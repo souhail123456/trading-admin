@@ -205,6 +205,72 @@ def execute_decisions(conn: sqlite3.Connection, decisions: list[dict], dry_run: 
         broker.disconnect()
 
 
+def _send_fx_telegram(conn: sqlite3.Connection, signals: list[dict], mode: str):
+    """Send FX pipeline summary to Telegram."""
+    import requests as _req
+
+    bot_token = os.environ["TELEGRAM_BOT_TOKEN"]
+    chat_id = os.environ["TELEGRAM_CHAT_ID"]
+
+    open_trades = conn.execute(
+        "SELECT * FROM paper_trades WHERE status = 'open' AND strategy_id IN (100, 101)"
+    ).fetchall()
+    closed_trades = conn.execute(
+        "SELECT * FROM paper_trades WHERE status = 'closed' AND strategy_id IN (100, 101)"
+    ).fetchall()
+
+    realized = sum(dict(t).get("pnl", 0) or 0 for t in closed_trades)
+    wins = sum(1 for t in closed_trades if (dict(t).get("pnl", 0) or 0) > 0)
+    total = len(closed_trades)
+    win_rate = (wins / total * 100) if total > 0 else 0
+
+    entries = [s for s in signals if s.get("signal_type") == "entry"]
+    exits = [s for s in signals if s.get("signal_type") == "exit"]
+
+    lines = [
+        f"<b>FX Pipeline — {datetime.now().strftime('%Y-%m-%d')}</b>",
+        f"Mode: {mode}",
+        "",
+    ]
+
+    if entries:
+        lines.append(f"<b>ENTRIES ({len(entries)})</b>")
+        for s in entries:
+            tag = "TREND" if s.get("strategy_id") == 100 else "PA"
+            lines.append(f"  [{tag}] {s['symbol']} {s['side'].upper()} @ {s['price_at_signal']}")
+        lines.append("")
+
+    if exits:
+        lines.append(f"<b>EXITS ({len(exits)})</b>")
+        for s in exits:
+            lines.append(f"  {s['symbol']} @ {s['price_at_signal']}")
+        lines.append("")
+
+    if not signals:
+        lines.append("No signals today.")
+        lines.append("")
+
+    lines += [
+        f"<b>PORTFOLIO</b>",
+        f"  Account: ${ACCOUNT_BALANCE:.0f}",
+        f"  Open: {len(open_trades)} position(s)",
+        f"  Realized: ${realized:+.2f}",
+        f"  Win Rate: {win_rate:.0f}% ({wins}/{total})",
+    ]
+
+    if open_trades:
+        lines.append("")
+        for t in open_trades:
+            t = dict(t)
+            lines.append(f"  {t['symbol']} {t['side']} {t.get('quantity', '?')} lots @ {t['entry_price']}")
+
+    _req.post(
+        f"https://api.telegram.org/bot{bot_token}/sendMessage",
+        json={"chat_id": chat_id, "text": "\n".join(lines), "parse_mode": "HTML"},
+        timeout=10,
+    ).raise_for_status()
+
+
 def fx_portfolio_status(conn: sqlite3.Connection):
     """Show FX portfolio status."""
     open_trades = conn.execute(
@@ -267,9 +333,17 @@ def run_daily(dry_run: bool = False, db_path: str | None = None):
         print("  No signals to evaluate.")
         print("\n[3/4] Nothing to execute.")
 
-    # Step 4: Status
+    # Step 4: Status + Telegram
     print("\n[4/4] Portfolio status...")
     fx_portfolio_status(conn)
+
+    # Send Telegram alert
+    if os.environ.get("TELEGRAM_BOT_TOKEN") and os.environ.get("TELEGRAM_CHAT_ID"):
+        try:
+            _send_fx_telegram(conn, signals, mode)
+            print("  Telegram alert sent.")
+        except Exception as e:
+            log.error(f"Telegram alert failed: {e}")
 
     log_agent_action(
         conn, "fx_pipeline", "daily_completed",
