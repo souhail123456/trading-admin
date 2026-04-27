@@ -168,24 +168,31 @@ def _build_fx_section(s: dict) -> str:
 
 
 def _build_poly_lines(s: dict) -> list[str]:
-    win_rate = (s["win_count"] / s["total_trades"] * 100) if s["total_trades"] > 0 else 0
+    total_resolved = s.get("win_count", 0) + s.get("loss_count", 0)
+    win_rate = (s["win_count"] / total_resolved * 100) if total_resolved > 0 else 0
     lines = [
         f"<b>POLYMARKET BOT</b>",
-        f"  P&L: ${s['total_pnl']:+,.2f}",
-        f"  Trades: {s['total_trades']} ({s['today_trades']} today)",
-        f"  Open: {s.get('open_positions', 0)} bets",
+        f"  P&L: ${s['total_pnl']:+,.2f} (resolved)",
+        f"  Trades: {s['total_trades']} ({s.get('open_positions', 0)} open)",
         f"  W/L: {s['win_count']}W / {s['loss_count']}L ({win_rate:.0f}%)",
         f"  Last run: {s.get('last_run') or 'N/A'}",
     ]
 
-    recent = s.get("trades", [])[-3:]
-    if recent:
-        lines.append("  Recent:")
-        for t in reversed(recent):
-            market = (t.get("market") or t.get("question", "?"))[:40]
-            side = t.get("side", t.get("outcome", "?"))
-            pnl = t.get("pnl", t.get("realized_pnl", 0)) or 0
-            lines.append(f"    {market} [{side}] ${float(pnl):+,.2f}")
+    # EV bot breakdown
+    ev_total = s.get("ev_total", 0)
+    if ev_total:
+        ev_resolved = s.get("ev_wins", 0) + s.get("ev_losses", 0)
+        ev_wr = (s["ev_wins"] / ev_resolved * 100) if ev_resolved > 0 else 0
+        lines.append(f"  <b>EV Bot:</b> {ev_total} trades ({s.get('ev_open', 0)} open) "
+                     f"P&L: ${s.get('ev_pnl', 0):+,.2f} ({ev_wr:.0f}% WR)")
+
+    # Weather bot breakdown
+    weather_total = s.get("weather_total", 0)
+    if weather_total:
+        w_resolved = s.get("weather_wins", 0) + s.get("weather_losses", 0)
+        w_wr = (s["weather_wins"] / w_resolved * 100) if w_resolved > 0 else 0
+        lines.append(f"  <b>Weather Bot:</b> {weather_total} trades ({s.get('weather_open', 0)} open) "
+                     f"P&L: ${s.get('weather_pnl', 0):+,.2f} ({w_wr:.0f}% WR)")
 
     return lines
 
