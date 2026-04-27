@@ -37,13 +37,6 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python3 -m pipeline.agents.fx_pipeline --daily
 
-      - name: Send Telegram alert
-        if: always()
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python3 -c "from pipeline.agents.paper_executor import portfolio_status; from pipeline.db import init_db; conn = init_db(); portfolio_status(conn)"
-
       - name: Save pipeline DB
         if: always()
         uses: actions/cache/save@v4
