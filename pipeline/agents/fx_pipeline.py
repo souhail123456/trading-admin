@@ -2,20 +2,20 @@
 FX Pipeline
 -----------
 Unified runner for the forex trading pipeline:
-  1. Generate FX signals (daily trend + 4h price action)
-  2. Risk management (position sizing + leverage)
-  3. Execute on OANDA / cTrader (if keys set)
-  4. Monitor open positions (stop loss, take profit)
+  1. Generate FX signals (daily trend + price action)
+  2. Risk management (position sizing)
+  3. Execute on broker (Capital.com / OANDA / cTrader)
+  4. Monitor open positions (time stops, SL management)
   5. Portfolio status + Telegram alert
 
-Supports two brokers:
-  - OANDA (REST API, instant setup, preferred)
-  - cTrader/Fusion Markets (protobuf, needs KYC approval)
+Execution matches backtested rules:
+  - Trend (ID 100): hold while above SMA-200, monthly rebalance, no fixed SL/TP
+  - Price Action (ID 101): max 15-day hold, 3% stop loss, exit on bearish pattern
 
 Usage:
-    python3 -m pipeline.agents.fx_pipeline --daily              # full pipeline
-    python3 -m pipeline.agents.fx_pipeline --daily --dry-run    # no execution
-    python3 -m pipeline.agents.fx_pipeline --status             # portfolio only
+    python3 -m pipeline.agents.fx_pipeline --daily
+    python3 -m pipeline.agents.fx_pipeline --daily --dry-run
+    python3 -m pipeline.agents.fx_pipeline --status
 """
 
 import argparse
@@ -23,7 +23,7 @@ import json
 import logging
 import os
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from pipeline.db import init_db, log_agent_action
 
@@ -33,12 +33,19 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# FX-specific risk parameters
+# Risk parameters
 ACCOUNT_BALANCE = float(os.environ.get("FX_ACCOUNT_BALANCE", "10000"))
 LEVERAGE = float(os.environ.get("FX_LEVERAGE", "500"))
-MAX_RISK_PER_TRADE = 0.02  # 2% = $2 on $100 account
+MAX_RISK_PER_TRADE = 0.02  # 2% per trade
 MAX_POSITIONS = 3
-STOP_LOSS_PIPS = 50  # 50 pip stop (adjustable)
+
+# Strategy-specific parameters (matching backtests)
+TREND_STRATEGY_ID = 100
+PA_STRATEGY_ID = 101
+PA_MAX_HOLD_DAYS = 15       # price action: max hold period
+PA_STOP_LOSS_PCT = 0.03     # price action: 3% stop loss
+TREND_SL_PIPS = 80          # trend: wider stop (holds longer)
+PA_SL_PIPS = 40             # price action: tighter stop (shorter hold)
 
 
 def _get_broker():
@@ -57,12 +64,115 @@ def _get_broker():
     return None
 
 
+def _close_broker_position(broker, symbol: str, broker_order_id: str | None):
+    """Close a position on the broker."""
+    if not broker or not broker_order_id:
+        return
+    try:
+        from pipeline.agents.broker_capital import CapitalBroker
+        if isinstance(broker, CapitalBroker):
+            broker.close_position(broker_order_id)
+        else:
+            broker.close_position(symbol=symbol, trade_id=broker_order_id)
+        log.info(f"    Broker position closed: {symbol} ({broker_order_id})")
+    except Exception as e:
+        log.error(f"    Failed to close broker position {symbol}: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Monitor: check open positions for time/stop exits
+# ---------------------------------------------------------------------------
+
+def monitor_positions(conn: sqlite3.Connection, broker=None, dry_run: bool = False) -> list[dict]:
+    """
+    Check open positions for exits that should trigger:
+      - Price action: max hold period (15 days) or 3% stop loss
+      - Trend: no time limit, but SMA crossdown triggers exit via signal generator
+    Returns list of positions closed.
+    """
+    closed = []
+    now = datetime.now()
+
+    open_trades = conn.execute(
+        "SELECT * FROM paper_trades WHERE status = 'open' AND strategy_id IN (100, 101)"
+    ).fetchall()
+
+    for row in open_trades:
+        t = dict(row)
+        should_close = False
+        close_reason = ""
+
+        # Price action: check hold period
+        if t["strategy_id"] == PA_STRATEGY_ID:
+            opened = datetime.strptime(t["opened_at"][:19], "%Y-%m-%dT%H:%M:%S")
+            days_held = (now - opened).days
+
+            if days_held >= PA_MAX_HOLD_DAYS:
+                should_close = True
+                close_reason = f"PA max hold ({days_held} days >= {PA_MAX_HOLD_DAYS})"
+
+            # Check 3% stop loss if broker has live price
+            if not should_close and broker and t.get("entry_price"):
+                try:
+                    price_data = broker.get_price(t["symbol"])
+                    if price_data:
+                        current = price_data["bid"]
+                        entry = float(t["entry_price"])
+                        pct_change = (current - entry) / entry
+                        if pct_change <= -PA_STOP_LOSS_PCT:
+                            should_close = True
+                            close_reason = f"PA stop loss ({pct_change:.1%} <= -{PA_STOP_LOSS_PCT:.0%})"
+                except Exception:
+                    pass
+
+        if should_close:
+            log.info(f"  MONITOR EXIT: {t['symbol']} — {close_reason}")
+            if not dry_run:
+                # Get current price for P&L
+                exit_price = None
+                if broker:
+                    try:
+                        price_data = broker.get_price(t["symbol"])
+                        if price_data:
+                            exit_price = price_data["bid"]
+                    except Exception:
+                        pass
+
+                # Calculate P&L
+                pnl = None
+                if exit_price and t.get("entry_price"):
+                    entry = float(t["entry_price"])
+                    qty = float(t.get("quantity", 1))
+                    if t["side"] == "long":
+                        pnl = (exit_price - entry) * qty * 1000  # micro lots * 1000
+                    else:
+                        pnl = (entry - exit_price) * qty * 1000
+
+                conn.execute(
+                    """UPDATE paper_trades
+                       SET status = 'closed', closed_at = ?, exit_price = ?, pnl = ?
+                       WHERE id = ?""",
+                    (now.strftime("%Y-%m-%dT%H:%M:%SZ"), exit_price, pnl, t["id"]),
+                )
+                conn.commit()
+
+                _close_broker_position(broker, t["symbol"], t.get("broker_order_id"))
+
+            closed.append({**t, "close_reason": close_reason})
+
+    return closed
+
+
+# ---------------------------------------------------------------------------
+# Risk check
+# ---------------------------------------------------------------------------
+
 def fx_risk_check(conn: sqlite3.Connection, signals: list[dict]) -> list[dict]:
     """
-    Simple FX risk manager for small account.
-    - Max 3 positions
+    FX risk manager:
+    - Max 3 positions total
     - 2% risk per trade
-    - Calculate micro lot size based on stop loss
+    - Strategy-specific stop loss pips
     """
     open_trades = conn.execute(
         "SELECT * FROM paper_trades WHERE status = 'open' AND strategy_id IN (100, 101) ORDER BY opened_at"
@@ -87,12 +197,17 @@ def fx_risk_check(conn: sqlite3.Connection, signals: list[dict]) -> list[dict]:
             decisions.append({**signal, "approved": False, "reason": f"already holding {symbol}"})
             continue
 
-        # Position sizing: risk $2 (2% of $100) with 50 pip stop
-        # Pip value for micro lot (0.01): ~$0.10 for most pairs
-        pip_value = 0.10
+        # Strategy-specific stop loss
+        if signal["strategy_id"] == TREND_STRATEGY_ID:
+            stop_pips = TREND_SL_PIPS
+        else:
+            stop_pips = PA_SL_PIPS
+
+        # Position sizing: risk amount / (stop_pips * pip_value)
+        pip_value = 0.10  # approx for micro lot
         risk_amount = ACCOUNT_BALANCE * MAX_RISK_PER_TRADE
-        micro_lots = risk_amount / (STOP_LOSS_PIPS * pip_value)
-        volume = max(int(micro_lots), 1)  # at least 1 micro lot
+        micro_lots = risk_amount / (stop_pips * pip_value)
+        volume = max(int(micro_lots), 1)
 
         decisions.append({
             **signal,
@@ -100,7 +215,7 @@ def fx_risk_check(conn: sqlite3.Connection, signals: list[dict]) -> list[dict]:
             "action": "entry",
             "micro_lots": volume,
             "risk_amount": round(risk_amount, 2),
-            "stop_pips": STOP_LOSS_PIPS,
+            "stop_pips": stop_pips,
             "risk_pct": MAX_RISK_PER_TRADE * 100,
         })
         open_count += 1
@@ -109,8 +224,12 @@ def fx_risk_check(conn: sqlite3.Connection, signals: list[dict]) -> list[dict]:
     return decisions
 
 
+# ---------------------------------------------------------------------------
+# Execute
+# ---------------------------------------------------------------------------
+
 def execute_decisions(conn: sqlite3.Connection, decisions: list[dict], dry_run: bool = False):
-    """Store decisions to DB and optionally execute on cTrader."""
+    """Execute approved decisions on DB and broker."""
     broker = _get_broker() if not dry_run else None
 
     for d in decisions:
@@ -120,10 +239,10 @@ def execute_decisions(conn: sqlite3.Connection, decisions: list[dict], dry_run: 
 
         if d["action"] == "entry":
             log.info(f"  ENTRY: {d['symbol']} {d['micro_lots']} micro lots, "
-                     f"risk=${d['risk_amount']} ({d['risk_pct']}%), stop={d['stop_pips']}pips")
+                     f"risk=${d['risk_amount']} ({d['risk_pct']}%), stop={d['stop_pips']}pips "
+                     f"[{'TREND' if d['strategy_id'] == TREND_STRATEGY_ID else 'PA'}]")
 
             if not dry_run:
-                # Store to DB
                 conn.execute(
                     """INSERT INTO paper_trades
                        (strategy_id, signal_id, symbol, side, entry_price,
@@ -140,52 +259,26 @@ def execute_decisions(conn: sqlite3.Connection, decisions: list[dict], dry_run: 
                 )
                 conn.commit()
 
-                # Execute on broker
                 if broker:
                     try:
-                        units = d["micro_lots"] * 1000  # micro lots → units
-
-                        from pipeline.agents.broker_capital import CapitalBroker
-                        from pipeline.agents.broker_oanda import OandaBroker
-
-                        if isinstance(broker, CapitalBroker):
-                            result = broker.submit_order(
-                                symbol=d["symbol"],
-                                units=units,
-                                side=d["side"],
-                                stop_loss_pips=d["stop_pips"],
-                                take_profit_pips=d["stop_pips"] * 3,
+                        units = d["micro_lots"] * 1000
+                        # Trend: no TP (hold until SMA exit), wider SL
+                        # PA: no TP on broker (managed by monitor), tighter SL
+                        result = broker.submit_order(
+                            symbol=d["symbol"],
+                            units=units,
+                            side=d["side"],
+                            stop_loss_pips=d["stop_pips"],
+                            take_profit_pips=None,  # managed by signals/monitor, not fixed TP
+                        )
+                        # Store broker order ID
+                        order_id = result.get("deal_id") or result.get("trade_id")
+                        if order_id:
+                            conn.execute(
+                                "UPDATE paper_trades SET broker_order_id = ? WHERE symbol = ? AND status = 'open' AND broker_order_id IS NULL",
+                                (order_id, d["symbol"]),
                             )
-                            if result.get("deal_id"):
-                                conn.execute(
-                                    "UPDATE paper_trades SET broker_order_id = ? WHERE symbol = ? AND status = 'open' AND broker_order_id IS NULL",
-                                    (result["deal_id"], d["symbol"]),
-                                )
-                                conn.commit()
-                        elif isinstance(broker, OandaBroker):
-                            result = broker.submit_order(
-                                symbol=d["symbol"],
-                                units=units,
-                                side=d["side"],
-                                stop_loss_pips=d["stop_pips"],
-                                take_profit_pips=d["stop_pips"] * 3,
-                            )
-                            if result.get("trade_id"):
-                                conn.execute(
-                                    "UPDATE paper_trades SET broker_order_id = ? WHERE symbol = ? AND status = 'open' AND broker_order_id IS NULL",
-                                    (result["trade_id"], d["symbol"]),
-                                )
-                                conn.commit()
-                        else:
-                            # cTrader fallback
-                            from pipeline.agents.broker_ctrader import MICRO_LOT
-                            volume = d["micro_lots"] * MICRO_LOT
-                            result = broker.submit_order(
-                                symbol=d["symbol"],
-                                volume=volume,
-                                side=d["side"],
-                                stop_loss_pips=d["stop_pips"],
-                            )
+                            conn.commit()
                         log.info(f"    Broker order: {result}")
                     except Exception as e:
                         log.error(f"    Broker execution failed: {e}")
@@ -193,19 +286,47 @@ def execute_decisions(conn: sqlite3.Connection, decisions: list[dict], dry_run: 
         elif d["action"] == "exit":
             log.info(f"  EXIT: {d['symbol']}")
             if not dry_run:
-                # Close in DB
-                conn.execute(
-                    """UPDATE paper_trades SET status = 'closed', closed_at = ?
-                       WHERE symbol = ? AND status = 'open'""",
-                    (datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ"), d["symbol"]),
-                )
-                conn.commit()
+                # Get broker order ID before closing
+                trade_row = conn.execute(
+                    "SELECT id, broker_order_id, entry_price, quantity, side FROM paper_trades WHERE symbol = ? AND status = 'open' LIMIT 1",
+                    (d["symbol"],),
+                ).fetchone()
+
+                if trade_row:
+                    trade = dict(trade_row)
+
+                    # Calculate P&L
+                    pnl = None
+                    exit_price = d.get("price_at_signal")
+                    if exit_price and trade.get("entry_price"):
+                        entry = float(trade["entry_price"])
+                        qty = float(trade.get("quantity", 1))
+                        if trade["side"] == "long":
+                            pnl = (float(exit_price) - entry) * qty * 1000
+                        else:
+                            pnl = (entry - float(exit_price)) * qty * 1000
+
+                    conn.execute(
+                        """UPDATE paper_trades
+                           SET status = 'closed', closed_at = ?, exit_price = ?, pnl = ?
+                           WHERE id = ?""",
+                        (datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ"), exit_price, pnl, trade["id"]),
+                    )
+                    conn.commit()
+
+                    # Close on broker
+                    if broker:
+                        _close_broker_position(broker, d["symbol"], trade.get("broker_order_id"))
 
     if broker:
         broker.disconnect()
 
 
-def _send_fx_telegram(conn: sqlite3.Connection, signals: list[dict], mode: str):
+# ---------------------------------------------------------------------------
+# Telegram + Status
+# ---------------------------------------------------------------------------
+
+def _send_fx_telegram(conn: sqlite3.Connection, signals: list[dict], mode: str, closed_by_monitor: list[dict] = None):
     """Send FX pipeline summary to Telegram."""
     import requests as _req
 
@@ -236,7 +357,7 @@ def _send_fx_telegram(conn: sqlite3.Connection, signals: list[dict], mode: str):
     if entries:
         lines.append(f"<b>ENTRIES ({len(entries)})</b>")
         for s in entries:
-            tag = "TREND" if s.get("strategy_id") == 100 else "PA"
+            tag = "TREND" if s.get("strategy_id") == TREND_STRATEGY_ID else "PA"
             lines.append(f"  [{tag}] {s['symbol']} {s['side'].upper()} @ {s['price_at_signal']}")
         lines.append("")
 
@@ -246,7 +367,13 @@ def _send_fx_telegram(conn: sqlite3.Connection, signals: list[dict], mode: str):
             lines.append(f"  {s['symbol']} @ {s['price_at_signal']}")
         lines.append("")
 
-    if not signals:
+    if closed_by_monitor:
+        lines.append(f"<b>MONITOR EXITS ({len(closed_by_monitor)})</b>")
+        for c in closed_by_monitor:
+            lines.append(f"  {c['symbol']} — {c['close_reason']}")
+        lines.append("")
+
+    if not signals and not closed_by_monitor:
         lines.append("No signals today.")
         lines.append("")
 
@@ -262,7 +389,9 @@ def _send_fx_telegram(conn: sqlite3.Connection, signals: list[dict], mode: str):
         lines.append("")
         for t in open_trades:
             t = dict(t)
-            lines.append(f"  {t['symbol']} {t['side']} {t.get('quantity', '?')} lots @ {t['entry_price']}")
+            tag = "T" if t["strategy_id"] == TREND_STRATEGY_ID else "PA"
+            opened = t.get("opened_at", "?")[:10]
+            lines.append(f"  [{tag}] {t['symbol']} {t['side']} {t.get('quantity', '?')} lots @ {t['entry_price']} ({opened})")
 
     _req.post(
         f"https://api.telegram.org/bot{bot_token}/sendMessage",
@@ -297,9 +426,22 @@ def fx_portfolio_status(conn: sqlite3.Connection):
         print(f"\n  OPEN POSITIONS:")
         for t in open_trades:
             t = dict(t)
-            print(f"    {t['symbol']:>8} {t['side']} {t.get('quantity', '?')} lots "
-                  f"@ {t['entry_price']} — opened {t.get('opened_at', '?')[:10]}")
+            tag = "TREND" if t["strategy_id"] == TREND_STRATEGY_ID else "PA"
+            opened = t.get("opened_at", "?")[:10]
+            days = ""
+            if t.get("opened_at"):
+                try:
+                    d = (datetime.now() - datetime.strptime(t["opened_at"][:19], "%Y-%m-%dT%H:%M:%S")).days
+                    days = f" ({d}d)"
+                except Exception:
+                    pass
+            print(f"    [{tag}] {t['symbol']:>8} {t['side']} {t.get('quantity', '?')} lots "
+                  f"@ {t['entry_price']} — {opened}{days}")
 
+
+# ---------------------------------------------------------------------------
+# Daily runner
+# ---------------------------------------------------------------------------
 
 def run_daily(dry_run: bool = False, db_path: str | None = None):
     conn = init_db(db_path)
@@ -312,6 +454,17 @@ def run_daily(dry_run: bool = False, db_path: str | None = None):
     print(f"\n{'#'*60}")
     print(f"# FX PIPELINE — {datetime.now().strftime('%Y-%m-%d %H:%M')} [{mode}]")
     print(f"{'#'*60}")
+
+    # Step 0: Monitor existing positions (time stops, % stops)
+    print("\n[0/4] Monitoring open positions...")
+    broker_for_monitor = _get_broker() if not dry_run else None
+    closed_by_monitor = monitor_positions(conn, broker=broker_for_monitor, dry_run=dry_run)
+    if closed_by_monitor:
+        print(f"  Closed {len(closed_by_monitor)} position(s) by monitor")
+    else:
+        print("  All positions OK")
+    if broker_for_monitor:
+        broker_for_monitor.disconnect()
 
     # Step 1: Generate signals
     from pipeline.agents.fx_signal_generator import generate_fx_signals
@@ -337,17 +490,21 @@ def run_daily(dry_run: bool = False, db_path: str | None = None):
     print("\n[4/4] Portfolio status...")
     fx_portfolio_status(conn)
 
-    # Send Telegram alert
     if os.environ.get("TELEGRAM_BOT_TOKEN") and os.environ.get("TELEGRAM_CHAT_ID"):
         try:
-            _send_fx_telegram(conn, signals, mode)
+            _send_fx_telegram(conn, signals, mode, closed_by_monitor)
             print("  Telegram alert sent.")
         except Exception as e:
             log.error(f"Telegram alert failed: {e}")
 
     log_agent_action(
         conn, "fx_pipeline", "daily_completed",
-        outputs={"signals": len(signals), "mode": mode, "dry_run": dry_run},
+        outputs={
+            "signals": len(signals),
+            "mode": mode,
+            "dry_run": dry_run,
+            "monitor_closed": len(closed_by_monitor),
+        },
     )
 
 
