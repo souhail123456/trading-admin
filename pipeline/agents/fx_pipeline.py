@@ -42,7 +42,10 @@ STOP_LOSS_PIPS = 50  # 50 pip stop (adjustable)
 
 
 def _get_broker():
-    """Get broker: OANDA (preferred) > cTrader > None."""
+    """Get broker: Capital.com (preferred) > OANDA > cTrader > None."""
+    if os.environ.get("CAPITAL_API_KEY") and os.environ.get("CAPITAL_EMAIL"):
+        from pipeline.agents.broker_capital import CapitalBroker
+        return CapitalBroker()
     if os.environ.get("OANDA_API_KEY") and os.environ.get("OANDA_ACCOUNT_ID"):
         from pipeline.agents.broker_oanda import OandaBroker
         return OandaBroker()
@@ -140,18 +143,33 @@ def execute_decisions(conn: sqlite3.Connection, decisions: list[dict], dry_run: 
                 # Execute on broker
                 if broker:
                     try:
+                        units = d["micro_lots"] * 1000  # micro lots → units
+
+                        from pipeline.agents.broker_capital import CapitalBroker
                         from pipeline.agents.broker_oanda import OandaBroker
-                        if isinstance(broker, OandaBroker):
-                            # OANDA: units = micro_lots * 1000
-                            units = d["micro_lots"] * 1000
+
+                        if isinstance(broker, CapitalBroker):
                             result = broker.submit_order(
                                 symbol=d["symbol"],
                                 units=units,
-                                side="buy",
+                                side=d["side"],
                                 stop_loss_pips=d["stop_pips"],
-                                take_profit_pips=d["stop_pips"] * 3,  # 3:1 R/R
+                                take_profit_pips=d["stop_pips"] * 3,
                             )
-                            # Update DB with trade ID
+                            if result.get("deal_id"):
+                                conn.execute(
+                                    "UPDATE paper_trades SET broker_order_id = ? WHERE symbol = ? AND status = 'open' AND broker_order_id IS NULL",
+                                    (result["deal_id"], d["symbol"]),
+                                )
+                                conn.commit()
+                        elif isinstance(broker, OandaBroker):
+                            result = broker.submit_order(
+                                symbol=d["symbol"],
+                                units=units,
+                                side=d["side"],
+                                stop_loss_pips=d["stop_pips"],
+                                take_profit_pips=d["stop_pips"] * 3,
+                            )
                             if result.get("trade_id"):
                                 conn.execute(
                                     "UPDATE paper_trades SET broker_order_id = ? WHERE symbol = ? AND status = 'open' AND broker_order_id IS NULL",
@@ -165,7 +183,7 @@ def execute_decisions(conn: sqlite3.Connection, decisions: list[dict], dry_run: 
                             result = broker.submit_order(
                                 symbol=d["symbol"],
                                 volume=volume,
-                                side="buy",
+                                side=d["side"],
                                 stop_loss_pips=d["stop_pips"],
                             )
                         log.info(f"    Broker order: {result}")
@@ -220,9 +238,10 @@ def fx_portfolio_status(conn: sqlite3.Connection):
 def run_daily(dry_run: bool = False, db_path: str | None = None):
     conn = init_db(db_path)
 
+    has_capital = bool(os.environ.get("CAPITAL_API_KEY"))
     has_oanda = bool(os.environ.get("OANDA_API_KEY"))
     has_ctrader = bool(os.environ.get("CTRADER_CLIENT_ID"))
-    mode = "OANDA" if has_oanda else "cTrader" if has_ctrader else "SQLITE-ONLY"
+    mode = "CAPITAL.COM" if has_capital else "OANDA" if has_oanda else "cTrader" if has_ctrader else "SQLITE-ONLY"
 
     print(f"\n{'#'*60}")
     print(f"# FX PIPELINE — {datetime.now().strftime('%Y-%m-%d %H:%M')} [{mode}]")
