@@ -1,12 +1,16 @@
 """
-FX Daily Pipeline
------------------
+FX Pipeline
+-----------
 Unified runner for the forex trading pipeline:
-  1. Generate FX signals (trend + price action)
-  2. Risk management (position sizing for $100 account + leverage)
-  3. Execute on cTrader / Fusion Markets (if keys set)
-  4. Monitor open positions
+  1. Generate FX signals (daily trend + 4h price action)
+  2. Risk management (position sizing + leverage)
+  3. Execute on OANDA / cTrader (if keys set)
+  4. Monitor open positions (stop loss, take profit)
   5. Portfolio status + Telegram alert
+
+Supports two brokers:
+  - OANDA (REST API, instant setup, preferred)
+  - cTrader/Fusion Markets (protobuf, needs KYC approval)
 
 Usage:
     python3 -m pipeline.agents.fx_pipeline --daily              # full pipeline
@@ -38,7 +42,10 @@ STOP_LOSS_PIPS = 50  # 50 pip stop (adjustable)
 
 
 def _get_broker():
-    """Get cTrader broker if keys set, else None."""
+    """Get broker: OANDA (preferred) > cTrader > None."""
+    if os.environ.get("OANDA_API_KEY") and os.environ.get("OANDA_ACCOUNT_ID"):
+        from pipeline.agents.broker_oanda import OandaBroker
+        return OandaBroker()
     if os.environ.get("CTRADER_CLIENT_ID") and os.environ.get("CTRADER_ACCESS_TOKEN"):
         from pipeline.agents.broker_ctrader import CTraderBroker
         broker = CTraderBroker()
@@ -130,20 +137,40 @@ def execute_decisions(conn: sqlite3.Connection, decisions: list[dict], dry_run: 
                 )
                 conn.commit()
 
-                # Execute on cTrader
+                # Execute on broker
                 if broker:
                     try:
-                        from pipeline.agents.broker_ctrader import MICRO_LOT
-                        volume = d["micro_lots"] * MICRO_LOT
-                        result = broker.submit_order(
-                            symbol=d["symbol"],
-                            volume=volume,
-                            side="buy",
-                            stop_loss_pips=d["stop_pips"],
-                        )
-                        log.info(f"    cTrader order: {result}")
+                        from pipeline.agents.broker_oanda import OandaBroker
+                        if isinstance(broker, OandaBroker):
+                            # OANDA: units = micro_lots * 1000
+                            units = d["micro_lots"] * 1000
+                            result = broker.submit_order(
+                                symbol=d["symbol"],
+                                units=units,
+                                side="buy",
+                                stop_loss_pips=d["stop_pips"],
+                                take_profit_pips=d["stop_pips"] * 3,  # 3:1 R/R
+                            )
+                            # Update DB with trade ID
+                            if result.get("trade_id"):
+                                conn.execute(
+                                    "UPDATE paper_trades SET broker_order_id = ? WHERE symbol = ? AND status = 'open' AND broker_order_id IS NULL",
+                                    (result["trade_id"], d["symbol"]),
+                                )
+                                conn.commit()
+                        else:
+                            # cTrader fallback
+                            from pipeline.agents.broker_ctrader import MICRO_LOT
+                            volume = d["micro_lots"] * MICRO_LOT
+                            result = broker.submit_order(
+                                symbol=d["symbol"],
+                                volume=volume,
+                                side="buy",
+                                stop_loss_pips=d["stop_pips"],
+                            )
+                        log.info(f"    Broker order: {result}")
                     except Exception as e:
-                        log.error(f"    cTrader execution failed: {e}")
+                        log.error(f"    Broker execution failed: {e}")
 
         elif d["action"] == "exit":
             log.info(f"  EXIT: {d['symbol']}")
@@ -193,8 +220,9 @@ def fx_portfolio_status(conn: sqlite3.Connection):
 def run_daily(dry_run: bool = False, db_path: str | None = None):
     conn = init_db(db_path)
 
-    has_broker = bool(os.environ.get("CTRADER_CLIENT_ID"))
-    mode = "cTrader/Fusion Markets" if has_broker else "SQLITE-ONLY"
+    has_oanda = bool(os.environ.get("OANDA_API_KEY"))
+    has_ctrader = bool(os.environ.get("CTRADER_CLIENT_ID"))
+    mode = "OANDA" if has_oanda else "cTrader" if has_ctrader else "SQLITE-ONLY"
 
     print(f"\n{'#'*60}")
     print(f"# FX PIPELINE — {datetime.now().strftime('%Y-%m-%d %H:%M')} [{mode}]")
