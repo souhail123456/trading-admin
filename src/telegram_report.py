@@ -112,24 +112,37 @@ def _build_unified_report(
 
 
 def _build_stock_lines(s: dict) -> list[str]:
-    win_rate = (s["win_count"] / s["total_trades"] * 100) if s["total_trades"] > 0 else 0
+    portfolio = s.get("portfolio_value")
+    cash = s.get("cash")
+    closed = s.get("trades", [])
+    closed_count = len(closed)
+    win_rate = (s["win_count"] / closed_count * 100) if closed_count > 0 else 0
+
     lines = [
         f"<b>STOCK BOT</b> (Alpaca)",
-        f"  P&L: ${s['total_pnl']:+,.2f}",
-        f"  Trades: {s['total_trades']} ({s['today_trades']} today)",
-        f"  W/L: {s['win_count']}W / {s['loss_count']}L ({win_rate:.0f}%)",
-        f"  Last run: {s.get('last_run') or 'N/A'}",
     ]
 
-    recent = s.get("trades", [])[-3:]
-    if recent:
-        lines.append("  Recent:")
-        for t in reversed(recent):
-            lines.append(
-                f"    {t['symbol']} {t['side']} {t['qty']}@{t['price']} "
-                f"P&L: ${t['pnl']:+,.2f}"
-            )
+    if portfolio is not None:
+        lines.append(f"  Portfolio: ${portfolio:,.2f} (P&L: ${s['total_pnl']:+,.2f})")
+    else:
+        lines.append(f"  P&L: ${s['total_pnl']:+,.2f}")
 
+    if cash is not None:
+        invested = portfolio - cash if portfolio else 0
+        lines.append(f"  Cash: ${cash:,.2f} | Invested: ${invested:,.2f}")
+
+    open_pos = s.get("open_positions", [])
+    if open_pos:
+        lines.append(f"  Open positions: {len(open_pos)}")
+        for p in open_pos:
+            unrealized = p.get("unrealized_pnl", 0)
+            lines.append(f"    {p['symbol']} {p['side']} {p['shares']}@${p['entry']} "
+                         f"(${unrealized:+,.2f})")
+
+    if closed_count > 0:
+        lines.append(f"  Closed: {closed_count} | W/L: {s['win_count']}W/{s['loss_count']}L ({win_rate:.0f}%)")
+
+    lines.append(f"  Last run: {s.get('last_run') or 'N/A'}")
     return lines
 
 
