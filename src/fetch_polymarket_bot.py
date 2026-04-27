@@ -47,13 +47,21 @@ def fetch_polymarket_stats(gh: Github, repo_name: str) -> dict:
         if t.get("status") == "open":
             stats["open_positions"] += 1
 
-    # Last workflow run
+    # Last workflow run, fallback to last commit
     try:
         runs = repo.get_workflow_runs(status="completed")
         if runs.totalCount > 0:
             stats["last_run"] = runs[0].created_at.strftime("%Y-%m-%d %H:%M UTC")
     except Exception:
         pass
+
+    if not stats["last_run"]:
+        try:
+            commits = repo.get_commits()
+            if commits.totalCount > 0:
+                stats["last_run"] = commits[0].commit.author.date.strftime("%Y-%m-%d %H:%M UTC")
+        except Exception:
+            pass
 
     return stats
 

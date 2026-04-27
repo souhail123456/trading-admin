@@ -1,8 +1,32 @@
 """Fetch trade data from the FX bot (local pipeline.db)."""
 
+import os
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
+
+import requests
+
+
+def _get_last_pipeline_run() -> str | None:
+    """Check last run of daily_pipeline workflow via GitHub API."""
+    gh_token = os.environ.get("GH_TOKEN")
+    if not gh_token:
+        return None
+    try:
+        resp = requests.get(
+            "https://api.github.com/repos/souhail123456/trading-admin/actions/workflows/daily_pipeline.yml/runs",
+            headers={"Authorization": f"token {gh_token}"},
+            params={"status": "completed", "per_page": 1},
+            timeout=10,
+        )
+        if resp.ok:
+            runs = resp.json().get("workflow_runs", [])
+            if runs:
+                return runs[0]["created_at"][:16].replace("T", " ") + " UTC"
+    except Exception:
+        pass
+    return None
 
 
 def fetch_fx_stats(db_path: str | None = None) -> dict:
@@ -69,7 +93,7 @@ def fetch_fx_stats(db_path: str | None = None) -> dict:
         if opened.startswith(today):
             stats["today_trades"] += 1
 
-    # Last pipeline run from agent_log
+    # Last pipeline run from agent_log, fallback to GitHub Actions API
     try:
         row = conn.execute(
             "SELECT created_at FROM agent_log WHERE agent = 'fx_pipeline' ORDER BY id DESC LIMIT 1"
@@ -78,6 +102,9 @@ def fetch_fx_stats(db_path: str | None = None) -> dict:
             stats["last_run"] = dict(row)["created_at"]
     except Exception:
         pass
+
+    if not stats["last_run"]:
+        stats["last_run"] = _get_last_pipeline_run()
 
     # Active strategies
     try:
