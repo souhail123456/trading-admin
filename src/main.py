@@ -45,7 +45,7 @@ def main():
         from github import Github
         gh = Github(gh_token)
 
-        stock_repo = os.environ.get("STOCK_REPO", "souhail123456/trading-bot")
+        stock_repo = os.environ.get("STOCK_REPO", "souhail123456/trading-bot")  # repo name is trading-bot
         poly_repo = os.environ.get("POLYMARKET_REPO", "souhail123456/polymarket-bot")
 
         print(f"Fetching stock bot stats from {stock_repo}...")

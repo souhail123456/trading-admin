@@ -24,7 +24,7 @@ jobs:
           GH_TOKEN: ${{ secrets.BOT_GITHUB_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          STOCK_REPO: ${{ vars.STOCK_REPO || 'souhail123456/stock-trading-bot' }}
+          STOCK_REPO: ${{ vars.STOCK_REPO || 'souhail123456/trading-bot' }}
           POLYMARKET_REPO: ${{ vars.POLYMARKET_REPO || 'souhail123456/polymarket-bot' }}
         working-directory: src
         run: python main.py
