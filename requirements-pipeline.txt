@@ -1,0 +1,7 @@
+requests>=2.31
+numpy>=1.24
+pandas>=2.0
+yfinance>=0.2.31
+beautifulsoup4>=4.12
+groq>=0.4
+python-telegram-bot>=20.7

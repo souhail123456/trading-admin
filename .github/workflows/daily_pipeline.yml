@@ -1,0 +1,57 @@
+name: Daily Trading Pipeline
+
+on:
+  schedule:
+    # Run Mon-Fri at 21:30 UTC (after US market close, 30min after report)
+    - cron: "30 21 * * 1-5"
+  workflow_dispatch: # Allow manual trigger
+
+jobs:
+  pipeline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements-pipeline.txt
+
+      - name: Restore pipeline DB
+        uses: actions/cache@v4
+        with:
+          path: data/pipeline.db
+          key: pipeline-db-${{ github.run_number }}
+          restore-keys: |
+            pipeline-db-
+
+      - name: Run FX daily pipeline
+        env:
+          CTRADER_CLIENT_ID: ${{ secrets.CTRADER_CLIENT_ID }}
+          CTRADER_CLIENT_SECRET: ${{ secrets.CTRADER_CLIENT_SECRET }}
+          CTRADER_ACCESS_TOKEN: ${{ secrets.CTRADER_ACCESS_TOKEN }}
+          CTRADER_ACCOUNT_ID: ${{ secrets.CTRADER_ACCOUNT_ID }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python3 -m pipeline.agents.fx_pipeline --daily
+
+      - name: Send Telegram alert
+        if: always()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python3 -c "
+          from pipeline.agents.paper_executor import portfolio_status;
+          from pipeline.db import init_db;
+          conn = init_db();
+          portfolio_status(conn);
+          "
+
+      - name: Save pipeline DB
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: data/pipeline.db
+          key: pipeline-db-${{ github.run_number }}
