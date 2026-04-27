@@ -25,7 +25,26 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
     conn = get_connection(db_path)
     schema = SCHEMA_PATH.read_text()
     conn.executescript(schema)
+    _seed_fx_strategies(conn)
     return conn
+
+
+def _seed_fx_strategies(conn: sqlite3.Connection) -> None:
+    """Ensure FX strategy rows exist (IDs 100, 101) so FK constraints pass."""
+    for sid, name, entry, exit_, universe in [
+        (100, "FX Trend Following", "SMA-200 filter, rank by trend strength, top 3 pairs",
+         "Close when price crosses below SMA-200", "10 major FX pairs"),
+        (101, "FX Price Action", "Candlestick patterns (engulfing, pin bar, hammer) + weekly trend filter",
+         "Exit on opposing pattern or bear score >= 2", "10 major FX pairs"),
+    ]:
+        existing = conn.execute("SELECT id FROM strategies WHERE id = ?", (sid,)).fetchone()
+        if not existing:
+            conn.execute(
+                """INSERT INTO strategies (id, name, status, entry_rule, exit_rule, asset_universe)
+                   VALUES (?, ?, 'paper_trading', ?, ?, ?)""",
+                (sid, name, entry, exit_, universe),
+            )
+    conn.commit()
 
 
 def log_agent_action(
