@@ -25,7 +25,7 @@ import os
 import sqlite3
 from datetime import datetime, timedelta
 
-from pipeline.db import init_db, log_agent_action
+from pipeline.db import init_db, log_agent_action, get_strategy_params
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,13 +39,13 @@ LEVERAGE = float(os.environ.get("FX_LEVERAGE", "500"))
 MAX_RISK_PER_TRADE = 0.02  # 2% per trade
 MAX_POSITIONS = 3
 
-# Strategy-specific parameters (matching backtests)
+# Strategy IDs
 TREND_STRATEGY_ID = 100
 PA_STRATEGY_ID = 101
-PA_MAX_HOLD_DAYS = 15       # price action: max hold period
-PA_STOP_LOSS_PCT = 0.03     # price action: 3% stop loss
-TREND_SL_PIPS = 80          # trend: wider stop (holds longer)
-PA_SL_PIPS = 40             # price action: tighter stop (shorter hold)
+
+# Defaults (overridden by DB parameters)
+_DEFAULT_TREND_PARAMS = {"stop_loss_pips": 80, "max_hold_days": None, "stop_loss_pct": None}
+_DEFAULT_PA_PARAMS = {"stop_loss_pips": 40, "max_hold_days": 15, "stop_loss_pct": 0.03}
 
 
 def _get_broker():
@@ -85,13 +85,18 @@ def _close_broker_position(broker, symbol: str, broker_order_id: str | None):
 
 def monitor_positions(conn: sqlite3.Connection, broker=None, dry_run: bool = False) -> list[dict]:
     """
-    Check open positions for exits that should trigger:
-      - Price action: max hold period (15 days) or 3% stop loss
-      - Trend: no time limit, but SMA crossdown triggers exit via signal generator
+    Check open positions for exits that should trigger.
+    Rules loaded from DB strategy parameters:
+      - max_hold_days: close after N days
+      - stop_loss_pct: close if drawdown exceeds threshold
     Returns list of positions closed.
     """
     closed = []
     now = datetime.now()
+
+    # Load strategy params from DB
+    pa_params = get_strategy_params(conn, PA_STRATEGY_ID) or _DEFAULT_PA_PARAMS
+    trend_params = get_strategy_params(conn, TREND_STRATEGY_ID) or _DEFAULT_TREND_PARAMS
 
     open_trades = conn.execute(
         "SELECT * FROM paper_trades WHERE status = 'open' AND strategy_id IN (100, 101)"
@@ -102,26 +107,31 @@ def monitor_positions(conn: sqlite3.Connection, broker=None, dry_run: bool = Fal
         should_close = False
         close_reason = ""
 
-        # Price action: check hold period
-        if t["strategy_id"] == PA_STRATEGY_ID:
+        # Get params for this strategy
+        params = pa_params if t["strategy_id"] == PA_STRATEGY_ID else trend_params
+        max_hold = params.get("max_hold_days")
+        stop_pct = params.get("stop_loss_pct")
+
+        # Check max hold period
+        if max_hold and t.get("opened_at"):
             opened = datetime.strptime(t["opened_at"][:19], "%Y-%m-%dT%H:%M:%S")
             days_held = (now - opened).days
 
-            if days_held >= PA_MAX_HOLD_DAYS:
+            if days_held >= max_hold:
                 should_close = True
-                close_reason = f"PA max hold ({days_held} days >= {PA_MAX_HOLD_DAYS})"
+                close_reason = f"Max hold ({days_held} days >= {max_hold})"
 
-            # Check 3% stop loss if broker has live price
-            if not should_close and broker and t.get("entry_price"):
+            # Check % stop loss if broker has live price
+            if not should_close and stop_pct and broker and t.get("entry_price"):
                 try:
                     price_data = broker.get_price(t["symbol"])
                     if price_data:
                         current = price_data["bid"]
                         entry = float(t["entry_price"])
                         pct_change = (current - entry) / entry
-                        if pct_change <= -PA_STOP_LOSS_PCT:
+                        if pct_change <= -stop_pct:
                             should_close = True
-                            close_reason = f"PA stop loss ({pct_change:.1%} <= -{PA_STOP_LOSS_PCT:.0%})"
+                            close_reason = f"Stop loss ({pct_change:.1%} <= -{stop_pct:.0%})"
                 except Exception:
                     pass
 
@@ -197,11 +207,10 @@ def fx_risk_check(conn: sqlite3.Connection, signals: list[dict]) -> list[dict]:
             decisions.append({**signal, "approved": False, "reason": f"already holding {symbol}"})
             continue
 
-        # Strategy-specific stop loss
-        if signal["strategy_id"] == TREND_STRATEGY_ID:
-            stop_pips = TREND_SL_PIPS
-        else:
-            stop_pips = PA_SL_PIPS
+        # Strategy-specific stop loss from DB
+        params = get_strategy_params(conn, signal["strategy_id"])
+        default = _DEFAULT_TREND_PARAMS if signal["strategy_id"] == TREND_STRATEGY_ID else _DEFAULT_PA_PARAMS
+        stop_pips = params.get("stop_loss_pips", default["stop_loss_pips"])
 
         # Position sizing: risk amount / (stop_pips * pip_value)
         pip_value = 0.10  # approx for micro lot

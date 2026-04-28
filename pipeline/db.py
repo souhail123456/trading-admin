@@ -30,21 +30,61 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
 
 
 def _seed_fx_strategies(conn: sqlite3.Connection) -> None:
-    """Ensure FX strategy rows exist (IDs 100, 101) so FK constraints pass."""
-    for sid, name, entry, exit_, universe in [
-        (100, "FX Trend Following", "SMA-200 filter, rank by trend strength, top 3 pairs",
-         "Close when price crosses below SMA-200", "10 major FX pairs"),
-        (101, "FX Price Action", "Candlestick patterns (engulfing, pin bar, hammer) + weekly trend filter",
-         "Exit on opposing pattern or bear score >= 2", "10 major FX pairs"),
-    ]:
-        existing = conn.execute("SELECT id FROM strategies WHERE id = ?", (sid,)).fetchone()
+    """Ensure FX strategy rows exist (IDs 100, 101) with validated parameters."""
+    strategies = [
+        {
+            "id": 100,
+            "name": "FX Trend Following",
+            "entry_rule": "SMA-200 filter, rank by trend strength, top 3 pairs",
+            "exit_rule": "Close when price crosses below SMA-200",
+            "universe": "10 major FX pairs",
+            "parameters": json.dumps({
+                "sma_period": 200,
+                "top_n": 3,
+                "stop_loss_pips": 80,
+                "take_profit_pips": None,
+                "max_hold_days": None,
+                "stop_loss_pct": None,
+            }),
+        },
+        {
+            "id": 101,
+            "name": "FX Price Action",
+            "entry_rule": "Candlestick patterns (engulfing, pin bar, hammer) + weekly trend filter",
+            "exit_rule": "Exit on opposing pattern or bear score >= 2",
+            "universe": "10 major FX pairs",
+            "parameters": json.dumps({
+                "min_bull_score": 2,
+                "stop_loss_pips": 40,
+                "take_profit_pips": None,
+                "max_hold_days": 15,
+                "stop_loss_pct": 0.03,
+            }),
+        },
+    ]
+
+    for s in strategies:
+        existing = conn.execute("SELECT id FROM strategies WHERE id = ?", (s["id"],)).fetchone()
         if not existing:
             conn.execute(
-                """INSERT INTO strategies (id, name, status, entry_rule, exit_rule, asset_universe)
-                   VALUES (?, ?, 'paper_trading', ?, ?, ?)""",
-                (sid, name, entry, exit_, universe),
+                """INSERT INTO strategies (id, name, status, entry_rule, exit_rule, asset_universe, parameters)
+                   VALUES (?, ?, 'paper_trading', ?, ?, ?, ?)""",
+                (s["id"], s["name"], s["entry_rule"], s["exit_rule"], s["universe"], s["parameters"]),
             )
+        else:
+            # Update parameters if missing
+            row = conn.execute("SELECT parameters FROM strategies WHERE id = ?", (s["id"],)).fetchone()
+            if not dict(row).get("parameters"):
+                conn.execute("UPDATE strategies SET parameters = ? WHERE id = ?", (s["parameters"], s["id"]))
     conn.commit()
+
+
+def get_strategy_params(conn: sqlite3.Connection, strategy_id: int) -> dict:
+    """Load strategy parameters from DB."""
+    row = conn.execute("SELECT parameters FROM strategies WHERE id = ?", (strategy_id,)).fetchone()
+    if row and dict(row).get("parameters"):
+        return json.loads(dict(row)["parameters"])
+    return {}
 
 
 def log_agent_action(

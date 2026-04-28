@@ -17,7 +17,7 @@ from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
 
-from pipeline.db import init_db, log_agent_action
+from pipeline.db import init_db, log_agent_action, get_strategy_params
 from pipeline.agents.data_fetcher import fetch_ohlcv, CURRENCY_PAIRS
 from pipeline.agents.price_action import detect_all_patterns
 
@@ -41,10 +41,14 @@ def _clean_symbol(ticker: str) -> str:
 # FX Trend-following signals
 # ---------------------------------------------------------------------------
 
-def fx_trend_signals(data: dict[str, pd.DataFrame], sma_period: int = 200, top_n: int = 3) -> list[dict]:
+def fx_trend_signals(data: dict[str, pd.DataFrame], params: dict | None = None) -> list[dict]:
     """
-    Scan FX pairs: which are above SMA-200? Rank by trend strength.
+    Scan FX pairs: which are above SMA? Rank by trend strength.
+    Parameters read from DB strategy params.
     """
+    params = params or {}
+    sma_period = params.get("sma_period", 200)
+    top_n = params.get("top_n", 3)
     signals = []
     candidates = []
 
@@ -102,8 +106,11 @@ def fx_trend_signals(data: dict[str, pd.DataFrame], sma_period: int = 200, top_n
 # FX Price action signals
 # ---------------------------------------------------------------------------
 
-def fx_pa_signals(data: dict[str, pd.DataFrame], min_score: int = 2) -> list[dict]:
-    """Scan FX pairs for bullish/bearish candlestick + structure patterns."""
+def fx_pa_signals(data: dict[str, pd.DataFrame], params: dict | None = None) -> list[dict]:
+    """Scan FX pairs for bullish/bearish candlestick + structure patterns.
+    Parameters read from DB strategy params."""
+    params = params or {}
+    min_score = params.get("min_bull_score", 2)
     signals = []
 
     for ticker, df in data.items():
@@ -184,15 +191,21 @@ def generate_fx_signals(dry_run: bool = False, db_path: str | None = None) -> li
 
     all_signals = []
 
+    # Load strategy parameters from DB
+    trend_params = get_strategy_params(conn, FX_TREND_STRATEGY_ID)
+    pa_params = get_strategy_params(conn, FX_PA_STRATEGY_ID)
+    log.info(f"Trend params: {trend_params}")
+    log.info(f"PA params: {pa_params}")
+
     log.info("\n--- FX Trend Signals ---")
-    t_sigs = fx_trend_signals(data)
+    t_sigs = fx_trend_signals(data, params=trend_params)
     all_signals.extend(t_sigs)
     for s in t_sigs:
         log.info(f"  [{s['signal_type'].upper()}] {s['symbol']} @ {s['price_at_signal']} "
                  f"(strength: {s['full_state'].get('trend_strength', 'N/A')})")
 
     log.info("\n--- FX Price Action Signals ---")
-    pa_sigs = fx_pa_signals(data)
+    pa_sigs = fx_pa_signals(data, params=pa_params)
     all_signals.extend(pa_sigs)
     for s in pa_sigs:
         log.info(f"  [{s['signal_type'].upper()}] {s['symbol']} @ {s['price_at_signal']} "
