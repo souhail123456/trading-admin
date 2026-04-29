@@ -1,0 +1,31 @@
+{
+  "last_updated": null,
+  "bots": {
+    "etf": {
+      "platform": "alpaca",
+      "equity": null,
+      "positions": [],
+      "last_trade": null
+    },
+    "polymarket_ev": {
+      "platform": "polymarket",
+      "bankroll": null,
+      "positions": [],
+      "last_trade": null
+    },
+    "weather": {
+      "platform": "polymarket",
+      "positions": [],
+      "last_trade": null
+    },
+    "fx": {
+      "platform": "capital_com",
+      "equity": null,
+      "positions": [],
+      "last_trade": null
+    }
+  },
+  "api_usage_today": {},
+  "regime": null,
+  "alerts": []
+}
