@@ -2,7 +2,7 @@ name: Daily Trading Report
 
 on:
   schedule:
-    # Run daily at 21:00 UTC (after US market close)
+    # Run daily at 21:00 UTC (after US market close) — 5:00 AM+1 Shanghai
     - cron: "0 21 * * 1-5"
   workflow_dispatch: # Allow manual trigger
 

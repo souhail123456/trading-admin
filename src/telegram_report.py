@@ -5,10 +5,11 @@ Sends consolidated reports across all 3 bots to Telegram.
 """
 
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import requests
 
+SHANGHAI_TZ = timezone(timedelta(hours=8))
 
 # ---------------------------------------------------------------------------
 # Senders
@@ -56,7 +57,9 @@ def _build_unified_report(
     fx: dict | None,
     poly: dict | None,
 ) -> str:
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    now_sh = datetime.now(SHANGHAI_TZ).strftime("%H:%M Shanghai")
+    now = f"{now_utc} ({now_sh})"
 
     # Totals
     total_pnl = 0
@@ -170,7 +173,9 @@ def _build_fx_lines(s: dict) -> list[str]:
 
 def _build_fx_section(s: dict) -> str:
     """Standalone FX report."""
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    now_sh = datetime.now(SHANGHAI_TZ).strftime("%H:%M Shanghai")
+    now = f"{now_utc} ({now_sh})"
     lines = [
         f"<b>FX BOT — Report</b>",
         f"{now}",
@@ -215,7 +220,9 @@ def _build_poly_lines(s: dict) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def _build_signal_report(signals: list[dict], portfolio: dict | None = None) -> str:
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    now_sh = datetime.now(SHANGHAI_TZ).strftime("%H:%M Shanghai")
+    now = f"{now_utc} ({now_sh})"
 
     entries = [s for s in signals if s.get("signal_type") == "entry"]
     exits = [s for s in signals if s.get("signal_type") == "exit"]

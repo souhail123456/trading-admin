@@ -2,7 +2,7 @@ name: Daily Trading Pipeline
 
 on:
   schedule:
-    # Run Mon-Fri at 21:30 UTC (after US market close, 30min after report)
+    # Run Mon-Fri at 21:30 UTC (after US market close, 30min after report) — 5:30 AM+1 Shanghai
     - cron: "30 21 * * 1-5"
   workflow_dispatch: # Allow manual trigger
 
@@ -51,6 +51,33 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python3 -m pipeline.agents.fx_pipeline --daily
 
+      - name: Update bot status
+        if: always()
+        run: |
+          python3 -c "
+          import json
+          from datetime import datetime, timezone, timedelta
+          SHANGHAI_TZ = timezone(timedelta(hours=8))
+          now = datetime.now(SHANGHAI_TZ).isoformat()
+
+          status = {}
+          try:
+              status = json.load(open('shared/bot_status.json'))
+          except:
+              pass
+
+          status['fx_bot'] = {
+              'last_run': now,
+              'status': 'ok',
+              'next_run': 'next weekday 21:30 UTC (5:30 AM Shanghai)'
+          }
+
+          import os
+          os.makedirs('shared', exist_ok=True)
+          json.dump(status, open('shared/bot_status.json', 'w'), indent=2)
+          print(f'FX bot status updated')
+          "
+
       - name: Run performance monitor
         continue-on-error: true
         run: python3 -m pipeline.agents.performance_monitor
@@ -66,7 +93,7 @@ jobs:
         run: |
           git config user.name "trading-admin[bot]"
           git config user.email "bot@trading-admin"
-          git add shared/global_state.json
+          git add shared/global_state.json shared/bot_status.json
           git diff --cached --quiet && echo "No shared state changes" && exit 0
           git commit -m "Update shared state $(date -u +%Y-%m-%d)"
           git push

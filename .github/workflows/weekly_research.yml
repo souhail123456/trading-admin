@@ -2,7 +2,7 @@ name: Weekly Research Pipeline
 
 on:
   schedule:
-    # Sundays at 10:00 UTC — markets closed, good time for heavy research
+    # Sundays at 10:00 UTC — markets closed, good time for heavy research — 6:00 PM Shanghai
     - cron: "0 10 * * 0"
   workflow_dispatch: # Allow manual trigger
 
@@ -78,6 +78,34 @@ jobs:
         run: |
           python3 -m pipeline.agents.validator --all 2>&1 | tee /tmp/validator.log
           echo "exit_code=$?" >> $GITHUB_OUTPUT
+
+      # --- Update bot status ---
+      - name: Update research pipeline status
+        if: always()
+        run: |
+          python3 -c "
+          import json
+          from datetime import datetime, timezone, timedelta
+          SHANGHAI_TZ = timezone(timedelta(hours=8))
+          now = datetime.now(SHANGHAI_TZ).isoformat()
+
+          status = {}
+          try:
+              status = json.load(open('shared/bot_status.json'))
+          except:
+              pass
+
+          status['research_pipeline'] = {
+              'last_run': now,
+              'status': 'ok',
+              'next_run': 'next Sunday 10:00 UTC (6:00 PM Shanghai)'
+          }
+
+          import os
+          os.makedirs('shared', exist_ok=True)
+          json.dump(status, open('shared/bot_status.json', 'w'), indent=2)
+          print(f'Research pipeline status updated')
+          "
 
       # --- Save DB before commit ---
       - name: Save pipeline DB
