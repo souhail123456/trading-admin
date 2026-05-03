@@ -1,0 +1,162 @@
+name: Weekly Research Pipeline
+
+on:
+  schedule:
+    # Sundays at 10:00 UTC — markets closed, good time for heavy research
+    - cron: "0 10 * * 0"
+  workflow_dispatch: # Allow manual trigger
+
+jobs:
+  research:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.BOT_GITHUB_TOKEN }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements-pipeline.txt
+
+      # Restore the shared DB so research builds on prior runs
+      - name: Restore pipeline DB
+        uses: actions/cache@v4
+        with:
+          path: data/pipeline.db
+          key: pipeline-db-${{ github.run_number }}
+          restore-keys: |
+            pipeline-db-
+
+      # Always init DB first to ensure tables exist
+      - name: Init database
+        run: python3 -c "from pipeline.db import init_db; init_db(); print('DB ready')"
+
+      # --- Step 1: Find new strategy papers on Quantpedia ---
+      - name: Run paper_hunter — find new strategies
+        id: paper_hunter
+        continue-on-error: true
+        run: |
+          python3 -m pipeline.agents.paper_hunter --top 20 2>&1 | tee /tmp/paper_hunter.log
+          echo "exit_code=$?" >> $GITHUB_OUTPUT
+
+      # --- Step 2: LLM-extract strategy rules from found papers ---
+      - name: Run paper_reader — extract strategy specs
+        id: paper_reader
+        continue-on-error: true
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          python3 -m pipeline.agents.paper_reader 2>&1 | tee /tmp/paper_reader.log
+          echo "exit_code=$?" >> $GITHUB_OUTPUT
+
+      # --- Step 3: Score, deduplicate, and rank cataloged strategies ---
+      - name: Run cataloger — rank strategies
+        id: cataloger
+        continue-on-error: true
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+        run: |
+          python3 -m pipeline.agents.cataloger 2>&1 | tee /tmp/cataloger.log
+          echo "exit_code=$?" >> $GITHUB_OUTPUT
+
+      # --- Step 4: Stress test ranked strategies (regime, sensitivity, MC) ---
+      - name: Run stress_tester — regime + param sensitivity + Monte Carlo
+        id: stress_tester
+        continue-on-error: true
+        run: |
+          python3 -m pipeline.agents.stress_tester --all 2>&1 | tee /tmp/stress_tester.log
+          echo "exit_code=$?" >> $GITHUB_OUTPUT
+
+      # --- Step 5: Validate stressed strategies against kill criteria ---
+      - name: Run validator — apply kill criteria
+        id: validator
+        continue-on-error: true
+        run: |
+          python3 -m pipeline.agents.validator --all 2>&1 | tee /tmp/validator.log
+          echo "exit_code=$?" >> $GITHUB_OUTPUT
+
+      # --- Save DB before commit ---
+      - name: Save pipeline DB
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: data/pipeline.db
+          key: pipeline-db-${{ github.run_number }}
+
+      # --- Commit any DB or state changes ---
+      - name: Commit research results
+        if: always()
+        run: |
+          git config user.name "trading-admin[bot]"
+          git config user.email "bot@trading-admin"
+          git add -A data/ shared/ || true
+          git diff --cached --quiet && echo "No changes to commit" && exit 0
+          git commit -m "Weekly research run $(date -u +%Y-%m-%d)"
+          git push
+
+      # --- Telegram summary of the full research run ---
+      - name: Send Telegram research summary
+        if: always()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python3 - <<'EOF'
+          import os
+          import requests
+
+          token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+          chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+          if not token or not chat_id:
+              print("Telegram not configured — skipping notification")
+              exit(0)
+
+          # Read agent logs to build summary
+          def tail_log(path, lines=10):
+              try:
+                  with open(path) as f:
+                      content = f.read().strip()
+                  last = content.split("\n")[-lines:]
+                  return "\n".join(last)
+              except FileNotFoundError:
+                  return "(no output)"
+
+          hunter_log  = tail_log("/tmp/paper_hunter.log")
+          reader_log  = tail_log("/tmp/paper_reader.log")
+          catalog_log = tail_log("/tmp/cataloger.log")
+          stress_log  = tail_log("/tmp/stress_tester.log")
+          valid_log   = tail_log("/tmp/validator.log")
+
+          msg = (
+              "📚 *Weekly Research Pipeline*\n"
+              f"Run: `$(date -u +%Y-%m-%d)` (Sunday)\n\n"
+              "━━━━━━━━━━━━━━━━━━━━\n"
+              "*Paper Hunter*\n"
+              f"```\n{hunter_log[-500:]}\n```\n\n"
+              "*Paper Reader*\n"
+              f"```\n{reader_log[-500:]}\n```\n\n"
+              "*Cataloger*\n"
+              f"```\n{catalog_log[-500:]}\n```\n\n"
+              "*Stress Tester*\n"
+              f"```\n{stress_log[-500:]}\n```\n\n"
+              "*Validator*\n"
+              f"```\n{valid_log[-500:]}\n```"
+          )
+
+          # Telegram max message length is 4096
+          msg = msg[:4000]
+
+          resp = requests.post(
+              f"https://api.telegram.org/bot{token}/sendMessage",
+              json={"chat_id": chat_id, "text": msg, "parse_mode": "Markdown"},
+              timeout=15,
+          )
+          if resp.ok:
+              print("Telegram summary sent")
+          else:
+              print(f"Telegram failed: {resp.status_code} {resp.text}")
+          EOF

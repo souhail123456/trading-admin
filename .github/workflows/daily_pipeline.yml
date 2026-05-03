@@ -51,6 +51,10 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python3 -m pipeline.agents.fx_pipeline --daily
 
+      - name: Run performance monitor
+        continue-on-error: true
+        run: python3 -m pipeline.agents.performance_monitor
+
       - name: Cross-bot risk check
         env:
           GH_TOKEN: ${{ secrets.BOT_GITHUB_TOKEN }}
