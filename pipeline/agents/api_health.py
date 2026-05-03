@@ -286,6 +286,52 @@ def check_all() -> list[dict]:
     return results
 
 
+FALLBACK_MAP = {
+    "groq": {"llm_fallback": "gemini"},
+    "capital": {"fx_broker_status": "down", "fx_action": "skip_new_entries"},
+    "alpaca": {"stock_broker_status": "down", "stock_action": "skip_all"},
+    "telegram": {"telegram_status": "down"},
+    "github": {"github_status": "down"},
+    "yfinance": {"market_data_status": "degraded"},
+    "polymarket": {"polymarket_api_status": "down"},
+    # anthropic: not currently used by any bot — skip
+}
+
+STATE_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "shared", "global_state.json")
+
+
+def auto_fallback(results: list[dict]) -> dict:
+    """Build fallback flags for failing APIs and merge into shared/global_state.json."""
+    fallbacks: dict = {}
+    for r in results:
+        check_key = r.get("check", "")
+        if r["status"] in ("error", "no_key", "degraded") and check_key in FALLBACK_MAP:
+            fallbacks.update(FALLBACK_MAP[check_key])
+
+    service_status = {
+        "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        **fallbacks,
+    }
+
+    # Merge into existing global_state.json
+    state_path = os.path.normpath(STATE_PATH)
+    state: dict = {}
+    if os.path.exists(state_path):
+        try:
+            with open(state_path) as f:
+                state = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            state = {}
+
+    state["service_status"] = service_status
+
+    os.makedirs(os.path.dirname(state_path), exist_ok=True)
+    with open(state_path, "w") as f:
+        json.dump(state, f, indent=2)
+
+    return service_status
+
+
 def print_report(results: list[dict]):
     """Print human-readable health report."""
     print(f"\n{'='*70}")
@@ -316,9 +362,16 @@ def print_report(results: list[dict]):
 def main():
     parser = argparse.ArgumentParser(description="API Health Monitor")
     parser.add_argument("--json", action="store_true", help="Output as JSON")
+    parser.add_argument("--fallback", action="store_true",
+                        help="Write fallback flags to shared/global_state.json for failing APIs")
     args = parser.parse_args()
 
     results = check_all()
+
+    if args.fallback:
+        fb = auto_fallback(results)
+        import sys
+        print(f"Fallback flags written: {json.dumps(fb)}", file=sys.stderr)
 
     if args.json:
         # Clean non-serializable fields
