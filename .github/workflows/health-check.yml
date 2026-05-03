@@ -1,0 +1,46 @@
+name: Health Check
+
+on:
+  schedule:
+    - cron: '0 */4 * * *'  # every 4h (24/7, Shanghai UTC+8)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run local health check
+        env:
+          CAPITAL_API_KEY: ${{ secrets.CAPITAL_API_KEY }}
+          CAPITAL_EMAIL: ${{ secrets.CAPITAL_EMAIL }}
+          CAPITAL_PASSWORD: ${{ secrets.CAPITAL_PASSWORD }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          BOT_GITHUB_TOKEN: ${{ secrets.BOT_GITHUB_TOKEN }}
+        run: python src/health_check.py
+
+      - name: Aggregate and report
+        env:
+          BOT_GITHUB_TOKEN: ${{ secrets.BOT_GITHUB_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python src/health_aggregator.py
+
+      - name: Commit health status
+        run: |
+          git config user.name "trading-admin[bot]"
+          git config user.email "bot@trading-admin"
+          git add -f shared/health_status.json
+          git stash
+          git pull --rebase origin main
+          git stash pop || true
+          git add -f shared/health_status.json
+          git diff --cached --quiet || git commit -m "Update health status"
+          git push origin main || (git pull --rebase origin main && git push origin main) || true
