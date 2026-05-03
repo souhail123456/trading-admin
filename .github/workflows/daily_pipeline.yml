@@ -37,6 +37,22 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python3 -m pipeline.agents.fx_pipeline --daily
 
+      - name: Cross-bot risk check
+        env:
+          GH_TOKEN: ${{ secrets.BOT_GITHUB_TOKEN }}
+          STOCK_REPO: ${{ vars.STOCK_REPO || 'souhail123456/trading-bot' }}
+          POLYMARKET_REPO: ${{ vars.POLYMARKET_REPO || 'souhail123456/polymarket-bot' }}
+        run: python3 -m pipeline.agents.cross_bot_risk
+
+      - name: Commit shared state
+        run: |
+          git config user.name "trading-admin[bot]"
+          git config user.email "bot@trading-admin"
+          git add shared/global_state.json
+          git diff --cached --quiet && echo "No shared state changes" && exit 0
+          git commit -m "Update shared state $(date -u +%Y-%m-%d)"
+          git push
+
       - name: Save pipeline DB
         if: always()
         uses: actions/cache/save@v4

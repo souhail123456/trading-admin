@@ -23,7 +23,7 @@ import json
 import logging
 import os
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from pipeline.db import init_db, log_agent_action, get_strategy_params
 
@@ -519,6 +519,28 @@ def run_daily(dry_run: bool = False, db_path: str | None = None):
     except Exception as e:
         log.warning(f"Regime detection failed (continuing): {e}")
         print(f"  Regime detection failed: {e} — proceeding with defaults")
+
+    # Write regime data to shared/global_state.json for other bots
+    state_path = os.path.join(os.path.dirname(__file__), "..", "..", "shared", "global_state.json")
+    try:
+        existing = {}
+        if os.path.exists(state_path):
+            with open(state_path) as f:
+                existing = json.load(f)
+
+        regime_state = {
+            "regime": regime_result["regime"] if regime_result else None,
+            "vix": vix if regime_result else None,
+            "recommendations": regime_result.get("recommendations", {}) if regime_result else {},
+            "updated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        existing.update(regime_state)
+
+        with open(state_path, "w") as f:
+            json.dump(existing, f, indent=2)
+        log.info(f"Regime data written to {state_path}")
+    except Exception as e:
+        log.warning(f"Failed to write regime to global_state.json: {e}")
 
     # Step 2: Generate signals
     from pipeline.agents.fx_signal_generator import generate_fx_signals

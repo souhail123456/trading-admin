@@ -5,3 +5,4 @@ yfinance>=0.2.31
 beautifulsoup4>=4.12
 groq>=0.4
 python-telegram-bot>=20.7
+PyGithub>=2.1
