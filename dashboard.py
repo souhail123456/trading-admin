@@ -1,86 +1,194 @@
 """
-Trading Dashboard
------------------
-Local web dashboard with live charts and position tracking.
-Uses TradingView Lightweight Charts (CDN) for candlestick charts.
+Trading Admin — Unified Dashboard
+----------------------------------
+Web dashboard covering all 3 bots with charts and live data.
+
+Modes:
+  --serve       Local server with live data (http://localhost:8050)
+  --static      Generate static HTML for GitHub Pages deployment
 
 Usage:
-    python3 dashboard.py
-    Open http://localhost:8050
+    python3 dashboard.py --serve
+    python3 dashboard.py --static --output docs/index.html
 """
 
+import argparse
 import json
+import os
 import sqlite3
 from datetime import datetime, timedelta
-from http.server import HTTPServer, SimpleHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
-
-import pandas as pd
+from pathlib import Path
 
 from pipeline.db import init_db
 from pipeline.agents.data_fetcher import fetch_ohlcv, CURRENCY_PAIRS
 
 
-def get_dashboard_data() -> dict:
-    conn = init_db()
+# ---------------------------------------------------------------------------
+# Data fetchers
+# ---------------------------------------------------------------------------
 
+def get_fx_data(conn: sqlite3.Connection) -> dict:
+    """Get FX bot data from local pipeline.db."""
     open_trades = conn.execute(
         "SELECT * FROM paper_trades WHERE status = 'open' AND strategy_id IN (100, 101) ORDER BY opened_at"
     ).fetchall()
-
     closed_trades = conn.execute(
         "SELECT * FROM paper_trades WHERE status = 'closed' AND strategy_id IN (100, 101) ORDER BY closed_at DESC LIMIT 20"
     ).fetchall()
-
     signals = conn.execute(
-        "SELECT * FROM signals WHERE strategy_id IN (100, 101) ORDER BY generated_at DESC LIMIT 20"
+        "SELECT * FROM signals WHERE strategy_id IN (100, 101) ORDER BY generated_at DESC LIMIT 10"
     ).fetchall()
-
-    etf_trades = conn.execute(
-        "SELECT * FROM paper_trades WHERE status = 'open' AND strategy_id NOT IN (100, 101) ORDER BY opened_at"
-    ).fetchall()
-
     all_closed = conn.execute(
         "SELECT * FROM paper_trades WHERE status = 'closed' AND strategy_id IN (100, 101)"
     ).fetchall()
+
     realized = sum(dict(t).get("pnl", 0) or 0 for t in all_closed)
     wins = sum(1 for t in all_closed if (dict(t).get("pnl", 0) or 0) > 0)
     total = len(all_closed)
 
-    agent_log = conn.execute(
-        "SELECT * FROM agent_log ORDER BY created_at DESC LIMIT 15"
-    ).fetchall()
+    # Last regime
+    regime_row = conn.execute(
+        "SELECT outputs FROM agent_log WHERE agent = 'regime_detector' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    regime = None
+    if regime_row:
+        try:
+            regime = json.loads(dict(regime_row)["outputs"])
+        except Exception:
+            pass
 
-    survivors = conn.execute(
-        "SELECT * FROM strategies WHERE status = 'backtest_pass' ORDER BY id"
-    ).fetchall()
+    # Performance snapshots
+    perf_rows = conn.execute(
+        "SELECT * FROM agent_log WHERE agent = 'performance_monitor' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
 
     return {
         "open_trades": [dict(t) for t in open_trades],
         "closed_trades": [dict(t) for t in closed_trades],
-        "etf_trades": [dict(t) for t in etf_trades],
         "signals": [dict(s) for s in signals],
-        "agent_log": [dict(a) for a in agent_log],
-        "survivors": [dict(s) for s in survivors],
-        "stats": {
-            "realized_pnl": round(realized, 2),
-            "win_rate": round(wins / total * 100, 1) if total > 0 else 0,
-            "wins": wins,
-            "total_closed": total,
-            "open_count": len(open_trades),
-        },
+        "realized_pnl": round(realized, 2),
+        "win_rate": round(wins / total * 100, 1) if total > 0 else 0,
+        "wins": wins,
+        "total_closed": total,
+        "open_count": len(open_trades),
+        "regime": regime,
     }
 
 
-def get_chart_data(symbol: str, days: int = 90) -> list[dict]:
-    """Get OHLCV data for charting."""
-    # Map clean symbol to yfinance ticker
-    yf_ticker = symbol + "=X" if "USD" in symbol or "EUR" in symbol or "GBP" in symbol or "JPY" in symbol or "CHF" in symbol or "AUD" in symbol or "NZD" in symbol or "CAD" in symbol else symbol
+def get_stock_data() -> dict:
+    """Get stock bot data via GitHub API."""
+    gh_token = os.environ.get("GH_TOKEN")
+    if not gh_token:
+        return None
+    try:
+        from github import Github
+        gh = Github(gh_token)
+        repo = gh.get_repo(os.environ.get("STOCK_REPO", "souhail123456/trading-bot"))
+        content = repo.get_contents("memory/TRADE-LOG.md").decoded_content.decode()
 
-    # Check if it's in our currency pairs
+        import re
+        match = re.search(r"<!--\s*SUMMARY\s*\n(.*?)-->", content, re.DOTALL)
+        if not match:
+            return None
+
+        summary = {}
+        for line in match.group(1).splitlines():
+            line = line.strip()
+            if not line or ":" not in line:
+                continue
+            key, _, value = line.partition(":")
+            key, value = key.strip(), value.strip()
+            if key in ("portfolio_value", "cash", "total_pnl"):
+                summary[key] = float(value)
+            elif key in ("open_positions", "closed_trades"):
+                summary[key] = json.loads(value)
+            elif key == "last_updated":
+                summary[key] = value
+
+        # Last run
+        last_run = None
+        try:
+            runs = repo.get_workflow_runs(status="completed")
+            if runs.totalCount > 0:
+                last_run = runs[0].created_at.strftime("%Y-%m-%d %H:%M UTC")
+        except Exception:
+            pass
+
+        return {
+            "portfolio_value": summary.get("portfolio_value", 100000),
+            "cash": summary.get("cash", 100000),
+            "total_pnl": summary.get("total_pnl", 0),
+            "open_positions": summary.get("open_positions", []),
+            "closed_trades": summary.get("closed_trades", []),
+            "last_run": last_run,
+        }
+    except Exception as e:
+        print(f"  Stock data fetch failed: {e}")
+        return None
+
+
+def get_poly_data() -> dict:
+    """Get polymarket data via GitHub API."""
+    gh_token = os.environ.get("GH_TOKEN")
+    if not gh_token:
+        return None
+    try:
+        from github import Github
+        gh = Github(gh_token)
+        repo = gh.get_repo(os.environ.get("POLYMARKET_REPO", "souhail123456/polymarket-bot"))
+
+        def parse_jsonl(path):
+            try:
+                content = repo.get_contents(path).decoded_content.decode()
+                return [json.loads(l) for l in content.splitlines() if l.strip()]
+            except Exception:
+                return []
+
+        ev_trades = parse_jsonl("logs/trades.jsonl")
+        weather_trades = parse_jsonl("logs/weather_trades.jsonl")
+
+        def stats(trades):
+            resolved = [t for t in trades if t.get("resolved")]
+            wins = [t for t in resolved if t.get("won")]
+            pnl = sum(float(t.get("realized_pnl", 0)) for t in resolved)
+            risked = sum(float(t.get("size_usd", 0)) for t in trades)
+            return {
+                "total": len(trades),
+                "open": len([t for t in trades if not t.get("resolved")]),
+                "resolved": len(resolved),
+                "wins": len(wins),
+                "losses": len(resolved) - len(wins),
+                "win_rate": round(len(wins) / len(resolved) * 100) if resolved else 0,
+                "pnl": round(pnl, 2),
+                "risked": round(risked, 2),
+            }
+
+        # Last run
+        last_run = None
+        try:
+            runs = repo.get_workflow_runs(status="completed")
+            if runs.totalCount > 0:
+                last_run = runs[0].created_at.strftime("%Y-%m-%d %H:%M UTC")
+        except Exception:
+            pass
+
+        return {
+            "ev": stats(ev_trades),
+            "weather": stats(weather_trades),
+            "ev_recent": ev_trades[-5:],
+            "weather_recent": weather_trades[-5:],
+            "last_run": last_run,
+        }
+    except Exception as e:
+        print(f"  Polymarket data fetch failed: {e}")
+        return None
+
+
+def get_chart_data(symbol: str, days: int = 90) -> dict:
+    """Get OHLCV data for charting."""
+    yf_ticker = symbol + "=X"
     for ticker in CURRENCY_PAIRS:
-        clean = ticker.replace("=X", "")
-        if clean == symbol:
+        if ticker.replace("=X", "") == symbol:
             yf_ticker = ticker
             break
 
@@ -88,560 +196,542 @@ def get_chart_data(symbol: str, days: int = 90) -> list[dict]:
     data = fetch_ohlcv([yf_ticker], start=start, cache=False)
 
     if yf_ticker not in data or data[yf_ticker].empty:
-        return []
+        return {"candles": [], "sma": []}
 
     df = data[yf_ticker]
     candles = []
-    sma_200 = df["close"].rolling(200).mean() if len(df) >= 200 else pd.Series(dtype=float)
-
     for date, row in df.iterrows():
-        candle = {
+        candles.append({
             "time": date.strftime("%Y-%m-%d"),
             "open": round(float(row["open"]), 5),
             "high": round(float(row["high"]), 5),
             "low": round(float(row["low"]), 5),
             "close": round(float(row["close"]), 5),
-        }
-        candles.append(candle)
+        })
 
-    # SMA data
     sma_data = []
     if len(df) >= 200:
         sma_200 = df["close"].rolling(200).mean()
         for date, val in sma_200.dropna().items():
-            sma_data.append({
-                "time": date.strftime("%Y-%m-%d"),
-                "value": round(float(val), 5),
-            })
+            sma_data.append({"time": date.strftime("%Y-%m-%d"), "value": round(float(val), 5)})
 
     return {"candles": candles, "sma": sma_data}
 
 
-def get_live_prices(symbols: list[str]) -> dict:
-    """Get latest prices for open positions."""
-    prices = {}
-    for symbol in symbols:
-        yf_ticker = None
-        for ticker in CURRENCY_PAIRS:
-            if ticker.replace("=X", "") == symbol:
-                yf_ticker = ticker
-                break
-        if not yf_ticker:
-            continue
-        start = (datetime.now() - timedelta(days=5)).strftime("%Y-%m-%d")
-        data = fetch_ohlcv([yf_ticker], start=start, cache=False)
-        if yf_ticker in data and not data[yf_ticker].empty:
-            prices[symbol] = round(float(data[yf_ticker]["close"].iloc[-1]), 5)
-    return prices
+# ---------------------------------------------------------------------------
+# HTML builder
+# ---------------------------------------------------------------------------
 
-
-def build_html() -> str:
-    data = get_dashboard_data()
+def build_dashboard(fx: dict, stock: dict | None, poly: dict | None, chart_data: dict | None = None) -> str:
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-    # Get live prices for open positions
-    open_symbols = [t["symbol"] for t in data["open_trades"]]
-    live_prices = get_live_prices(open_symbols) if open_symbols else {}
+    # Aggregate totals
+    bots_online = 1  # FX always online
+    total_pnl = fx["realized_pnl"]
+    if stock:
+        bots_online += 1
+        total_pnl += stock.get("total_pnl", 0)
+    if poly:
+        bots_online += 1
+        total_pnl += poly["ev"]["pnl"] + poly["weather"]["pnl"]
 
-    # Build position rows with live P&L
-    open_rows = ""
-    total_unrealized = 0
-    for t in data["open_trades"]:
-        symbol = t["symbol"]
-        entry = t["entry_price"]
-        current = live_prices.get(symbol, entry)
-        qty = t.get("quantity", 0) or 0
+    regime = fx.get("regime") or {}
+    regime_label = regime.get("regime", "N/A")
+    regime_desc = regime.get("description", "")
+    vix = regime.get("vix", "N/A")
 
-        # P&L calculation for FX micro lots
-        # For JPY pairs: pip value is different
-        if "JPY" in symbol:
-            pips = (current - entry) * 100
-            pnl = pips * qty * 0.01  # ~$0.01 per pip per micro lot for JPY pairs at this scale
-        else:
-            pips = (current - entry) * 10000
-            pnl = pips * qty * 0.10  # ~$0.10 per pip per micro lot
+    # Chart JSON
+    chart_json = json.dumps(chart_data or {"candles": [], "sma": []})
 
-        pnl_class = "pos" if pnl >= 0 else "neg"
-        total_unrealized += pnl
-
-        open_rows += f"""<tr class="position-row" data-symbol="{symbol}" onclick="showChart('{symbol}')">
-            <td><strong>{symbol}</strong></td>
+    # FX position rows
+    fx_rows = ""
+    for t in fx["open_trades"]:
+        tag = "T" if t["strategy_id"] == 100 else "PA"
+        days = ""
+        if t.get("opened_at"):
+            try:
+                d = (datetime.now() - datetime.strptime(t["opened_at"][:19], "%Y-%m-%dT%H:%M:%S")).days
+                days = f"{d}d"
+            except Exception:
+                pass
+        fx_rows += f"""<tr>
+            <td><span class="badge badge-{tag.lower()}">{tag}</span> <b>{t['symbol']}</b></td>
             <td>{t['side'].upper()}</td>
-            <td>{qty:.0f}</td>
-            <td>{entry}</td>
-            <td>{current}</td>
-            <td>{pips:+.1f}</td>
-            <td class="{pnl_class}">${pnl:+.2f}</td>
-            <td>{str(t.get('opened_at', ''))[:10]}</td>
-        </tr>"""
-
-    if not open_rows:
-        open_rows = '<tr><td colspan="8" style="text-align:center;color:#888;padding:20px">No open FX positions</td></tr>'
-
-    # Chart symbols for tabs
-    chart_symbols = open_symbols if open_symbols else ["EURUSD", "GBPUSD", "USDJPY"]
-    chart_tabs = ""
-    for i, sym in enumerate(chart_symbols):
-        active = "active" if i == 0 else ""
-        chart_tabs += f'<button class="chart-tab {active}" onclick="showChart(\'{sym}\')">{sym}</button>'
-
-    # Add all 10 pairs as extra tabs
-    all_pairs = [t.replace("=X", "") for t in CURRENCY_PAIRS.keys()]
-    for sym in all_pairs:
-        if sym not in chart_symbols:
-            chart_tabs += f'<button class="chart-tab" onclick="showChart(\'{sym}\')">{sym}</button>'
-
-    # Signals
-    signal_rows = ""
-    for s in data["signals"]:
-        state = json.loads(s["full_state"]) if isinstance(s["full_state"], str) else s["full_state"]
-        strategy = "TREND" if s["strategy_id"] == 100 else "PA"
-        css_class = "entry" if s["signal_type"] == "entry" else "exit"
-        strength = state.get("trend_strength", state.get("bull_score", "—"))
-        signal_rows += f"""<tr class="{css_class}">
-            <td>{str(s['generated_at'])[:16]}</td>
-            <td><span class="badge badge-{strategy.lower()}">{strategy}</span></td>
-            <td><strong>{s['symbol']}</strong></td>
-            <td class="sig-{s['signal_type']}">{s['signal_type'].upper()}</td>
-            <td>{s['price_at_signal']}</td>
-            <td>{strength}</td>
-        </tr>"""
-
-    # Closed trades
-    closed_rows = ""
-    for t in data["closed_trades"]:
-        pnl = t.get("pnl", 0) or 0
-        r = t.get("r_multiple", 0) or 0
-        css = "win" if pnl > 0 else "loss" if pnl < 0 else ""
-        closed_rows += f"""<tr class="{css}">
-            <td>{t['symbol']}</td>
+            <td>{t.get('quantity', '?')}</td>
             <td>{t['entry_price']}</td>
-            <td>{t.get('exit_price', '—')}</td>
-            <td class="pnl">${pnl:+.2f}</td>
-            <td>{r:+.1f}R</td>
-            <td>{str(t.get('closed_at', ''))[:10]}</td>
+            <td>{days}</td>
         </tr>"""
-    if not closed_rows:
-        closed_rows = '<tr><td colspan="6" style="text-align:center;color:#888">No closed trades yet</td></tr>'
+    if not fx_rows:
+        fx_rows = '<tr><td colspan="5" class="empty">No open positions</td></tr>'
 
-    # Agent log
-    log_rows = ""
-    for a in data["agent_log"]:
-        log_rows += f"""<tr>
-            <td>{str(a['created_at'])[:16]}</td>
-            <td><span class="badge">{a['agent']}</span></td>
-            <td>{a['action']}</td>
-        </tr>"""
-
-    # Survivors
-    survivor_rows = ""
-    for s in data["survivors"]:
-        survivor_rows += f"""<tr>
-            <td>{s['id']}</td>
-            <td><strong>{s['name']}</strong></td>
-            <td>{s['asset_universe'][:30]}</td>
+    # FX signal rows
+    signal_rows = ""
+    for s in fx.get("signals", [])[:8]:
+        state = json.loads(s["full_state"]) if isinstance(s["full_state"], str) else (s["full_state"] or {})
+        tag = "T" if s["strategy_id"] == 100 else "PA"
+        css = "entry" if s["signal_type"] == "entry" else "exit"
+        signal_rows += f"""<tr>
+            <td>{str(s['generated_at'])[:10]}</td>
+            <td><span class="badge badge-{tag.lower()}">{tag}</span></td>
+            <td><b>{s['symbol']}</b></td>
+            <td class="sig-{css}">{s['signal_type'].upper()}</td>
+            <td>{s['price_at_signal']}</td>
         </tr>"""
 
-    stats = data["stats"]
-    portfolio_val = 10000 + stats["realized_pnl"] + total_unrealized
-    default_chart = chart_symbols[0] if chart_symbols else "EURUSD"
+    # Stock section
+    stock_html = ""
+    if stock:
+        pv = stock["portfolio_value"]
+        pnl = stock["total_pnl"]
+        pnl_pct = (pnl / 100000) * 100
+        pos_html = ""
+        for p in stock.get("open_positions", []):
+            unrealized = p.get("unrealized_pnl", 0)
+            pos_html += f"""<tr>
+                <td><b>{p['symbol']}</b></td>
+                <td>{p.get('side', 'BUY')}</td>
+                <td>{p['shares']}</td>
+                <td>${p['entry']}</td>
+                <td class="{'pos' if unrealized >= 0 else 'neg'}">${unrealized:+,.2f}</td>
+            </tr>"""
+        if not pos_html:
+            pos_html = '<tr><td colspan="5" class="empty">No open positions</td></tr>'
 
-    # Get initial chart data
-    initial_chart = get_chart_data(default_chart, days=120)
-    initial_candles_json = json.dumps(initial_chart.get("candles", []))
-    initial_sma_json = json.dumps(initial_chart.get("sma", []))
+        closed_html = ""
+        for t in stock.get("closed_trades", [])[:5]:
+            rpnl = t.get("realized_pnl", 0)
+            closed_html += f"""<tr>
+                <td>{t.get('symbol','?')}</td>
+                <td>${t.get('entry','?')}</td>
+                <td>${t.get('exit','?')}</td>
+                <td class="{'pos' if rpnl >= 0 else 'neg'}">${rpnl:+,.2f}</td>
+            </tr>"""
 
-    # Entry markers for chart
-    entry_markers = []
-    for t in data["open_trades"]:
-        if t["symbol"] == default_chart:
-            entry_markers.append({
-                "time": str(t.get("opened_at", ""))[:10],
-                "position": "belowBar",
-                "color": "#00d4aa",
-                "shape": "arrowUp",
-                "text": f"LONG @ {t['entry_price']}",
-            })
-    markers_json = json.dumps(entry_markers)
+        stock_html = f"""
+        <div class="bot-card">
+            <div class="bot-header">
+                <div class="bot-title">STOCK/ETF BOT <span class="bot-tag">Alpaca</span></div>
+                <div class="bot-pnl {'pos' if pnl >= 0 else 'neg'}">${pnl:+,.2f} ({pnl_pct:+.2f}%)</div>
+            </div>
+            <div class="bot-stats">
+                <div class="mini-stat"><span class="label">Portfolio</span><span class="val">${pv:,.2f}</span></div>
+                <div class="mini-stat"><span class="label">Cash</span><span class="val">${stock.get('cash', 0):,.2f}</span></div>
+                <div class="mini-stat"><span class="label">Positions</span><span class="val">{len(stock.get('open_positions', []))}</span></div>
+                <div class="mini-stat"><span class="label">Last Run</span><span class="val">{stock.get('last_run', 'N/A')}</span></div>
+            </div>
+            <table>
+                <tr><th>Symbol</th><th>Side</th><th>Shares</th><th>Entry</th><th>Unrealized</th></tr>
+                {pos_html}
+            </table>
+            {f'<h3>Closed Trades</h3><table><tr><th>Symbol</th><th>Entry</th><th>Exit</th><th>P&L</th></tr>{closed_html}</table>' if closed_html else ''}
+        </div>"""
+
+    # Polymarket section
+    poly_html = ""
+    if poly:
+        ev = poly["ev"]
+        w = poly["weather"]
+        total_poly_pnl = ev["pnl"] + w["pnl"]
+
+        # Recent trades
+        recent_html = ""
+        for t in (poly.get("weather_recent", []) + poly.get("ev_recent", []))[-6:]:
+            q = (t.get("market") or t.get("question", "?"))[:40]
+            size = float(t.get("size_usd", 0))
+            st = "WON" if t.get("won") else "LOST" if t.get("resolved") else "OPEN"
+            rpnl = float(t.get("realized_pnl", 0) or 0)
+            css = "pos" if rpnl > 0 else "neg" if rpnl < 0 else ""
+            recent_html += f'<tr><td>{q}</td><td>${size:.2f}</td><td>{st}</td><td class="{css}">${rpnl:+.2f}</td></tr>'
+
+        poly_html = f"""
+        <div class="bot-card">
+            <div class="bot-header">
+                <div class="bot-title">POLYMARKET BOT <span class="bot-tag">Paper</span></div>
+                <div class="bot-pnl {'pos' if total_poly_pnl >= 0 else 'neg'}">${total_poly_pnl:+,.2f}</div>
+            </div>
+            <div class="bot-stats">
+                <div class="mini-stat"><span class="label">EV Trades</span><span class="val">{ev['total']} ({ev['open']} open)</span></div>
+                <div class="mini-stat"><span class="label">EV Win Rate</span><span class="val">{ev['win_rate']}%</span></div>
+                <div class="mini-stat"><span class="label">EV P&L</span><span class="val">${ev['pnl']:+.2f}</span></div>
+                <div class="mini-stat"><span class="label">Weather Trades</span><span class="val">{w['total']} ({w['open']} open)</span></div>
+                <div class="mini-stat"><span class="label">Weather Win Rate</span><span class="val">{w['win_rate']}%</span></div>
+                <div class="mini-stat"><span class="label">Weather P&L</span><span class="val">${w['pnl']:+.2f}</span></div>
+            </div>
+            <h3>Recent Trades</h3>
+            <table>
+                <tr><th>Market</th><th>Size</th><th>Status</th><th>P&L</th></tr>
+                {recent_html}
+            </table>
+        </div>"""
+
+    # FX section
+    fx_pnl = fx["realized_pnl"]
+    fx_html = f"""
+    <div class="bot-card">
+        <div class="bot-header">
+            <div class="bot-title">FX BOT <span class="bot-tag">Capital.com</span></div>
+            <div class="bot-pnl {'pos' if fx_pnl >= 0 else 'neg'}">${fx_pnl:+,.2f}</div>
+        </div>
+        <div class="bot-stats">
+            <div class="mini-stat"><span class="label">Open</span><span class="val">{fx['open_count']}</span></div>
+            <div class="mini-stat"><span class="label">Closed</span><span class="val">{fx['total_closed']}</span></div>
+            <div class="mini-stat"><span class="label">Win Rate</span><span class="val">{fx['win_rate']}%</span></div>
+            <div class="mini-stat"><span class="label">Regime</span><span class="val regime-{regime_label.lower()}">{regime_label}</span></div>
+        </div>
+        <h3>Open Positions</h3>
+        <table>
+            <tr><th>Symbol</th><th>Side</th><th>Lots</th><th>Entry</th><th>Held</th></tr>
+            {fx_rows}
+        </table>
+        <h3>Recent Signals</h3>
+        <table>
+            <tr><th>Date</th><th>Strategy</th><th>Symbol</th><th>Type</th><th>Price</th></tr>
+            {signal_rows}
+        </table>
+    </div>"""
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>FX Trading Pipeline</title>
+<title>Trading Admin Dashboard</title>
 <script src="https://unpkg.com/lightweight-charts@4.1.0/dist/lightweight-charts.standalone.production.js"></script>
 <style>
-    * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-    body {{
-        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace;
-        background: #0a0e17;
-        color: #e0e0e0;
-        padding: 16px;
-    }}
-    .header {{
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        margin-bottom: 20px;
-        padding-bottom: 12px;
-        border-bottom: 1px solid #1e2a3a;
-    }}
-    .header h1 {{ color: #00d4aa; font-size: 22px; }}
-    .header .time {{ color: #888; font-size: 13px; }}
-    .header .mode {{
-        background: #0d3320;
-        color: #00d4aa;
-        padding: 4px 12px;
-        border-radius: 4px;
-        font-size: 12px;
-    }}
-    .stats {{
-        display: grid;
-        grid-template-columns: repeat(5, 1fr);
-        gap: 12px;
-        margin-bottom: 20px;
-    }}
-    .stat-card {{
-        background: #111827;
-        border: 1px solid #1e2a3a;
-        border-radius: 8px;
-        padding: 14px;
-    }}
-    .stat-card .label {{ color: #888; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }}
-    .stat-card .value {{ font-size: 24px; font-weight: bold; margin-top: 4px; }}
-    .green {{ color: #00d4aa; }}
-    .blue {{ color: #3b82f6; }}
-    .yellow {{ color: #f59e0b; }}
-    .red {{ color: #ef4444; }}
-    .pos {{ color: #00d4aa; font-weight: bold; }}
-    .neg {{ color: #ef4444; font-weight: bold; }}
+* {{ margin: 0; padding: 0; box-sizing: border-box; }}
+body {{
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace;
+    background: #0a0e17;
+    color: #e0e0e0;
+    padding: 20px;
+    max-width: 1400px;
+    margin: 0 auto;
+}}
 
-    .chart-container {{
-        background: #111827;
-        border: 1px solid #1e2a3a;
-        border-radius: 8px;
-        margin-bottom: 20px;
-        overflow: hidden;
-    }}
-    .chart-header {{
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        padding: 8px 12px;
-        border-bottom: 1px solid #1e2a3a;
-    }}
-    .chart-tabs {{
-        display: flex;
-        gap: 4px;
-        flex-wrap: wrap;
-    }}
-    .chart-tab {{
-        background: #1e2a3a;
-        color: #888;
-        border: none;
-        padding: 4px 10px;
-        border-radius: 4px;
-        cursor: pointer;
-        font-size: 12px;
-        font-family: monospace;
-    }}
-    .chart-tab:hover {{ background: #2a3a4a; color: #fff; }}
-    .chart-tab.active {{ background: #00d4aa; color: #0a0e17; }}
-    #chart {{ height: 400px; }}
-    .chart-symbol {{ color: #00d4aa; font-size: 16px; font-weight: bold; }}
-    .chart-price {{ color: #fff; font-size: 14px; margin-left: 12px; }}
+/* Header */
+.header {{
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 24px;
+    padding-bottom: 16px;
+    border-bottom: 1px solid #1e2a3a;
+}}
+.header h1 {{ color: #00d4aa; font-size: 24px; }}
+.header .meta {{ color: #666; font-size: 13px; }}
 
-    .section {{
-        background: #111827;
-        border: 1px solid #1e2a3a;
-        border-radius: 8px;
-        margin-bottom: 16px;
-        overflow: hidden;
-    }}
-    .section h2 {{
-        padding: 10px 14px;
-        font-size: 12px;
-        text-transform: uppercase;
-        letter-spacing: 1px;
-        color: #666;
-        border-bottom: 1px solid #1e2a3a;
-    }}
-    table {{ width: 100%; border-collapse: collapse; }}
-    th {{
-        text-align: left;
-        padding: 6px 10px;
-        font-size: 10px;
-        text-transform: uppercase;
-        color: #555;
-        border-bottom: 1px solid #1e2a3a;
-    }}
-    td {{ padding: 7px 10px; font-size: 12px; border-bottom: 1px solid #0d1520; }}
-    tr:hover {{ background: #1a2332; }}
-    .position-row {{ cursor: pointer; }}
-    .position-row:hover {{ background: #1a3332 !important; }}
-    .sig-entry {{ color: #00d4aa; font-weight: bold; }}
-    .sig-exit {{ color: #ef4444; font-weight: bold; }}
-    tr.win td.pnl {{ color: #00d4aa; }}
-    tr.loss td.pnl {{ color: #ef4444; }}
-    .badge {{
-        display: inline-block;
-        padding: 2px 8px;
-        border-radius: 4px;
-        font-size: 10px;
-        font-weight: bold;
-        background: #1e2a3a;
-        color: #888;
-    }}
-    .badge-trend {{ background: #0d3320; color: #00d4aa; }}
-    .badge-pa {{ background: #1e1a33; color: #8b5cf6; }}
-    .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }}
-    .grid3 {{ display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; }}
-    @media (max-width: 900px) {{
-        .grid, .grid3 {{ grid-template-columns: 1fr; }}
-        .stats {{ grid-template-columns: repeat(2, 1fr); }}
-    }}
+/* Overview cards */
+.overview {{
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 14px;
+    margin-bottom: 24px;
+}}
+.overview-card {{
+    background: #111827;
+    border: 1px solid #1e2a3a;
+    border-radius: 10px;
+    padding: 18px;
+}}
+.overview-card .label {{ color: #666; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }}
+.overview-card .value {{ font-size: 28px; font-weight: bold; margin-top: 6px; }}
+.overview-card .sub {{ font-size: 12px; color: #555; margin-top: 4px; }}
+
+/* Colors */
+.pos {{ color: #00d4aa; }}
+.neg {{ color: #ef4444; }}
+.green {{ color: #00d4aa; }}
+.blue {{ color: #3b82f6; }}
+.yellow {{ color: #f59e0b; }}
+.red {{ color: #ef4444; }}
+
+/* Regime */
+.regime-trending {{ color: #00d4aa; }}
+.regime-ranging {{ color: #f59e0b; }}
+.regime-volatile {{ color: #ef4444; }}
+.regime-crisis {{ color: #ef4444; font-weight: bold; }}
+.regime-n\\/a {{ color: #666; }}
+
+/* Chart */
+.chart-container {{
+    background: #111827;
+    border: 1px solid #1e2a3a;
+    border-radius: 10px;
+    margin-bottom: 24px;
+    overflow: hidden;
+}}
+.chart-header {{
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 10px 16px;
+    border-bottom: 1px solid #1e2a3a;
+}}
+.chart-title {{ color: #00d4aa; font-size: 16px; font-weight: bold; }}
+#chart {{ height: 350px; }}
+
+/* Bot cards */
+.bots {{ display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; margin-bottom: 24px; }}
+.bot-card {{
+    background: #111827;
+    border: 1px solid #1e2a3a;
+    border-radius: 10px;
+    padding: 16px;
+    overflow: hidden;
+}}
+.bot-header {{
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 14px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid #1e2a3a;
+}}
+.bot-title {{ font-size: 14px; font-weight: bold; }}
+.bot-tag {{
+    background: #1e2a3a;
+    color: #888;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 10px;
+    font-weight: normal;
+    margin-left: 6px;
+}}
+.bot-pnl {{ font-size: 18px; font-weight: bold; }}
+.bot-stats {{
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 8px;
+    margin-bottom: 14px;
+}}
+.mini-stat {{
+    background: #0d1520;
+    border-radius: 6px;
+    padding: 8px 10px;
+}}
+.mini-stat .label {{ display: block; font-size: 10px; color: #555; text-transform: uppercase; }}
+.mini-stat .val {{ display: block; font-size: 13px; font-weight: bold; margin-top: 2px; }}
+
+h3 {{
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: #555;
+    margin: 14px 0 8px;
+}}
+
+/* Tables */
+table {{ width: 100%; border-collapse: collapse; }}
+th {{
+    text-align: left;
+    padding: 5px 8px;
+    font-size: 10px;
+    text-transform: uppercase;
+    color: #444;
+    border-bottom: 1px solid #1e2a3a;
+}}
+td {{ padding: 6px 8px; font-size: 12px; border-bottom: 1px solid #0d1520; }}
+tr:hover {{ background: #1a2332; }}
+.empty {{ text-align: center; color: #555; padding: 16px !important; }}
+
+.badge {{
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 10px;
+    font-weight: bold;
+}}
+.badge-t {{ background: #0d3320; color: #00d4aa; }}
+.badge-pa {{ background: #1e1a33; color: #8b5cf6; }}
+
+.sig-entry {{ color: #00d4aa; font-weight: bold; }}
+.sig-exit {{ color: #ef4444; font-weight: bold; }}
+
+/* Regime bar */
+.regime-bar {{
+    background: #111827;
+    border: 1px solid #1e2a3a;
+    border-radius: 10px;
+    padding: 12px 18px;
+    margin-bottom: 24px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}}
+.regime-bar .regime-label {{ font-size: 14px; }}
+.regime-bar .regime-detail {{ font-size: 12px; color: #666; }}
+
+/* Footer */
+.footer {{ text-align: center; color: #333; font-size: 11px; margin-top: 24px; padding-top: 16px; border-top: 1px solid #1e2a3a; }}
+
+@media (max-width: 1000px) {{
+    .bots {{ grid-template-columns: 1fr; }}
+    .overview {{ grid-template-columns: repeat(2, 1fr); }}
+    .bot-stats {{ grid-template-columns: repeat(2, 1fr); }}
+}}
 </style>
 </head>
 <body>
 
 <div class="header">
-    <h1>FX Trading Pipeline</h1>
-    <span class="mode">DEMO — $10K</span>
-    <div class="time">{now} | <a href="/" style="color:#3b82f6;text-decoration:none">Refresh</a></div>
+    <h1>Trading Admin</h1>
+    <div class="meta">{now} | {bots_online}/3 bots online</div>
 </div>
 
-<div class="stats">
-    <div class="stat-card">
-        <div class="label">Portfolio Value</div>
-        <div class="value green">${portfolio_val:,.0f}</div>
+<div class="overview">
+    <div class="overview-card">
+        <div class="label">Total P&L</div>
+        <div class="value {'green' if total_pnl >= 0 else 'red'}">${total_pnl:+,.2f}</div>
     </div>
-    <div class="stat-card">
-        <div class="label">Open Positions</div>
-        <div class="value blue">{stats['open_count']}</div>
+    <div class="overview-card">
+        <div class="label">Regime</div>
+        <div class="value regime-{regime_label.lower()}">{regime_label}</div>
+        <div class="sub">VIX: {vix}</div>
     </div>
-    <div class="stat-card">
-        <div class="label">Unrealized P&L</div>
-        <div class="value {'green' if total_unrealized >= 0 else 'red'}">${total_unrealized:+,.2f}</div>
+    <div class="overview-card">
+        <div class="label">FX Win Rate</div>
+        <div class="value yellow">{fx['win_rate']}%</div>
+        <div class="sub">{fx['wins']}/{fx['total_closed']} trades</div>
     </div>
-    <div class="stat-card">
-        <div class="label">Realized P&L</div>
-        <div class="value {'green' if stats['realized_pnl'] >= 0 else 'red'}">${stats['realized_pnl']:+,.2f}</div>
-    </div>
-    <div class="stat-card">
-        <div class="label">Win Rate</div>
-        <div class="value yellow">{stats['win_rate']}% <span style="font-size:12px;color:#666">({stats['wins']}/{stats['total_closed']})</span></div>
+    <div class="overview-card">
+        <div class="label">Bots Online</div>
+        <div class="value blue">{bots_online}/3</div>
     </div>
 </div>
 
 <div class="chart-container">
     <div class="chart-header">
-        <div>
-            <span class="chart-symbol" id="chart-symbol">{default_chart}</span>
-            <span class="chart-price" id="chart-price"></span>
-        </div>
-        <div class="chart-tabs">
-            {chart_tabs}
-        </div>
+        <span class="chart-title">EURUSD</span>
     </div>
     <div id="chart"></div>
 </div>
 
-<div class="section">
-    <h2>Open FX Positions (click to view chart)</h2>
-    <table>
-        <tr><th>Symbol</th><th>Side</th><th>Lots</th><th>Entry</th><th>Current</th><th>Pips</th><th>P&L</th><th>Opened</th></tr>
-        {open_rows}
-    </table>
+<div class="bots">
+    {stock_html if stock_html else '<div class="bot-card"><div class="bot-header"><div class="bot-title">STOCK/ETF BOT</div></div><div class="empty">Offline — no GH_TOKEN</div></div>'}
+    {fx_html}
+    {poly_html if poly_html else '<div class="bot-card"><div class="bot-header"><div class="bot-title">POLYMARKET BOT</div></div><div class="empty">Offline — no GH_TOKEN</div></div>'}
 </div>
 
-<div class="grid">
-    <div class="section">
-        <h2>Recent Signals</h2>
-        <table>
-            <tr><th>Time</th><th>Strategy</th><th>Symbol</th><th>Type</th><th>Price</th><th>Strength</th></tr>
-            {signal_rows}
-        </table>
-    </div>
-    <div class="section">
-        <h2>Trade History</h2>
-        <table>
-            <tr><th>Symbol</th><th>Entry</th><th>Exit</th><th>P&L</th><th>R</th><th>Date</th></tr>
-            {closed_rows}
-        </table>
-    </div>
-</div>
-
-<div class="grid3">
-    <div class="section">
-        <h2>Strategy Survivors</h2>
-        <table>
-            <tr><th>ID</th><th>Name</th><th>Universe</th></tr>
-            {survivor_rows}
-        </table>
-    </div>
-    <div class="section" style="grid-column: span 2">
-        <h2>Agent Activity</h2>
-        <table>
-            <tr><th>Time</th><th>Agent</th><th>Action</th></tr>
-            {log_rows}
-        </table>
-    </div>
-</div>
+<div class="footer">Trading Admin Dashboard | Auto-generated {now}</div>
 
 <script>
-// Chart setup
 const chartEl = document.getElementById('chart');
-const chart = LightweightCharts.createChart(chartEl, {{
-    width: chartEl.clientWidth,
-    height: 400,
-    layout: {{
-        background: {{ color: '#111827' }},
-        textColor: '#888',
-    }},
-    grid: {{
-        vertLines: {{ color: '#1e2a3a' }},
-        horzLines: {{ color: '#1e2a3a' }},
-    }},
-    crosshair: {{
-        mode: LightweightCharts.CrosshairMode.Normal,
-    }},
-    rightPriceScale: {{
-        borderColor: '#1e2a3a',
-    }},
-    timeScale: {{
-        borderColor: '#1e2a3a',
-        timeVisible: false,
-    }},
-}});
-
-const candleSeries = chart.addCandlestickSeries({{
-    upColor: '#00d4aa',
-    downColor: '#ef4444',
-    borderUpColor: '#00d4aa',
-    borderDownColor: '#ef4444',
-    wickUpColor: '#00d4aa',
-    wickDownColor: '#ef4444',
-}});
-
-const smaSeries = chart.addLineSeries({{
-    color: '#f59e0b',
-    lineWidth: 2,
-    title: 'SMA 200',
-}});
-
-// Load initial data
-const initialCandles = {initial_candles_json};
-const initialSma = {initial_sma_json};
-const initialMarkers = {markers_json};
-
-candleSeries.setData(initialCandles);
-smaSeries.setData(initialSma);
-if (initialMarkers.length > 0) candleSeries.setMarkers(initialMarkers);
-chart.timeScale().fitContent();
-
-if (initialCandles.length > 0) {{
-    const last = initialCandles[initialCandles.length - 1];
-    document.getElementById('chart-price').textContent = last.close;
-}}
-
-// Resize
-window.addEventListener('resize', () => {{
-    chart.applyOptions({{ width: chartEl.clientWidth }});
-}});
-
-// Chart switching
-function showChart(symbol) {{
-    document.getElementById('chart-symbol').textContent = symbol;
-    document.querySelectorAll('.chart-tab').forEach(t => t.classList.remove('active'));
-    document.querySelectorAll('.chart-tab').forEach(t => {{
-        if (t.textContent === symbol) t.classList.add('active');
+if (chartEl) {{
+    const chart = LightweightCharts.createChart(chartEl, {{
+        width: chartEl.clientWidth,
+        height: 350,
+        layout: {{ background: {{ color: '#111827' }}, textColor: '#888' }},
+        grid: {{ vertLines: {{ color: '#1e2a3a' }}, horzLines: {{ color: '#1e2a3a' }} }},
+        rightPriceScale: {{ borderColor: '#1e2a3a' }},
+        timeScale: {{ borderColor: '#1e2a3a', timeVisible: false }},
     }});
 
-    fetch('/api/chart?symbol=' + symbol)
-        .then(r => r.json())
-        .then(data => {{
-            candleSeries.setData(data.candles || []);
-            smaSeries.setData(data.sma || []);
-            chart.timeScale().fitContent();
-            if (data.candles && data.candles.length > 0) {{
-                const last = data.candles[data.candles.length - 1];
-                document.getElementById('chart-price').textContent = last.close;
-            }}
-            // Add entry markers for this symbol
-            fetch('/api/markers?symbol=' + symbol)
-                .then(r => r.json())
-                .then(markers => {{
-                    if (markers.length > 0) candleSeries.setMarkers(markers);
-                    else candleSeries.setMarkers([]);
-                }});
+    const cd = {chart_json};
+    if (cd.candles && cd.candles.length > 0) {{
+        const cs = chart.addCandlestickSeries({{
+            upColor: '#00d4aa', downColor: '#ef4444',
+            borderUpColor: '#00d4aa', borderDownColor: '#ef4444',
+            wickUpColor: '#00d4aa', wickDownColor: '#ef4444',
         }});
+        cs.setData(cd.candles);
+        if (cd.sma && cd.sma.length > 0) {{
+            const sma = chart.addLineSeries({{ color: '#f59e0b', lineWidth: 2, title: 'SMA 200' }});
+            sma.setData(cd.sma);
+        }}
+        chart.timeScale().fitContent();
+    }}
+
+    window.addEventListener('resize', () => chart.applyOptions({{ width: chartEl.clientWidth }}));
 }}
 </script>
-
 </body>
 </html>"""
 
     return html
 
 
-class DashboardHandler(SimpleHTTPRequestHandler):
-    def do_GET(self):
-        parsed = urlparse(self.path)
+# ---------------------------------------------------------------------------
+# Modes
+# ---------------------------------------------------------------------------
 
-        if parsed.path == "/api/chart":
-            params = parse_qs(parsed.query)
-            symbol = params.get("symbol", ["EURUSD"])[0]
-            data = get_chart_data(symbol, days=120)
-            self.send_response(200)
-            self.send_header("Content-type", "application/json")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            self.wfile.write(json.dumps(data).encode())
+def serve(port: int = 8050):
+    """Run local dashboard server."""
+    from http.server import HTTPServer, SimpleHTTPRequestHandler
+    from urllib.parse import urlparse, parse_qs
 
-        elif parsed.path == "/api/markers":
-            params = parse_qs(parsed.query)
-            symbol = params.get("symbol", [""])[0]
-            conn = init_db()
-            trades = conn.execute(
-                "SELECT * FROM paper_trades WHERE status = 'open' AND symbol = ?", (symbol,)
-            ).fetchall()
-            markers = []
-            for t in trades:
-                t = dict(t)
-                markers.append({
-                    "time": str(t.get("opened_at", ""))[:10],
-                    "position": "belowBar",
-                    "color": "#00d4aa",
-                    "shape": "arrowUp",
-                    "text": f"LONG @ {t['entry_price']}",
-                })
-            self.send_response(200)
-            self.send_header("Content-type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps(markers).encode())
+    class Handler(SimpleHTTPRequestHandler):
+        def do_GET(self):
+            parsed = urlparse(self.path)
+            if parsed.path == "/api/chart":
+                params = parse_qs(parsed.query)
+                symbol = params.get("symbol", ["EURUSD"])[0]
+                data = get_chart_data(symbol, days=120)
+                self.send_response(200)
+                self.send_header("Content-type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps(data).encode())
+            else:
+                conn = init_db()
+                fx = get_fx_data(conn)
+                stock = get_stock_data()
+                poly = get_poly_data()
+                chart = get_chart_data("EURUSD", days=120)
+                html = build_dashboard(fx, stock, poly, chart)
+                self.send_response(200)
+                self.send_header("Content-type", "text/html")
+                self.end_headers()
+                self.wfile.write(html.encode())
 
-        else:
-            self.send_response(200)
-            self.send_header("Content-type", "text/html")
-            self.end_headers()
-            html = build_html()
-            self.wfile.write(html.encode())
+        def log_message(self, *args):
+            pass
 
-    def log_message(self, format, *args):
-        pass
-
-
-def main():
-    port = 8050
-    server = HTTPServer(("localhost", port), DashboardHandler)
-    print(f"Dashboard running at http://localhost:{port}")
-    print("Press Ctrl+C to stop")
+    server = HTTPServer(("localhost", port), Handler)
+    print(f"Dashboard at http://localhost:{port}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\nStopped.")
         server.server_close()
+
+
+def generate_static(output: str = "docs/index.html"):
+    """Generate static HTML dashboard."""
+    print("Generating static dashboard...")
+    conn = init_db()
+
+    print("  Fetching FX data...")
+    fx = get_fx_data(conn)
+
+    print("  Fetching stock data...")
+    stock = get_stock_data()
+
+    print("  Fetching polymarket data...")
+    poly = get_poly_data()
+
+    print("  Fetching chart data...")
+    chart = get_chart_data("EURUSD", days=120)
+
+    html = build_dashboard(fx, stock, poly, chart)
+
+    out_path = Path(output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(html)
+    print(f"  Dashboard written to {output}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Trading Admin Dashboard")
+    parser.add_argument("--serve", action="store_true", help="Run local web server")
+    parser.add_argument("--static", action="store_true", help="Generate static HTML")
+    parser.add_argument("--output", default="docs/index.html", help="Output path for static mode")
+    parser.add_argument("--port", type=int, default=8050)
+    args = parser.parse_args()
+
+    if args.serve:
+        serve(port=args.port)
+    elif args.static:
+        generate_static(output=args.output)
+    else:
+        serve(port=args.port)
 
 
 if __name__ == "__main__":
