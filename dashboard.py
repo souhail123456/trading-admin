@@ -222,7 +222,43 @@ def get_chart_data(symbol: str, days: int = 90) -> dict:
 # HTML builder
 # ---------------------------------------------------------------------------
 
-def build_dashboard(fx: dict, stock: dict | None, poly: dict | None, chart_data: dict | None = None) -> str:
+def _build_api_health_html(api_health: list[dict] | None) -> str:
+    if not api_health:
+        return ""
+
+    rows = ""
+    for a in api_health:
+        status = a.get("status", "unknown")
+        css = {"ok": "pos", "degraded": "yellow", "error": "neg", "no_key": "dim"}.get(status, "dim")
+        icon = {"ok": "OK", "degraded": "SLOW", "error": "DOWN", "no_key": "N/A"}.get(status, "?")
+        latency = f'{a["latency_ms"]}ms' if "latency_ms" in a else "-"
+        fallback = a.get("fallback", "")
+        rows += f"""<tr>
+            <td><b>{a['name']}</b></td>
+            <td>{a.get('bot', '')}</td>
+            <td class="{css}"><b>{icon}</b></td>
+            <td>{latency}</td>
+            <td style="color:#666;font-size:11px">{a.get('message', '')}</td>
+            <td style="color:#555;font-size:10px">{fallback[:60]}</td>
+        </tr>"""
+
+    ok = sum(1 for a in api_health if a.get("status") == "ok")
+    total = len(api_health)
+
+    return f"""
+    <div class="bot-card" style="grid-column: 1 / -1; margin-top: 8px;">
+        <div class="bot-header">
+            <div class="bot-title">API STATUS <span class="bot-tag">{ok}/{total} OK</span></div>
+        </div>
+        <table>
+            <tr><th>Service</th><th>Bot</th><th>Status</th><th>Latency</th><th>Details</th><th>Fallback</th></tr>
+            {rows}
+        </table>
+    </div>"""
+
+
+def build_dashboard(fx: dict, stock: dict | None, poly: dict | None,
+                    chart_data: dict | None = None, api_health: list[dict] | None = None) -> str:
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
     # Aggregate totals
@@ -444,6 +480,7 @@ body {{
 .blue {{ color: #3b82f6; }}
 .yellow {{ color: #f59e0b; }}
 .red {{ color: #ef4444; }}
+.dim {{ color: #555; }}
 
 /* Regime */
 .regime-trending {{ color: #00d4aa; }}
@@ -612,6 +649,8 @@ tr:hover {{ background: #1a2332; }}
     {poly_html if poly_html else '<div class="bot-card"><div class="bot-header"><div class="bot-title">POLYMARKET BOT</div></div><div class="empty">Offline — no GH_TOKEN</div></div>'}
 </div>
 
+{_build_api_health_html(api_health)}
+
 <div class="footer">Trading Admin Dashboard | Auto-generated {now}</div>
 
 <script>
@@ -676,7 +715,12 @@ def serve(port: int = 8050):
                 stock = get_stock_data()
                 poly = get_poly_data()
                 chart = get_chart_data("EURUSD", days=120)
-                html = build_dashboard(fx, stock, poly, chart)
+                try:
+                    from pipeline.agents.api_health import check_all
+                    api_health = check_all()
+                except Exception:
+                    api_health = None
+                html = build_dashboard(fx, stock, poly, chart, api_health)
                 self.send_response(200)
                 self.send_header("Content-type", "text/html")
                 self.end_headers()
@@ -710,7 +754,15 @@ def generate_static(output: str = "docs/index.html"):
     print("  Fetching chart data...")
     chart = get_chart_data("EURUSD", days=120)
 
-    html = build_dashboard(fx, stock, poly, chart)
+    print("  Running API health checks...")
+    try:
+        from pipeline.agents.api_health import check_all
+        api_health = check_all()
+    except Exception as e:
+        print(f"    Health check failed: {e}")
+        api_health = None
+
+    html = build_dashboard(fx, stock, poly, chart, api_health)
 
     out_path = Path(output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
