@@ -335,7 +335,9 @@ def execute_decisions(conn: sqlite3.Connection, decisions: list[dict], dry_run: 
 # Telegram + Status
 # ---------------------------------------------------------------------------
 
-def _send_fx_telegram(conn: sqlite3.Connection, signals: list[dict], mode: str, closed_by_monitor: list[dict] = None):
+def _send_fx_telegram(conn: sqlite3.Connection, signals: list[dict], mode: str,
+                      closed_by_monitor: list[dict] = None, regime: dict = None,
+                      perf_alerts: list[dict] = None):
     """Send FX pipeline summary to Telegram."""
     import requests as _req
 
@@ -360,8 +362,17 @@ def _send_fx_telegram(conn: sqlite3.Connection, signals: list[dict], mode: str, 
     lines = [
         f"<b>FX Pipeline — {datetime.now().strftime('%Y-%m-%d')}</b>",
         f"Mode: {mode}",
-        "",
     ]
+
+    # Regime info
+    if regime:
+        r = regime["regime"]
+        vix = regime.get("vix")
+        adx = regime.get("avg_adx")
+        vix_str = f"VIX:{vix}" if vix else ""
+        adx_str = f"ADX:{adx}" if adx else ""
+        lines.append(f"Regime: <b>{r}</b> ({vix_str} {adx_str})")
+    lines.append("")
 
     if entries:
         lines.append(f"<b>ENTRIES ({len(entries)})</b>")
@@ -401,6 +412,13 @@ def _send_fx_telegram(conn: sqlite3.Connection, signals: list[dict], mode: str, 
             tag = "T" if t["strategy_id"] == TREND_STRATEGY_ID else "PA"
             opened = t.get("opened_at", "?")[:10]
             lines.append(f"  [{tag}] {t['symbol']} {t['side']} {t.get('quantity', '?')} lots @ {t['entry_price']} ({opened})")
+
+    # Performance alerts
+    if perf_alerts:
+        lines.append("")
+        lines.append(f"<b>ALERTS ({len(perf_alerts)})</b>")
+        for a in perf_alerts:
+            lines.append(f"  [{a['severity']}] {a['message']}")
 
     _req.post(
         f"https://api.telegram.org/bot{bot_token}/sendMessage",
@@ -465,7 +483,7 @@ def run_daily(dry_run: bool = False, db_path: str | None = None):
     print(f"{'#'*60}")
 
     # Step 0: Monitor existing positions (time stops, % stops)
-    print("\n[0/4] Monitoring open positions...")
+    print("\n[0/6] Monitoring open positions...")
     broker_for_monitor = _get_broker() if not dry_run else None
     closed_by_monitor = monitor_positions(conn, broker=broker_for_monitor, dry_run=dry_run)
     if closed_by_monitor:
@@ -475,33 +493,107 @@ def run_daily(dry_run: bool = False, db_path: str | None = None):
     if broker_for_monitor:
         broker_for_monitor.disconnect()
 
-    # Step 1: Generate signals
+    # Step 1: Regime detection — determine market conditions before trading
+    print("\n[1/6] Regime detection...")
+    regime_result = None
+    paused_strategies = set()
+    reduced_strategies = set()
+    try:
+        from pipeline.agents.regime_detector import classify_regime, get_vix, get_fx_adx
+        vix = get_vix()
+        fx_adx = get_fx_adx()
+        regime_result = classify_regime(vix, fx_adx)
+        regime = regime_result["regime"]
+        print(f"  Regime: {regime} — {regime_result['description']}")
+
+        for sid, rec in regime_result.get("recommendations", {}).items():
+            action = rec["action"]
+            name = {100: "FX Trend", 101: "FX Price Action"}.get(sid, f"Strategy {sid}")
+            print(f"    [{sid}] {name}: {action} — {rec['reason']}")
+            if action == "PAUSE":
+                paused_strategies.add(sid)
+            elif action == "REDUCE":
+                reduced_strategies.add(sid)
+
+        log_agent_action(conn, "regime_detector", "regime_classified", outputs=regime_result)
+    except Exception as e:
+        log.warning(f"Regime detection failed (continuing): {e}")
+        print(f"  Regime detection failed: {e} — proceeding with defaults")
+
+    # Step 2: Generate signals
     from pipeline.agents.fx_signal_generator import generate_fx_signals
-    print("\n[1/4] Generating FX signals...")
+    print("\n[2/6] Generating FX signals...")
     signals = generate_fx_signals(dry_run=dry_run, db_path=db_path)
 
-    # Step 2: Risk check
-    print("\n[2/4] Risk management...")
+    # Filter signals based on regime
+    if paused_strategies or reduced_strategies:
+        filtered = []
+        for s in signals:
+            sid = s.get("strategy_id")
+            if s["signal_type"] == "exit":
+                # Always allow exits
+                filtered.append(s)
+            elif sid in paused_strategies:
+                print(f"  REGIME PAUSE: skipping {s['symbol']} entry (strategy {sid})")
+            else:
+                filtered.append(s)
+        signals = filtered
+
+    # Step 3: Risk check
+    print("\n[3/6] Risk management...")
     if signals:
         decisions = fx_risk_check(conn, signals)
+
+        # Halve position sizes for REDUCE strategies
+        for d in decisions:
+            if d.get("approved") and d.get("action") == "entry" and d.get("strategy_id") in reduced_strategies:
+                d["micro_lots"] = max(d["micro_lots"] // 2, 1)
+                d["risk_amount"] = round(d["risk_amount"] / 2, 2)
+                print(f"  REGIME REDUCE: {d['symbol']} position halved to {d['micro_lots']} micro lots")
+
         approved = [d for d in decisions if d["approved"]]
         vetoed = [d for d in decisions if not d["approved"]]
         print(f"  {len(approved)} approved, {len(vetoed)} vetoed")
 
-        # Step 3: Execute
-        print("\n[3/4] Executing...")
+        # Step 4: Execute
+        print("\n[4/6] Executing...")
         execute_decisions(conn, decisions, dry_run=dry_run)
     else:
         print("  No signals to evaluate.")
-        print("\n[3/4] Nothing to execute.")
+        print("\n[4/6] Nothing to execute.")
 
-    # Step 4: Status + Telegram
-    print("\n[4/4] Portfolio status...")
+    # Step 5: Performance monitor
+    print("\n[5/6] Performance check...")
+    perf_results = []
+    perf_alerts = []
+    try:
+        from pipeline.agents.performance_monitor import analyze_strategy
+        for sid in [TREND_STRATEGY_ID, PA_STRATEGY_ID]:
+            r = analyze_strategy(conn, sid)
+            perf_results.append(r)
+            if r["status"] == "no_data":
+                print(f"  [{sid}] {r['name']}: no closed trades yet")
+            else:
+                sharpe_str = f"{r['rolling_sharpe']:.2f}" if r['rolling_sharpe'] is not None else "N/A"
+                print(f"  [{sid}] {r['name']}: Sharpe={sharpe_str} WR={r['win_rate']}% P&L=${r['total_pnl']:+.2f}")
+                for a in r["alerts"]:
+                    perf_alerts.append(a)
+                    print(f"    [{a['severity']}] {a['message']}")
+
+        log_agent_action(conn, "performance_monitor", "daily_check",
+                         outputs={"strategies": len(perf_results), "alerts": len(perf_alerts)})
+    except Exception as e:
+        log.warning(f"Performance monitor failed (continuing): {e}")
+        print(f"  Performance monitor failed: {e}")
+
+    # Step 6: Status + Telegram
+    print("\n[6/6] Portfolio status...")
     fx_portfolio_status(conn)
 
     if os.environ.get("TELEGRAM_BOT_TOKEN") and os.environ.get("TELEGRAM_CHAT_ID"):
         try:
-            _send_fx_telegram(conn, signals, mode, closed_by_monitor)
+            _send_fx_telegram(conn, signals, mode, closed_by_monitor,
+                              regime=regime_result, perf_alerts=perf_alerts)
             print("  Telegram alert sent.")
         except Exception as e:
             log.error(f"Telegram alert failed: {e}")
@@ -513,6 +605,10 @@ def run_daily(dry_run: bool = False, db_path: str | None = None):
             "mode": mode,
             "dry_run": dry_run,
             "monitor_closed": len(closed_by_monitor),
+            "regime": regime_result["regime"] if regime_result else None,
+            "paused": list(paused_strategies),
+            "reduced": list(reduced_strategies),
+            "perf_alerts": len(perf_alerts),
         },
     )
 
