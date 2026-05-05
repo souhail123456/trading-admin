@@ -31,6 +31,24 @@ log = logging.getLogger(__name__)
 FX_TREND_STRATEGY_ID = 100
 FX_PA_STRATEGY_ID = 101
 
+# ---------------------------------------------------------------------------
+# Carry trade overlay — central bank policy rates (updated manually)
+# ---------------------------------------------------------------------------
+CENTRAL_BANK_RATES = {
+    "USD": 4.50, "EUR": 2.65, "GBP": 4.50, "JPY": 0.50,
+    "CHF": 0.25, "AUD": 4.10, "CAD": 2.75, "NZD": 3.50,
+}
+
+
+def calculate_carry(pair: str) -> float:
+    """Return annualized carry (%) for going long the pair.
+    Long = buy base (first 3 chars), sell quote (last 3 chars).
+    E.g. AUDUSD long: AUD rate - USD rate = 4.10 - 4.50 = -0.40
+    """
+    base = pair[:3]
+    quote = pair[3:6]
+    return CENTRAL_BANK_RATES.get(base, 0.0) - CENTRAL_BANK_RATES.get(quote, 0.0)
+
 # yfinance ticker to clean symbol mapping
 def _clean_symbol(ticker: str) -> str:
     """EURUSD=X -> EURUSD"""
@@ -62,17 +80,25 @@ def fx_trend_signals(data: dict[str, pd.DataFrame], params: dict | None = None) 
         above = latest["close"] > latest_sma
         strength = (latest["close"] - latest_sma) / latest_sma if latest_sma > 0 else 0
 
+        pair = _clean_symbol(ticker)
+        carry = calculate_carry(pair)
+        carry_normalized = carry / 10.0
+        composite = float(strength) * 0.7 + carry_normalized * 0.3
+
         state = {
             "close": round(float(latest["close"]), 5),
             "sma_200": round(float(latest_sma), 5),
             "above_sma": bool(above),
             "trend_strength": round(float(strength), 4),
+            "carry_pct": round(carry, 2),
+            "carry_normalized": round(carry_normalized, 4),
+            "composite_score": round(composite, 4),
             "date": str(df.index[-1].date()),
-            "pair": _clean_symbol(ticker),
+            "pair": pair,
         }
 
         if above:
-            candidates.append((ticker, strength, state))
+            candidates.append((ticker, composite, state))
         else:
             # Check if just dropped below (exit signal)
             if len(df) >= 2 and df.iloc[-2]["close"] > sma.iloc[-2]:
@@ -86,9 +112,11 @@ def fx_trend_signals(data: dict[str, pd.DataFrame], params: dict | None = None) 
                     "full_state": {**state, "reason": "dropped_below_sma"},
                 })
 
-    # Top N by trend strength
+    # Top N by composite score (trend strength * 0.7 + carry * 0.3)
     candidates.sort(key=lambda x: x[1], reverse=True)
-    for ticker, strength, state in candidates[:top_n]:
+    for ticker, composite, state in candidates[:top_n]:
+        log.info(f"  CARRY: {state['pair']} carry={state['carry_pct']:+.2f}% "
+                 f"trend={state['trend_strength']:.4f} composite={state['composite_score']:.4f}")
         signals.append({
             "strategy": "fx_trend",
             "strategy_id": FX_TREND_STRATEGY_ID,
