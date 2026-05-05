@@ -24,7 +24,6 @@ import logging
 import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
-
 from pipeline.db import init_db, log_agent_action, get_strategy_params
 
 logging.basicConfig(
@@ -46,6 +45,55 @@ PA_STRATEGY_ID = 101
 # Defaults (overridden by DB parameters)
 _DEFAULT_TREND_PARAMS = {"stop_loss_pips": 80, "max_hold_days": None, "stop_loss_pct": None}
 _DEFAULT_PA_PARAMS = {"stop_loss_pips": 40, "max_hold_days": 15, "stop_loss_pct": 0.03}
+
+# Safety net: trend positions without explicit max_hold get closed after this many days
+TREND_SAFETY_MAX_HOLD = 90
+
+# ATR cache (session-level, avoids repeated yfinance calls)
+_atr_cache: dict[str, float | None] = {}
+
+
+def get_atr(pair: str, period: int = 14) -> float | None:
+    """Fetch ATR(period) for a currency pair using yfinance daily data.
+
+    Returns ATR in price terms (e.g. 0.0080 for EURUSD = 80 pips).
+    Caches results for the session to avoid repeated API calls.
+    """
+    if pair in _atr_cache:
+        return _atr_cache[pair]
+
+    try:
+        import yfinance as yf
+        import pandas as pd
+
+        ticker = f"{pair[:3]}{pair[3:]}=X"
+        df = yf.download(ticker, period="1mo", interval="1d", progress=False)
+        if df is None or len(df) < period + 1:
+            _atr_cache[pair] = None
+            return None
+
+        high = df["High"].values.flatten()
+        low = df["Low"].values.flatten()
+        close = df["Close"].values.flatten()
+
+        # True Range calculation
+        tr = [high[0] - low[0]]
+        for i in range(1, len(high)):
+            tr.append(max(
+                high[i] - low[i],
+                abs(high[i] - close[i - 1]),
+                abs(low[i] - close[i - 1]),
+            ))
+
+        # Simple moving average of TR for ATR
+        atr_val = float(sum(tr[-period:]) / period)
+        _atr_cache[pair] = atr_val
+        log.info(f"  [ATR] {pair}: ATR({period}) = {atr_val:.5f}")
+        return atr_val
+    except Exception as e:
+        log.warning(f"  [ATR] {pair}: failed to compute ATR: {e}")
+        _atr_cache[pair] = None
+        return None
 
 
 def _get_broker():
@@ -111,29 +159,118 @@ def monitor_positions(conn: sqlite3.Connection, broker=None, dry_run: bool = Fal
         params = pa_params if t["strategy_id"] == PA_STRATEGY_ID else trend_params
         max_hold = params.get("max_hold_days")
         stop_pct = params.get("stop_loss_pct")
+        is_trend = t["strategy_id"] == TREND_STRATEGY_ID
+
+        # Safety net: trend positions without max_hold get a 90-day hard cap
+        effective_max_hold = max_hold if max_hold else (TREND_SAFETY_MAX_HOLD if is_trend else None)
 
         # Check max hold period
-        if max_hold and t.get("opened_at"):
+        if effective_max_hold and t.get("opened_at"):
             opened = datetime.strptime(t["opened_at"][:19], "%Y-%m-%dT%H:%M:%S")
             days_held = (now - opened).days
 
-            if days_held >= max_hold:
+            if days_held >= effective_max_hold:
                 should_close = True
-                close_reason = f"Max hold ({days_held} days >= {max_hold})"
+                label = "Safety max hold" if not max_hold else "Max hold"
+                close_reason = f"{label} ({days_held} days >= {effective_max_hold})"
 
-            # Check % stop loss if broker has live price
-            if not should_close and stop_pct and broker and t.get("entry_price"):
-                try:
-                    price_data = broker.get_price(t["symbol"])
-                    if price_data:
-                        current = price_data["bid"]
-                        entry = float(t["entry_price"])
-                        pct_change = (current - entry) / entry
-                        if pct_change <= -stop_pct:
+        # Bug fix: stop_pct check runs independently of max_hold
+        if not should_close and stop_pct and broker and t.get("entry_price"):
+            try:
+                price_data = broker.get_price(t["symbol"])
+                if price_data:
+                    current = price_data["bid"]
+                    entry = float(t["entry_price"])
+                    pct_change = (current - entry) / entry
+                    if pct_change <= -stop_pct:
+                        should_close = True
+                        close_reason = f"Stop loss ({pct_change:.1%} <= -{stop_pct:.0%})"
+            except Exception:
+                pass
+
+        # ATR-adaptive trailing stop for TREND positions only
+        if not should_close and is_trend and broker and t.get("entry_price"):
+            try:
+                price_data = broker.get_price(t["symbol"])
+                if price_data:
+                    current = price_data["bid"]
+                    entry = float(t["entry_price"])
+                    side = t.get("side", "long")
+                    atr = get_atr(t["symbol"])
+
+                    if atr and atr > 0:
+                        if side == "long":
+                            unrealized = current - entry
+                            if unrealized >= 2 * atr:
+                                # Profit trail: lock in at current - 1x ATR
+                                effective_stop = current - atr
+                                if current <= effective_stop:
+                                    should_close = True
+                                    close_reason = (f"ATR trailing stop (unrealized={unrealized:+.5f}, "
+                                                    f"ATR={atr:.5f}, trail @ {effective_stop:.5f})")
+                                else:
+                                    log.info(f"  [TRAIL] {t['symbol']}: ATR={atr:.5f}, "
+                                             f"unrealized={unrealized:+.5f}, trailing stop @ {effective_stop:.5f}")
+                            elif unrealized >= 1 * atr:
+                                # Break-even lock
+                                effective_stop = entry
+                                if current <= effective_stop:
+                                    should_close = True
+                                    close_reason = f"ATR break-even stop (ATR={atr:.5f})"
+                                else:
+                                    log.info(f"  [TRAIL] {t['symbol']}: ATR={atr:.5f}, "
+                                             f"unrealized={unrealized:+.5f}, stop=break-even @ {entry:.5f}")
+                            else:
+                                # Initial stop: 2x ATR below entry
+                                effective_stop = entry - 2 * atr
+                                if current <= effective_stop:
+                                    should_close = True
+                                    close_reason = (f"ATR initial stop (current={current:.5f} <= "
+                                                    f"stop={effective_stop:.5f}, 2xATR={2*atr:.5f})")
+                                else:
+                                    log.info(f"  [TRAIL] {t['symbol']}: ATR={atr:.5f}, "
+                                             f"unrealized={unrealized:+.5f}, initial stop @ {effective_stop:.5f}")
+                        else:
+                            # Short position: mirror logic
+                            unrealized = entry - current
+                            if unrealized >= 2 * atr:
+                                effective_stop = current + atr
+                                if current >= effective_stop:
+                                    should_close = True
+                                    close_reason = (f"ATR trailing stop (unrealized={unrealized:+.5f}, "
+                                                    f"ATR={atr:.5f}, trail @ {effective_stop:.5f})")
+                                else:
+                                    log.info(f"  [TRAIL] {t['symbol']}: ATR={atr:.5f}, "
+                                             f"unrealized={unrealized:+.5f}, trailing stop @ {effective_stop:.5f}")
+                            elif unrealized >= 1 * atr:
+                                effective_stop = entry
+                                if current >= effective_stop:
+                                    should_close = True
+                                    close_reason = f"ATR break-even stop (ATR={atr:.5f})"
+                                else:
+                                    log.info(f"  [TRAIL] {t['symbol']}: ATR={atr:.5f}, "
+                                             f"unrealized={unrealized:+.5f}, stop=break-even @ {entry:.5f}")
+                            else:
+                                effective_stop = entry + 2 * atr
+                                if current >= effective_stop:
+                                    should_close = True
+                                    close_reason = (f"ATR initial stop (current={current:.5f} >= "
+                                                    f"stop={effective_stop:.5f}, 2xATR={2*atr:.5f})")
+                                else:
+                                    log.info(f"  [TRAIL] {t['symbol']}: ATR={atr:.5f}, "
+                                             f"unrealized={unrealized:+.5f}, initial stop @ {effective_stop:.5f}")
+                    else:
+                        # ATR unavailable — fall back to fixed 80-pip stop
+                        pip_mult = 0.01 if "JPY" in t["symbol"] else 0.0001
+                        fixed_stop_dist = 80 * pip_mult
+                        if side == "long" and current <= entry - fixed_stop_dist:
                             should_close = True
-                            close_reason = f"Stop loss ({pct_change:.1%} <= -{stop_pct:.0%})"
-                except Exception:
-                    pass
+                            close_reason = f"Fixed 80-pip stop (no ATR, current={current:.5f})"
+                        elif side == "short" and current >= entry + fixed_stop_dist:
+                            should_close = True
+                            close_reason = f"Fixed 80-pip stop (no ATR, current={current:.5f})"
+            except Exception as e:
+                log.warning(f"  [TRAIL] {t['symbol']}: error checking ATR stop: {e}")
 
         if should_close:
             log.info(f"  MONITOR EXIT: {t['symbol']} — {close_reason}")
@@ -268,6 +405,8 @@ def fx_risk_check(conn: sqlite3.Connection, signals: list[dict]) -> list[dict]:
     ).fetchall()
     open_count = len(open_trades)
     open_symbols = [dict(t)["symbol"] for t in open_trades]
+    # Track open symbol+strategy pairs for dedup (prevents duplicate entries same day)
+    open_sym_strat = {(dict(t)["symbol"], dict(t)["strategy_id"]) for t in open_trades}
     # Track open positions as dicts for correlation guard (updated as we approve entries)
     open_pos_list = [dict(t) for t in open_trades]
 
@@ -290,8 +429,9 @@ def fx_risk_check(conn: sqlite3.Connection, signals: list[dict]) -> list[dict]:
             decisions.append({**signal, "approved": False, "reason": f"max {MAX_POSITIONS} positions"})
             continue
 
-        if symbol in open_symbols:
-            decisions.append({**signal, "approved": False, "reason": f"already holding {symbol}"})
+        strategy_id = signal.get("strategy_id")
+        if (symbol, strategy_id) in open_sym_strat:
+            decisions.append({**signal, "approved": False, "reason": f"already holding {symbol} (strategy {strategy_id})"})
             continue
 
         # Correlation guard
@@ -330,6 +470,7 @@ def fx_risk_check(conn: sqlite3.Connection, signals: list[dict]) -> list[dict]:
         })
         open_count += 1
         open_symbols.append(symbol)
+        open_sym_strat.add((symbol, strategy_id))
         open_pos_list.append({"symbol": symbol, "side": signal["side"]})
 
     return decisions
