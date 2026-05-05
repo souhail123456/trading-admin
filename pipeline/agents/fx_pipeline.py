@@ -49,8 +49,43 @@ _DEFAULT_PA_PARAMS = {"stop_loss_pips": 40, "max_hold_days": 15, "stop_loss_pct"
 # Safety net: trend positions without explicit max_hold get closed after this many days
 TREND_SAFETY_MAX_HOLD = 90
 
+# Regime-aware limits
+RANGING_MAX_TREND_POSITIONS = 1  # reduce from 3 to 1 in ranging
+VOLATILE_ATR_MULTIPLIER = 1.5   # tighter stops in volatile (vs 2.0 normal)
+NORMAL_ATR_MULTIPLIER = 2.0
+RANGING_MIN_COMPOSITE_SCORE = 7.0  # block weak trend entries in ranging
+
 # ATR cache (session-level, avoids repeated yfinance calls)
 _atr_cache: dict[str, float | None] = {}
+
+
+def get_current_regime(conn: sqlite3.Connection) -> dict | None:
+    """Load the latest regime classification from global_state.json or agent_log.
+
+    Returns dict with keys: regime, vix, recommendations, updated.
+    """
+    # Try global_state.json first (written by run_daily step 1)
+    state_path = os.path.join(os.path.dirname(__file__), "..", "..", "shared", "global_state.json")
+    try:
+        if os.path.exists(state_path):
+            with open(state_path) as f:
+                data = json.load(f)
+            if data.get("regime"):
+                return data
+    except Exception:
+        pass
+
+    # Fallback: most recent regime entry from agent_log
+    try:
+        row = conn.execute(
+            "SELECT outputs FROM agent_log WHERE agent = 'regime_detector' AND action = 'regime_classified' ORDER BY ts DESC LIMIT 1"
+        ).fetchone()
+        if row:
+            return json.loads(row[0]) if isinstance(row[0], str) else row[0]
+    except Exception:
+        pass
+
+    return None
 
 
 def get_atr(pair: str, period: int = 14) -> float | None:
@@ -150,6 +185,110 @@ def monitor_positions(conn: sqlite3.Connection, broker=None, dry_run: bool = Fal
         "SELECT * FROM paper_trades WHERE status = 'open' AND strategy_id IN (100, 101)"
     ).fetchall()
 
+    # --- Regime-aware position management ---
+    regime_data = get_current_regime(conn)
+    current_regime = regime_data.get("regime") if regime_data else None
+    if current_regime:
+        log.info(f"  [REGIME] Current regime: {current_regime}")
+
+    # CRISIS: close ALL trend positions immediately
+    if current_regime == "CRISIS":
+        trend_trades = [dict(r) for r in open_trades if dict(r)["strategy_id"] == TREND_STRATEGY_ID]
+        if trend_trades:
+            log.info(f"  [REGIME] CRISIS: closing ALL {len(trend_trades)} trend positions immediately")
+            for t in trend_trades:
+                exit_price = None
+                pnl = None
+                if broker:
+                    try:
+                        price_data = broker.get_price(t["symbol"])
+                        if price_data:
+                            exit_price = price_data["bid"]
+                    except Exception:
+                        pass
+                if exit_price and t.get("entry_price"):
+                    entry = float(t["entry_price"])
+                    qty = float(t.get("quantity", 1))
+                    pnl = ((exit_price - entry) if t["side"] == "long" else (entry - exit_price)) * qty * 1000
+
+                if not dry_run:
+                    conn.execute(
+                        """UPDATE paper_trades
+                           SET status = 'closed', closed_at = ?, exit_price = ?, pnl = ?
+                           WHERE id = ?""",
+                        (now.strftime("%Y-%m-%dT%H:%M:%SZ"), exit_price, pnl, t["id"]),
+                    )
+                    conn.commit()
+                    _close_broker_position(broker, t["symbol"], t.get("broker_order_id"))
+
+                closed.append({**t, "close_reason": f"[REGIME] CRISIS: emergency close all trend positions"})
+            # Reload open_trades after crisis closures
+            open_trades = conn.execute(
+                "SELECT * FROM paper_trades WHERE status = 'open' AND strategy_id IN (100, 101)"
+            ).fetchall()
+
+    # RANGING: reduce trend positions to max 1, close weakest by trend strength
+    if current_regime == "RANGING":
+        trend_trades = [dict(r) for r in open_trades if dict(r)["strategy_id"] == TREND_STRATEGY_ID]
+        if len(trend_trades) > RANGING_MAX_TREND_POSITIONS:
+            excess = len(trend_trades) - RANGING_MAX_TREND_POSITIONS
+            log.info(f"  [REGIME] RANGING: reducing trend positions from {len(trend_trades)} to "
+                     f"{RANGING_MAX_TREND_POSITIONS}, closing weakest {excess}")
+
+            # Rank by trend strength: unrealized P&L as proxy (weakest = lowest P&L)
+            for t in trend_trades:
+                t["_strength"] = 0.0
+                if broker and t.get("entry_price"):
+                    try:
+                        price_data = broker.get_price(t["symbol"])
+                        if price_data:
+                            current = price_data["bid"]
+                            entry = float(t["entry_price"])
+                            t["_strength"] = (current - entry) if t["side"] == "long" else (entry - current)
+                    except Exception:
+                        pass
+
+            # Sort ascending by strength — weakest first
+            trend_trades.sort(key=lambda x: x["_strength"])
+            to_close = trend_trades[:excess]
+
+            for t in to_close:
+                exit_price = None
+                pnl = None
+                if broker:
+                    try:
+                        price_data = broker.get_price(t["symbol"])
+                        if price_data:
+                            exit_price = price_data["bid"]
+                    except Exception:
+                        pass
+                if exit_price and t.get("entry_price"):
+                    entry = float(t["entry_price"])
+                    qty = float(t.get("quantity", 1))
+                    pnl = ((exit_price - entry) if t["side"] == "long" else (entry - exit_price)) * qty * 1000
+
+                if not dry_run:
+                    conn.execute(
+                        """UPDATE paper_trades
+                           SET status = 'closed', closed_at = ?, exit_price = ?, pnl = ?
+                           WHERE id = ?""",
+                        (now.strftime("%Y-%m-%dT%H:%M:%SZ"), exit_price, pnl, t["id"]),
+                    )
+                    conn.commit()
+                    _close_broker_position(broker, t["symbol"], t.get("broker_order_id"))
+
+                closed.append({**t, "close_reason": f"[REGIME] RANGING: weakest trend position (strength={t['_strength']:+.5f})"})
+
+            # Reload open_trades after ranging closures
+            open_trades = conn.execute(
+                "SELECT * FROM paper_trades WHERE status = 'open' AND strategy_id IN (100, 101)"
+            ).fetchall()
+
+    # Determine ATR multiplier based on regime (VOLATILE = tighter)
+    atr_multiplier = VOLATILE_ATR_MULTIPLIER if current_regime == "VOLATILE" else NORMAL_ATR_MULTIPLIER
+    if current_regime == "VOLATILE":
+        log.info(f"  [REGIME] VOLATILE: ATR multiplier tightened to {atr_multiplier}x (from {NORMAL_ATR_MULTIPLIER}x)")
+
     for row in open_trades:
         t = dict(row)
         should_close = False
@@ -201,7 +340,7 @@ def monitor_positions(conn: sqlite3.Connection, broker=None, dry_run: bool = Fal
                     if atr and atr > 0:
                         if side == "long":
                             unrealized = current - entry
-                            if unrealized >= 2 * atr:
+                            if unrealized >= atr_multiplier * atr:
                                 # Profit trail: lock in at current - 1x ATR
                                 effective_stop = current - atr
                                 if current <= effective_stop:
@@ -221,19 +360,19 @@ def monitor_positions(conn: sqlite3.Connection, broker=None, dry_run: bool = Fal
                                     log.info(f"  [TRAIL] {t['symbol']}: ATR={atr:.5f}, "
                                              f"unrealized={unrealized:+.5f}, stop=break-even @ {entry:.5f}")
                             else:
-                                # Initial stop: 2x ATR below entry
-                                effective_stop = entry - 2 * atr
+                                # Initial stop: Nx ATR below entry (regime-aware)
+                                effective_stop = entry - atr_multiplier * atr
                                 if current <= effective_stop:
                                     should_close = True
                                     close_reason = (f"ATR initial stop (current={current:.5f} <= "
-                                                    f"stop={effective_stop:.5f}, 2xATR={2*atr:.5f})")
+                                                    f"stop={effective_stop:.5f}, {atr_multiplier}xATR={atr_multiplier*atr:.5f})")
                                 else:
                                     log.info(f"  [TRAIL] {t['symbol']}: ATR={atr:.5f}, "
                                              f"unrealized={unrealized:+.5f}, initial stop @ {effective_stop:.5f}")
                         else:
                             # Short position: mirror logic
                             unrealized = entry - current
-                            if unrealized >= 2 * atr:
+                            if unrealized >= atr_multiplier * atr:
                                 effective_stop = current + atr
                                 if current >= effective_stop:
                                     should_close = True
@@ -251,11 +390,11 @@ def monitor_positions(conn: sqlite3.Connection, broker=None, dry_run: bool = Fal
                                     log.info(f"  [TRAIL] {t['symbol']}: ATR={atr:.5f}, "
                                              f"unrealized={unrealized:+.5f}, stop=break-even @ {entry:.5f}")
                             else:
-                                effective_stop = entry + 2 * atr
+                                effective_stop = entry + atr_multiplier * atr
                                 if current >= effective_stop:
                                     should_close = True
                                     close_reason = (f"ATR initial stop (current={current:.5f} >= "
-                                                    f"stop={effective_stop:.5f}, 2xATR={2*atr:.5f})")
+                                                    f"stop={effective_stop:.5f}, {atr_multiplier}xATR={atr_multiplier*atr:.5f})")
                                 else:
                                     log.info(f"  [TRAIL] {t['symbol']}: ATR={atr:.5f}, "
                                              f"unrealized={unrealized:+.5f}, initial stop @ {effective_stop:.5f}")
@@ -395,16 +534,24 @@ def check_correlation_guard(
 def fx_risk_check(conn: sqlite3.Connection, signals: list[dict]) -> list[dict]:
     """
     FX risk manager:
-    - Max 3 positions total
+    - Max 3 positions total (regime-adjusted)
     - 2% risk per trade
     - Strategy-specific stop loss pips
     - Correlation guard: block/reduce concentrated currency exposure
+    - Regime compliance: RANGING limits trend entries, CRISIS blocks all
     """
+    # Load regime for entry gating
+    regime_data = get_current_regime(conn)
+    current_regime = regime_data.get("regime") if regime_data else None
+
     open_trades = conn.execute(
         "SELECT * FROM paper_trades WHERE status = 'open' AND strategy_id IN (100, 101) ORDER BY opened_at"
     ).fetchall()
     open_count = len(open_trades)
     open_symbols = [dict(t)["symbol"] for t in open_trades]
+
+    # Regime-adjusted max positions for trend
+    open_trend_count = sum(1 for t in open_trades if dict(t)["strategy_id"] == TREND_STRATEGY_ID)
     # Track open symbol+strategy pairs for dedup (prevents duplicate entries same day)
     open_sym_strat = {(dict(t)["symbol"], dict(t)["strategy_id"]) for t in open_trades}
     # Track open positions as dicts for correlation guard (updated as we approve entries)
@@ -433,6 +580,24 @@ def fx_risk_check(conn: sqlite3.Connection, signals: list[dict]) -> list[dict]:
         if (symbol, strategy_id) in open_sym_strat:
             decisions.append({**signal, "approved": False, "reason": f"already holding {symbol} (strategy {strategy_id})"})
             continue
+
+        # Regime gating for new trend entries
+        if strategy_id == TREND_STRATEGY_ID and current_regime:
+            if current_regime == "CRISIS":
+                decisions.append({**signal, "approved": False,
+                                  "reason": f"[REGIME] CRISIS: no new trend entries"})
+                continue
+            if current_regime == "RANGING":
+                if open_trend_count >= RANGING_MAX_TREND_POSITIONS:
+                    decisions.append({**signal, "approved": False,
+                                      "reason": f"[REGIME] RANGING: trend positions capped at {RANGING_MAX_TREND_POSITIONS}"})
+                    continue
+                # Block weak trend signals in ranging — require high composite score
+                composite = signal.get("composite_score", 0)
+                if composite < RANGING_MIN_COMPOSITE_SCORE:
+                    decisions.append({**signal, "approved": False,
+                                      "reason": f"[REGIME] RANGING: trend composite score {composite} < {RANGING_MIN_COMPOSITE_SCORE} threshold"})
+                    continue
 
         # Correlation guard
         allowed, corr_reason, size_mult = check_correlation_guard(
@@ -469,6 +634,8 @@ def fx_risk_check(conn: sqlite3.Connection, signals: list[dict]) -> list[dict]:
             **({"corr_note": corr_reason} if corr_reason else {}),
         })
         open_count += 1
+        if strategy_id == TREND_STRATEGY_ID:
+            open_trend_count += 1
         open_symbols.append(symbol)
         open_sym_strat.add((symbol, strategy_id))
         open_pos_list.append({"symbol": symbol, "side": signal["side"]})
