@@ -177,18 +177,105 @@ def monitor_positions(conn: sqlite3.Connection, broker=None, dry_run: bool = Fal
 # Risk check
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Correlation guard — prevent concentrated currency exposure
+# ---------------------------------------------------------------------------
+
+# Currency decomposition: long = +base -quote
+PAIR_CURRENCIES = {
+    "EURUSD": ("EUR", "USD"), "GBPUSD": ("GBP", "USD"), "USDJPY": ("USD", "JPY"),
+    "USDCHF": ("USD", "CHF"), "AUDUSD": ("AUD", "USD"), "USDCAD": ("USD", "CAD"),
+    "NZDUSD": ("NZD", "USD"), "EURGBP": ("EUR", "GBP"), "EURJPY": ("EUR", "JPY"),
+    "GBPJPY": ("GBP", "JPY"),
+}
+
+MAX_CURRENCY_EXPOSURE = 3  # block at ±3
+WARN_CURRENCY_EXPOSURE = 2  # reduce size at ±2
+
+
+def get_currency_exposure(open_positions: list[dict]) -> dict[str, int]:
+    """Count each currency's net directional exposure from open positions.
+
+    Long AUDUSD = +1 AUD, -1 USD.  Short USDJPY = -1 USD, +1 JPY.
+    Returns e.g. {"AUD": 1, "USD": -2, "JPY": -1, ...}
+    """
+    exposure: dict[str, int] = {}
+    for pos in open_positions:
+        symbol = pos["symbol"]
+        side = pos.get("side", "long")
+        currencies = PAIR_CURRENCIES.get(symbol)
+        if not currencies:
+            continue
+        base, quote = currencies
+        direction = 1 if side == "long" else -1
+        exposure[base] = exposure.get(base, 0) + direction
+        exposure[quote] = exposure.get(quote, 0) - direction
+    return exposure
+
+
+def check_correlation_guard(
+    new_pair: str,
+    new_side: str,
+    open_positions: list[dict],
+) -> tuple[bool, str, float]:
+    """Check if adding *new_pair* would breach currency-exposure limits.
+
+    Returns (allowed, reason, size_multiplier).
+      - allowed=False  → trade blocked
+      - size_multiplier=0.5 → reduce size by half
+      - size_multiplier=1.0 → full size OK
+    """
+    currencies = PAIR_CURRENCIES.get(new_pair)
+    if not currencies:
+        return True, "", 1.0
+
+    current = get_currency_exposure(open_positions)
+    base, quote = currencies
+    direction = 1 if new_side == "long" else -1
+
+    new_base_exp = current.get(base, 0) + direction
+    new_quote_exp = current.get(quote, 0) - direction
+
+    # Check block threshold (±3)
+    for ccy, exp in [(base, new_base_exp), (quote, new_quote_exp)]:
+        if abs(exp) >= MAX_CURRENCY_EXPOSURE:
+            reason = (f"correlation guard BLOCK: {ccy} exposure would be {exp:+d} "
+                      f"(limit ±{MAX_CURRENCY_EXPOSURE})")
+            log.warning(reason)
+            return False, reason, 0.0
+
+    # Check reduce threshold (±2)
+    for ccy, exp in [(base, new_base_exp), (quote, new_quote_exp)]:
+        if abs(exp) >= WARN_CURRENCY_EXPOSURE:
+            reason = (f"correlation guard REDUCE: {ccy} exposure would be {exp:+d} "
+                      f"(warn ±{WARN_CURRENCY_EXPOSURE}) — size halved")
+            log.info(reason)
+            return True, reason, 0.5
+
+    return True, "", 1.0
+
+
 def fx_risk_check(conn: sqlite3.Connection, signals: list[dict]) -> list[dict]:
     """
     FX risk manager:
     - Max 3 positions total
     - 2% risk per trade
     - Strategy-specific stop loss pips
+    - Correlation guard: block/reduce concentrated currency exposure
     """
     open_trades = conn.execute(
         "SELECT * FROM paper_trades WHERE status = 'open' AND strategy_id IN (100, 101) ORDER BY opened_at"
     ).fetchall()
     open_count = len(open_trades)
     open_symbols = [dict(t)["symbol"] for t in open_trades]
+    # Track open positions as dicts for correlation guard (updated as we approve entries)
+    open_pos_list = [dict(t) for t in open_trades]
+
+    # Log current exposure at start
+    current_exp = get_currency_exposure(open_pos_list)
+    if current_exp:
+        exp_str = ", ".join(f"{c}:{v:+d}" for c, v in sorted(current_exp.items()) if v != 0)
+        log.info(f"  Currency exposure: {exp_str}")
 
     decisions = []
 
@@ -207,6 +294,14 @@ def fx_risk_check(conn: sqlite3.Connection, signals: list[dict]) -> list[dict]:
             decisions.append({**signal, "approved": False, "reason": f"already holding {symbol}"})
             continue
 
+        # Correlation guard
+        allowed, corr_reason, size_mult = check_correlation_guard(
+            symbol, signal["side"], open_pos_list
+        )
+        if not allowed:
+            decisions.append({**signal, "approved": False, "reason": corr_reason})
+            continue
+
         # Strategy-specific stop loss from DB
         params = get_strategy_params(conn, signal["strategy_id"])
         default = _DEFAULT_TREND_PARAMS if signal["strategy_id"] == TREND_STRATEGY_ID else _DEFAULT_PA_PARAMS
@@ -218,6 +313,11 @@ def fx_risk_check(conn: sqlite3.Connection, signals: list[dict]) -> list[dict]:
         micro_lots = risk_amount / (stop_pips * pip_value)
         volume = max(int(micro_lots), 1)
 
+        # Apply correlation size reduction
+        if size_mult < 1.0:
+            volume = max(int(volume * size_mult), 1)
+            risk_amount = round(risk_amount * size_mult, 2)
+
         decisions.append({
             **signal,
             "approved": True,
@@ -226,9 +326,11 @@ def fx_risk_check(conn: sqlite3.Connection, signals: list[dict]) -> list[dict]:
             "risk_amount": round(risk_amount, 2),
             "stop_pips": stop_pips,
             "risk_pct": MAX_RISK_PER_TRADE * 100,
+            **({"corr_note": corr_reason} if corr_reason else {}),
         })
         open_count += 1
         open_symbols.append(symbol)
+        open_pos_list.append({"symbol": symbol, "side": signal["side"]})
 
     return decisions
 
