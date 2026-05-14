@@ -158,7 +158,7 @@ class CapitalBroker:
         For FX micro lots: size = units / 1000 (1 micro lot = 0.01 standard lot).
         """
         epic = self._epic(symbol)
-        direction = "BUY" if side.lower() == "buy" else "SELL"
+        direction = "BUY" if side.lower() in ("buy", "long") else "SELL"
 
         # Capital.com uses raw units (1000 = 1 micro lot)
         # Minimum is 1000 units
