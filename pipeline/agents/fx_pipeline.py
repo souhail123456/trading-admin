@@ -53,7 +53,7 @@ TREND_SAFETY_MAX_HOLD = 90
 RANGING_MAX_TREND_POSITIONS = 2  # allow 2 trend positions in ranging (was 1 — too restrictive, bot never traded)
 VOLATILE_ATR_MULTIPLIER = 1.5   # tighter stops in volatile (vs 2.0 normal)
 NORMAL_ATR_MULTIPLIER = 2.0
-RANGING_MIN_COMPOSITE_SCORE = 3.0  # allow moderate trend entries in ranging (was 7.0 — blocked everything)
+RANGING_MIN_COMPOSITE_SCORE = 0.05  # composite is ~0.03-0.15 scale (strength*0.7 + carry/10*0.3)
 
 # ATR cache (session-level, avoids repeated yfinance calls)
 _atr_cache: dict[str, float | None] = {}
@@ -593,7 +593,8 @@ def fx_risk_check(conn: sqlite3.Connection, signals: list[dict]) -> list[dict]:
                                       "reason": f"[REGIME] RANGING: trend positions capped at {RANGING_MAX_TREND_POSITIONS}"})
                     continue
                 # Block weak trend signals in ranging — require high composite score
-                composite = signal.get("composite_score", 0)
+                full_state = signal.get("full_state") or {}
+                composite = signal.get("composite_score") or full_state.get("composite_score", 0)
                 if composite < RANGING_MIN_COMPOSITE_SCORE:
                     decisions.append({**signal, "approved": False,
                                       "reason": f"[REGIME] RANGING: trend composite score {composite} < {RANGING_MIN_COMPOSITE_SCORE} threshold"})
