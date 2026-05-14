@@ -9,8 +9,12 @@ on:
 jobs:
   pipeline:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.BOT_GITHUB_TOKEN }}
 
       - uses: actions/setup-python@v5
         with:
