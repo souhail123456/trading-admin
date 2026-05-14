@@ -662,45 +662,50 @@ def execute_decisions(conn: sqlite3.Connection, decisions: list[dict], dry_run: 
                      f"[{'TREND' if d['strategy_id'] == TREND_STRATEGY_ID else 'PA'}]")
 
             if not dry_run:
+                if not broker:
+                    log.warning(f"  SKIPPED {d['symbol']}: no broker connected — refusing to create ghost trade")
+                    continue
+
+                # Submit to broker FIRST — only write to DB if broker confirms
+                broker_order_id = None
+                try:
+                    units = d["micro_lots"] * 1000
+                    result = broker.submit_order(
+                        symbol=d["symbol"],
+                        units=units,
+                        side=d["side"],
+                        stop_loss_pips=d["stop_pips"],
+                        take_profit_pips=None,
+                    )
+                    broker_order_id = result.get("deal_id") or result.get("trade_id")
+                    log.info(f"    Broker order: {result}")
+
+                    if not broker_order_id:
+                        log.error(f"  SKIPPED {d['symbol']}: broker returned no deal_id — not writing to DB")
+                        continue
+
+                except Exception as e:
+                    log.error(f"  SKIPPED {d['symbol']}: broker execution failed: {e} — not writing to DB")
+                    continue
+
+                # Broker confirmed — now write to DB with order ID
                 conn.execute(
                     """INSERT INTO paper_trades
                        (strategy_id, signal_id, symbol, side, entry_price,
-                        quantity, thesis, risk_pct, risk_approved, status, opened_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 'open', ?)""",
+                        quantity, thesis, risk_pct, risk_approved, status, broker_order_id, opened_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 'open', ?, ?)""",
                     (
                         d["strategy_id"], d.get("signal_id"),
                         d["symbol"], d["side"], d["price_at_signal"],
                         d["micro_lots"],
                         f"FX {d['strategy']}: {d['symbol']} @ {d['price_at_signal']}",
                         d["risk_pct"],
+                        broker_order_id,
                         datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ"),
                     ),
                 )
                 conn.commit()
-
-                if broker:
-                    try:
-                        units = d["micro_lots"] * 1000
-                        # Trend: no TP (hold until SMA exit), wider SL
-                        # PA: no TP on broker (managed by monitor), tighter SL
-                        result = broker.submit_order(
-                            symbol=d["symbol"],
-                            units=units,
-                            side=d["side"],
-                            stop_loss_pips=d["stop_pips"],
-                            take_profit_pips=None,  # managed by signals/monitor, not fixed TP
-                        )
-                        # Store broker order ID
-                        order_id = result.get("deal_id") or result.get("trade_id")
-                        if order_id:
-                            conn.execute(
-                                "UPDATE paper_trades SET broker_order_id = ? WHERE symbol = ? AND status = 'open' AND broker_order_id IS NULL",
-                                (order_id, d["symbol"]),
-                            )
-                            conn.commit()
-                        log.info(f"    Broker order: {result}")
-                    except Exception as e:
-                        log.error(f"    Broker execution failed: {e}")
+                log.info(f"    DB trade created with broker_order_id={broker_order_id}")
 
         elif d["action"] == "exit":
             log.info(f"  EXIT: {d['symbol']}")
@@ -891,6 +896,22 @@ def run_daily(dry_run: bool = False, db_path: str | None = None):
     print(f"\n{'#'*60}")
     print(f"# FX PIPELINE — {datetime.now().strftime('%Y-%m-%d %H:%M')} [{mode}]")
     print(f"{'#'*60}")
+
+    # Pre-flight: verify broker credentials work before doing anything
+    if not dry_run:
+        print("\n[PRE] Broker credential check...")
+        try:
+            broker_test = _get_broker()
+            if broker_test:
+                acct = broker_test.get_account()
+                print(f"  CONNECTED: {mode} | balance=${acct.get('balance', '?')} | equity=${acct.get('equity', '?')}")
+                broker_test.disconnect()
+            else:
+                print(f"  WARNING: No broker credentials found — running in SQLITE-ONLY mode (no real trades)")
+        except Exception as e:
+            print(f"  ERROR: Broker connection failed: {e}")
+            print(f"  Continuing in SQLITE-ONLY mode — signals will be generated but NOT executed")
+            mode = "SQLITE-ONLY (broker auth failed)"
 
     # Step 0: Monitor existing positions (time stops, % stops)
     print("\n[0/6] Monitoring open positions...")
