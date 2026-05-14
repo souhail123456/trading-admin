@@ -26,6 +26,40 @@
     }
   },
   "api_usage_today": {},
-  "regime": null,
-  "alerts": []
+  "regime": "RANGING",
+  "alerts": [],
+  "service_status": {
+    "timestamp": "2026-05-14T05:54:50Z",
+    "stock_broker_status": "down",
+    "stock_action": "skip_all"
+  },
+  "vix": 17.8700008392334,
+  "recommendations": {
+    "100": {
+      "action": "REDUCE",
+      "reason": "Ranging market \u2014 trend signals weaker"
+    },
+    "101": {
+      "action": "ACTIVE",
+      "reason": "Ranging favors price action reversals"
+    }
+  },
+  "updated": "2026-05-14T05:54:54Z",
+  "cross_bot_risk": {
+    "total_positions": 6,
+    "total_exposure": 22294.6,
+    "by_bot": {
+      "fx": {
+        "count": 3,
+        "total_value": 8662.72815
+      },
+      "stock": {
+        "count": 3,
+        "total_value": 13631.869999999999
+      }
+    },
+    "overlaps": {},
+    "flags": [],
+    "computed_at": "2026-05-14T05:55:02Z"
+  }
 }
