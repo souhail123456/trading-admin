@@ -50,10 +50,10 @@ _DEFAULT_PA_PARAMS = {"stop_loss_pips": 40, "max_hold_days": 15, "stop_loss_pct"
 TREND_SAFETY_MAX_HOLD = 90
 
 # Regime-aware limits
-RANGING_MAX_TREND_POSITIONS = 1  # reduce from 3 to 1 in ranging
+RANGING_MAX_TREND_POSITIONS = 2  # allow 2 trend positions in ranging (was 1 — too restrictive, bot never traded)
 VOLATILE_ATR_MULTIPLIER = 1.5   # tighter stops in volatile (vs 2.0 normal)
 NORMAL_ATR_MULTIPLIER = 2.0
-RANGING_MIN_COMPOSITE_SCORE = 7.0  # block weak trend entries in ranging
+RANGING_MIN_COMPOSITE_SCORE = 3.0  # allow moderate trend entries in ranging (was 7.0 — blocked everything)
 
 # ATR cache (session-level, avoids repeated yfinance calls)
 _atr_cache: dict[str, float | None] = {}
@@ -835,11 +835,27 @@ def _send_fx_telegram(conn: sqlite3.Connection, signals: list[dict], mode: str,
         for a in perf_alerts:
             lines.append(f"  [{a['severity']}] {a['message']}")
 
-    _req.post(
-        f"https://api.telegram.org/bot{bot_token}/sendMessage",
-        json={"chat_id": chat_id, "text": "\n".join(lines), "parse_mode": "HTML"},
-        timeout=10,
-    ).raise_for_status()
+    msg_text = "\n".join(lines)
+    # Telegram has a 4096 char limit
+    if len(msg_text) > 4000:
+        msg_text = msg_text[:4000] + "\n..."
+    try:
+        _req.post(
+            f"https://api.telegram.org/bot{bot_token}/sendMessage",
+            json={"chat_id": chat_id, "text": msg_text, "parse_mode": "HTML"},
+            timeout=10,
+        ).raise_for_status()
+    except Exception as e:
+        # Retry without HTML parse_mode (malformed tags cause 400)
+        log.warning(f"Telegram HTML failed: {e}, retrying as plain text")
+        try:
+            _req.post(
+                f"https://api.telegram.org/bot{bot_token}/sendMessage",
+                json={"chat_id": chat_id, "text": msg_text.replace("<b>", "").replace("</b>", "")},
+                timeout=10,
+            ).raise_for_status()
+        except Exception as e2:
+            log.error(f"Telegram alert failed: {e2}")
 
 
 def fx_portfolio_status(conn: sqlite3.Connection):
@@ -897,7 +913,7 @@ def run_daily(dry_run: bool = False, db_path: str | None = None):
     print(f"# FX PIPELINE — {datetime.now().strftime('%Y-%m-%d %H:%M')} [{mode}]")
     print(f"{'#'*60}")
 
-    # Pre-flight: verify broker credentials work before doing anything
+    # Pre-flight: verify broker credentials and sync positions
     if not dry_run:
         print("\n[PRE] Broker credential check...")
         try:
@@ -905,6 +921,34 @@ def run_daily(dry_run: bool = False, db_path: str | None = None):
             if broker_test:
                 acct = broker_test.get_account()
                 print(f"  CONNECTED: {mode} | balance=${acct.get('balance', '?')} | equity=${acct.get('equity', '?')}")
+
+                # Sync: detect broker positions missing from DB
+                broker_positions = broker_test.get_positions()
+                db_open = conn.execute(
+                    "SELECT symbol, broker_order_id FROM paper_trades WHERE status = 'open' AND strategy_id IN (100, 101)"
+                ).fetchall()
+                db_deal_ids = {dict(r).get("broker_order_id") for r in db_open}
+                db_symbols = {dict(r)["symbol"] for r in db_open}
+
+                for bp in broker_positions:
+                    epic = bp["epic"].upper().replace("/", "")
+                    if bp["deal_id"] not in db_deal_ids and epic not in db_symbols:
+                        print(f"  SYNC: Found broker position {epic} (deal={bp['deal_id']}) not in DB — importing")
+                        side = "long" if bp["direction"] == "BUY" else "short"
+                        conn.execute(
+                            """INSERT INTO paper_trades
+                               (strategy_id, symbol, side, entry_price, quantity, thesis,
+                                risk_pct, risk_approved, status, broker_order_id, opened_at)
+                               VALUES (?, ?, ?, ?, ?, ?, ?, 1, 'open', ?, ?)""",
+                            (TREND_STRATEGY_ID, epic, side, bp["entry_price"], bp["size"],
+                             f"Synced from broker: {epic} {side} @ {bp['entry_price']}",
+                             MAX_RISK_PER_TRADE * 100, bp["deal_id"], bp.get("created_date", datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ"))),
+                        )
+                        conn.commit()
+                        print(f"    Imported: {epic} {side} @ {bp['entry_price']}, deal={bp['deal_id']}")
+
+                if not broker_positions:
+                    print(f"  No open positions on broker")
                 broker_test.disconnect()
             else:
                 print(f"  WARNING: No broker credentials found — running in SQLITE-ONLY mode (no real trades)")

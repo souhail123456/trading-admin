@@ -38,9 +38,9 @@ jobs:
           db = 'data/pipeline.db'
           if os.path.exists(db):
               conn = sqlite3.connect(db)
-              cur = conn.execute(\"UPDATE paper_trades SET status='closed', closed_at=datetime('now'), pnl=0 WHERE broker_order_id IS NULL AND status='open' AND strategy_id IN (100, 101)\")
+              cur = conn.execute(\"UPDATE paper_trades SET status='closed', closed_at=datetime('now'), pnl=0 WHERE broker_order_id IS NULL AND status IN ('open', 'pending')\")
               if cur.rowcount > 0:
-                  print(f'Cleaned {cur.rowcount} ghost FX trades (no broker confirmation)')
+                  print(f'Cleaned {cur.rowcount} ghost trades (no broker confirmation)')
               conn.commit()
               conn.close()
           "
