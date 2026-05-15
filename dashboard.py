@@ -22,7 +22,6 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from pipeline.db import init_db
-from pipeline.agents.data_fetcher import fetch_ohlcv, CURRENCY_PAIRS
 
 
 def _us_market_open() -> bool:
@@ -141,6 +140,21 @@ def get_stock_data() -> dict:
         except Exception:
             pass
 
+        # Fetch equity history for chart
+        equity_history = []
+        try:
+            csv_content = repo.get_contents("memory/PORTFOLIO-HISTORY.csv").decoded_content.decode()
+            seen_dates = {}
+            for line in csv_content.splitlines()[1:]:  # skip header
+                parts = line.split(",")
+                if len(parts) >= 2:
+                    ts = parts[0].strip()[:10]  # date only
+                    eq = float(parts[1])
+                    seen_dates[ts] = eq  # last entry per day wins
+            equity_history = [{"time": d, "value": v} for d, v in sorted(seen_dates.items())]
+        except Exception:
+            pass
+
         return {
             "portfolio_value": summary.get("portfolio_value", 100000),
             "cash": summary.get("cash", 100000),
@@ -148,6 +162,7 @@ def get_stock_data() -> dict:
             "open_positions": summary.get("open_positions", []),
             "closed_trades": summary.get("closed_trades", []),
             "last_run": last_run,
+            "equity_history": equity_history,
         }
     except Exception as e:
         print(f"  Stock data fetch failed: {e}")
@@ -211,39 +226,6 @@ def get_poly_data() -> dict:
         return None
 
 
-def get_chart_data(symbol: str, days: int = 90) -> dict:
-    """Get OHLCV data for charting."""
-    yf_ticker = symbol + "=X"
-    for ticker in CURRENCY_PAIRS:
-        if ticker.replace("=X", "") == symbol:
-            yf_ticker = ticker
-            break
-
-    start = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-    data = fetch_ohlcv([yf_ticker], start=start, cache=False)
-
-    if yf_ticker not in data or data[yf_ticker].empty:
-        return {"candles": [], "sma": []}
-
-    df = data[yf_ticker]
-    candles = []
-    for date, row in df.iterrows():
-        candles.append({
-            "time": date.strftime("%Y-%m-%d"),
-            "open": round(float(row["open"]), 5),
-            "high": round(float(row["high"]), 5),
-            "low": round(float(row["low"]), 5),
-            "close": round(float(row["close"]), 5),
-        })
-
-    sma_data = []
-    if len(df) >= 200:
-        sma_200 = df["close"].rolling(200).mean()
-        for date, val in sma_200.dropna().items():
-            sma_data.append({"time": date.strftime("%Y-%m-%d"), "value": round(float(val), 5)})
-
-    return {"candles": candles, "sma": sma_data}
-
 
 # ---------------------------------------------------------------------------
 # HTML builder
@@ -285,7 +267,7 @@ def _build_api_health_html(api_health: list[dict] | None) -> str:
 
 
 def build_dashboard(fx: dict, stock: dict | None, poly: dict | None,
-                    chart_data: dict | None = None, api_health: list[dict] | None = None) -> str:
+                    api_health: list[dict] | None = None) -> str:
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
     # Aggregate totals
@@ -306,8 +288,9 @@ def build_dashboard(fx: dict, stock: dict | None, poly: dict | None,
     # Market status
     us_open = _us_market_open()
 
-    # Chart JSON
-    chart_json = json.dumps(chart_data or {"candles": [], "sma": []})
+    # Equity chart data
+    equity_data = stock.get("equity_history", []) if stock else []
+    equity_json = json.dumps(equity_data)
 
     # FX position rows
     fx_rows = ""
@@ -675,7 +658,8 @@ tr:hover {{ background: #1a2332; }}
 
 <div class="chart-container">
     <div class="chart-header">
-        <span class="chart-title">EURUSD</span>
+        <span class="chart-title">Portfolio Equity</span>
+        <span style="color:#666;font-size:12px">Stock bot — $100k baseline</span>
     </div>
     <div id="chart"></div>
 </div>
@@ -702,18 +686,26 @@ if (chartEl) {{
         timeScale: {{ borderColor: '#1e2a3a', timeVisible: false }},
     }});
 
-    const cd = {chart_json};
-    if (cd.candles && cd.candles.length > 0) {{
-        const cs = chart.addCandlestickSeries({{
-            upColor: '#00d4aa', downColor: '#ef4444',
-            borderUpColor: '#00d4aa', borderDownColor: '#ef4444',
-            wickUpColor: '#00d4aa', wickDownColor: '#ef4444',
+    const eqData = {equity_json};
+    if (eqData && eqData.length > 0) {{
+        // Baseline at $100k
+        const baseline = chart.addLineSeries({{
+            color: '#333',
+            lineWidth: 1,
+            lineStyle: 2,
+            title: 'Baseline $100k',
         }});
-        cs.setData(cd.candles);
-        if (cd.sma && cd.sma.length > 0) {{
-            const sma = chart.addLineSeries({{ color: '#f59e0b', lineWidth: 2, title: 'SMA 200' }});
-            sma.setData(cd.sma);
-        }}
+        baseline.setData(eqData.map(d => ({{ time: d.time, value: 100000 }})));
+
+        // Equity curve
+        const eq = chart.addAreaSeries({{
+            topColor: 'rgba(0, 212, 170, 0.3)',
+            bottomColor: 'rgba(0, 212, 170, 0.02)',
+            lineColor: '#00d4aa',
+            lineWidth: 2,
+            title: 'Equity',
+        }});
+        eq.setData(eqData);
         chart.timeScale().fitContent();
     }}
 
@@ -739,25 +731,19 @@ def serve(port: int = 8050):
         def do_GET(self):
             parsed = urlparse(self.path)
             if parsed.path == "/api/chart":
-                params = parse_qs(parsed.query)
-                symbol = params.get("symbol", ["EURUSD"])[0]
-                data = get_chart_data(symbol, days=120)
-                self.send_response(200)
-                self.send_header("Content-type", "application/json")
+                self.send_response(404)
                 self.end_headers()
-                self.wfile.write(json.dumps(data).encode())
             else:
                 conn = init_db()
                 fx = get_fx_data(conn)
                 stock = get_stock_data()
                 poly = get_poly_data()
-                chart = get_chart_data("EURUSD", days=120)
                 try:
                     from pipeline.agents.api_health import check_all
                     api_health = check_all()
                 except Exception:
                     api_health = None
-                html = build_dashboard(fx, stock, poly, chart, api_health)
+                html = build_dashboard(fx, stock, poly, api_health)
                 self.send_response(200)
                 self.send_header("Content-type", "text/html")
                 self.end_headers()
@@ -788,9 +774,6 @@ def generate_static(output: str = "docs/index.html"):
     print("  Fetching polymarket data...")
     poly = get_poly_data()
 
-    print("  Fetching chart data...")
-    chart = get_chart_data("EURUSD", days=120)
-
     print("  Running API health checks...")
     try:
         from pipeline.agents.api_health import check_all
@@ -799,7 +782,7 @@ def generate_static(output: str = "docs/index.html"):
         print(f"    Health check failed: {e}")
         api_health = None
 
-    html = build_dashboard(fx, stock, poly, chart, api_health)
+    html = build_dashboard(fx, stock, poly, api_health)
 
     out_path = Path(output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
