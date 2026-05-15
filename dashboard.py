@@ -321,12 +321,14 @@ def build_dashboard(fx: dict, stock: dict | None, poly: dict | None,
                 pass
         upnl = t.get("unrealized_pnl", 0)
         upnl_css = "pos" if upnl >= 0 else "neg"
+        entry_val = t.get("entry_price", 0) * t.get("quantity", 0)
+        upnl_pct = (upnl / entry_val * 100) if entry_val else 0
         fx_rows += f"""<tr>
             <td><b>{t['symbol']}</b></td>
             <td>{t['side'].upper()}</td>
             <td>{t.get('quantity', '?')}</td>
             <td>{t['entry_price']}</td>
-            <td class="{upnl_css}">${upnl:+,.2f}</td>
+            <td class="{upnl_css}">${upnl:+,.2f} ({upnl_pct:+.1f}%)</td>
             <td>{days}</td>
         </tr>"""
     if not fx_rows:
@@ -341,12 +343,14 @@ def build_dashboard(fx: dict, stock: dict | None, poly: dict | None,
         pos_html = ""
         for p in stock.get("open_positions", []):
             unrealized = p.get("unrealized_pnl", 0)
+            entry_cost = p.get("entry", 0) * p.get("shares", 0)
+            u_pct = (unrealized / entry_cost * 100) if entry_cost else 0
             pos_html += f"""<tr>
                 <td><b>{p['symbol']}</b></td>
                 <td>{p.get('side', 'BUY')}</td>
                 <td>{p['shares']}</td>
                 <td>${p['entry']}</td>
-                <td class="{'pos' if unrealized >= 0 else 'neg'}">${unrealized:+,.2f}</td>
+                <td class="{'pos' if unrealized >= 0 else 'neg'}">${unrealized:+,.2f} ({u_pct:+.1f}%)</td>
             </tr>"""
         if not pos_html:
             pos_html = '<tr><td colspan="5" class="empty">No open positions</td></tr>'
@@ -354,11 +358,13 @@ def build_dashboard(fx: dict, stock: dict | None, poly: dict | None,
         closed_html = ""
         for t in stock.get("closed_trades", [])[:5]:
             rpnl = t.get("realized_pnl", 0)
+            entry_cost = t.get("entry", 0) * t.get("shares", 1)
+            r_pct = (rpnl / entry_cost * 100) if entry_cost else 0
             closed_html += f"""<tr>
                 <td>{t.get('symbol','?')}</td>
                 <td>${t.get('entry','?')}</td>
                 <td>${t.get('exit','?')}</td>
-                <td class="{'pos' if rpnl >= 0 else 'neg'}">${rpnl:+,.2f}</td>
+                <td class="{'pos' if rpnl >= 0 else 'neg'}">${rpnl:+,.2f} ({r_pct:+.1f}%)</td>
             </tr>"""
 
         stock_html = f"""
@@ -394,14 +400,15 @@ def build_dashboard(fx: dict, stock: dict | None, poly: dict | None,
             size = float(t.get("size_usd", 0))
             st = "WON" if t.get("won") else "LOST" if t.get("resolved") else "OPEN"
             rpnl = float(t.get("realized_pnl", 0) or 0)
+            rpnl_pct = (rpnl / size * 100) if size else 0
             css = "pos" if rpnl > 0 else "neg" if rpnl < 0 else ""
-            recent_html += f'<tr><td>{q}</td><td>${size:.2f}</td><td>{st}</td><td class="{css}">${rpnl:+.2f}</td></tr>'
+            recent_html += f'<tr><td>{q}</td><td>${size:.2f}</td><td>{st}</td><td class="{css}">${rpnl:+.2f} ({rpnl_pct:+.0f}%)</td></tr>'
 
         poly_html = f"""
         <div class="bot-card">
             <div class="bot-header">
                 <div class="bot-title">POLYMARKET BOT <span class="bot-tag">Paper</span> <span class="market-status market-247">24/7</span></div>
-                <div class="bot-pnl {'pos' if total_poly_pnl >= 0 else 'neg'}">${total_poly_pnl:+,.2f}</div>
+                <div class="bot-pnl {'pos' if total_poly_pnl >= 0 else 'neg'}">${total_poly_pnl:+,.2f} ({total_poly_pnl / (ev['risked'] + w['risked']) * 100 if (ev['risked'] + w['risked']) else 0:+.1f}%)</div>
             </div>
             <div class="bot-stats">
                 <div class="mini-stat"><span class="label">EV Trades</span><span class="val">{ev['total']} ({ev['open']} open)</span></div>
@@ -428,7 +435,7 @@ def build_dashboard(fx: dict, stock: dict | None, poly: dict | None,
     <div class="bot-card">
         <div class="bot-header">
             <div class="bot-title">FX BOT <span class="bot-tag">Capital.com</span> <span class="market-status {'market-open' if fx.get('market_open') else 'market-closed'}">{'OPEN' if fx.get('market_open') else 'CLOSED'}</span></div>
-            <div class="bot-pnl {'pos' if fx_unrealized >= 0 else 'neg'}">${fx_unrealized:+,.2f}</div>
+            <div class="bot-pnl {'pos' if fx_unrealized >= 0 else 'neg'}">${fx_unrealized:+,.2f} ({fx_unrealized / fx_balance * 100 if fx_balance else 0:+.2f}%)</div>
         </div>
         <div class="bot-stats">
             <div class="mini-stat"><span class="label">Equity</span><span class="val">${fx_equity:,.2f}</span></div>
