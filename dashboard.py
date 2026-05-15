@@ -19,8 +19,20 @@ import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from zoneinfo import ZoneInfo
+
 from pipeline.db import init_db
 from pipeline.agents.data_fetcher import fetch_ohlcv, CURRENCY_PAIRS
+
+
+def _us_market_open() -> bool:
+    """Check if US stock market is currently open (9:30-16:00 ET, Mon-Fri)."""
+    et = datetime.now(ZoneInfo("America/New_York"))
+    if et.weekday() >= 5:  # Sat/Sun
+        return False
+    t = et.time()
+    from datetime import time as dtime
+    return dtime(9, 30) <= t <= dtime(16, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -34,12 +46,14 @@ def get_fx_data(conn: sqlite3.Connection) -> dict:
     open_trades = []
     account = {}
     unrealized_pnl = 0.0
+    market_open = False
 
     try:
         broker = CapitalBroker()
         account = broker.get_account()
         positions = broker.get_positions()
         unrealized_pnl = account.get("unrealized_pnl", 0.0)
+        market_open = broker.is_market_open()
 
         for p in positions:
             open_trades.append({
@@ -75,6 +89,7 @@ def get_fx_data(conn: sqlite3.Connection) -> dict:
         "signals": [],
         "realized_pnl": 0,
         "unrealized_pnl": round(unrealized_pnl, 2),
+        "market_open": market_open,
         "win_rate": 0,
         "wins": 0,
         "total_closed": 0,
@@ -285,6 +300,9 @@ def build_dashboard(fx: dict, stock: dict | None, poly: dict | None,
     regime_desc = regime.get("description", "")
     vix = regime.get("vix", "N/A")
 
+    # Market status
+    us_open = _us_market_open()
+
     # Chart JSON
     chart_json = json.dumps(chart_data or {"candles": [], "sma": []})
 
@@ -343,7 +361,7 @@ def build_dashboard(fx: dict, stock: dict | None, poly: dict | None,
         stock_html = f"""
         <div class="bot-card">
             <div class="bot-header">
-                <div class="bot-title">STOCK/ETF BOT <span class="bot-tag">Alpaca</span></div>
+                <div class="bot-title">STOCK/ETF BOT <span class="bot-tag">Alpaca</span> <span class="market-status {'market-open' if us_open else 'market-closed'}">{'OPEN' if us_open else 'CLOSED'}</span></div>
                 <div class="bot-pnl {'pos' if pnl >= 0 else 'neg'}">${pnl:+,.2f} ({pnl_pct:+.2f}%)</div>
             </div>
             <div class="bot-stats">
@@ -379,7 +397,7 @@ def build_dashboard(fx: dict, stock: dict | None, poly: dict | None,
         poly_html = f"""
         <div class="bot-card">
             <div class="bot-header">
-                <div class="bot-title">POLYMARKET BOT <span class="bot-tag">Paper</span></div>
+                <div class="bot-title">POLYMARKET BOT <span class="bot-tag">Paper</span> <span class="market-status market-247">24/7</span></div>
                 <div class="bot-pnl {'pos' if total_poly_pnl >= 0 else 'neg'}">${total_poly_pnl:+,.2f}</div>
             </div>
             <div class="bot-stats">
@@ -406,7 +424,7 @@ def build_dashboard(fx: dict, stock: dict | None, poly: dict | None,
     fx_html = f"""
     <div class="bot-card">
         <div class="bot-header">
-            <div class="bot-title">FX BOT <span class="bot-tag">Capital.com</span></div>
+            <div class="bot-title">FX BOT <span class="bot-tag">Capital.com</span> <span class="market-status {'market-open' if fx.get('market_open') else 'market-closed'}">{'OPEN' if fx.get('market_open') else 'CLOSED'}</span></div>
             <div class="bot-pnl {'pos' if fx_unrealized >= 0 else 'neg'}">${fx_unrealized:+,.2f}</div>
         </div>
         <div class="bot-stats">
@@ -533,6 +551,17 @@ body {{
     margin-left: 6px;
 }}
 .bot-pnl {{ font-size: 18px; font-weight: bold; }}
+.market-status {{
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 10px;
+    font-weight: bold;
+    margin-left: 6px;
+}}
+.market-open {{ background: #0d3320; color: #00d4aa; }}
+.market-closed {{ background: #3b1111; color: #ef4444; }}
+.market-247 {{ background: #1a1a33; color: #8b5cf6; }}
 .bot-stats {{
     display: grid;
     grid-template-columns: repeat(3, 1fr);
