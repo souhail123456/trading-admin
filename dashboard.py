@@ -72,14 +72,17 @@ def get_fx_data(conn: sqlite3.Connection) -> dict:
     except Exception as e:
         print(f"  Capital.com fetch failed: {e}")
 
-    # Regime from local DB (if available)
+    # Regime from shared/global_state.json (committed by daily pipeline)
     regime = None
+    state_path = Path(__file__).parent / "shared" / "global_state.json"
     try:
-        regime_row = conn.execute(
-            "SELECT outputs FROM agent_log WHERE agent = 'regime_detector' ORDER BY id DESC LIMIT 1"
-        ).fetchone()
-        if regime_row:
-            regime = json.loads(dict(regime_row)["outputs"])
+        if state_path.exists():
+            state = json.loads(state_path.read_text())
+            regime = {
+                "regime": state.get("regime", "N/A"),
+                "vix": state.get("vix"),
+                "description": state.get("recommendations", {}).get("100", {}).get("reason", ""),
+            }
     except Exception:
         pass
 
