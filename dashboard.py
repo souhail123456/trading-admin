@@ -28,50 +28,59 @@ from pipeline.agents.data_fetcher import fetch_ohlcv, CURRENCY_PAIRS
 # ---------------------------------------------------------------------------
 
 def get_fx_data(conn: sqlite3.Connection) -> dict:
-    """Get FX bot data from local pipeline.db."""
-    open_trades = conn.execute(
-        "SELECT * FROM paper_trades WHERE status = 'open' AND strategy_id IN (100, 101) ORDER BY opened_at"
-    ).fetchall()
-    closed_trades = conn.execute(
-        "SELECT * FROM paper_trades WHERE status = 'closed' AND strategy_id IN (100, 101) ORDER BY closed_at DESC LIMIT 20"
-    ).fetchall()
-    signals = conn.execute(
-        "SELECT * FROM signals WHERE strategy_id IN (100, 101) ORDER BY generated_at DESC LIMIT 10"
-    ).fetchall()
-    all_closed = conn.execute(
-        "SELECT * FROM paper_trades WHERE status = 'closed' AND strategy_id IN (100, 101)"
-    ).fetchall()
+    """Get FX data from Capital.com broker (live positions + account)."""
+    from pipeline.agents.broker_capital import CapitalBroker
 
-    realized = sum(dict(t).get("pnl", 0) or 0 for t in all_closed)
-    wins = sum(1 for t in all_closed if (dict(t).get("pnl", 0) or 0) > 0)
-    total = len(all_closed)
+    open_trades = []
+    account = {}
+    unrealized_pnl = 0.0
 
-    # Last regime
-    regime_row = conn.execute(
-        "SELECT outputs FROM agent_log WHERE agent = 'regime_detector' ORDER BY id DESC LIMIT 1"
-    ).fetchone()
+    try:
+        broker = CapitalBroker()
+        account = broker.get_account()
+        positions = broker.get_positions()
+        unrealized_pnl = account.get("unrealized_pnl", 0.0)
+
+        for p in positions:
+            open_trades.append({
+                "symbol": p["epic"],
+                "side": p["direction"],
+                "quantity": p["size"],
+                "entry_price": p["entry_price"],
+                "unrealized_pnl": p["unrealized_pnl"],
+                "opened_at": p.get("created_date", ""),
+                "deal_id": p.get("deal_id", ""),
+                "stop_level": p.get("stop_level"),
+                "profit_level": p.get("profit_level"),
+            })
+
+        broker.disconnect()
+    except Exception as e:
+        print(f"  Capital.com fetch failed: {e}")
+
+    # Regime from local DB (if available)
     regime = None
-    if regime_row:
-        try:
+    try:
+        regime_row = conn.execute(
+            "SELECT outputs FROM agent_log WHERE agent = 'regime_detector' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if regime_row:
             regime = json.loads(dict(regime_row)["outputs"])
-        except Exception:
-            pass
-
-    # Performance snapshots
-    perf_rows = conn.execute(
-        "SELECT * FROM agent_log WHERE agent = 'performance_monitor' ORDER BY id DESC LIMIT 1"
-    ).fetchone()
+    except Exception:
+        pass
 
     return {
-        "open_trades": [dict(t) for t in open_trades],
-        "closed_trades": [dict(t) for t in closed_trades],
-        "signals": [dict(s) for s in signals],
-        "realized_pnl": round(realized, 2),
-        "win_rate": round(wins / total * 100, 1) if total > 0 else 0,
-        "wins": wins,
-        "total_closed": total,
+        "open_trades": open_trades,
+        "closed_trades": [],
+        "signals": [],
+        "realized_pnl": 0,
+        "unrealized_pnl": round(unrealized_pnl, 2),
+        "win_rate": 0,
+        "wins": 0,
+        "total_closed": 0,
         "open_count": len(open_trades),
         "regime": regime,
+        "account": account,
     }
 
 
@@ -262,8 +271,8 @@ def build_dashboard(fx: dict, stock: dict | None, poly: dict | None,
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
     # Aggregate totals
-    bots_online = 1  # FX always online
-    total_pnl = fx["realized_pnl"]
+    bots_online = 1 if fx.get("account") else 0
+    total_pnl = fx.get("unrealized_pnl", 0)
     if stock:
         bots_online += 1
         total_pnl += stock.get("total_pnl", 0)
@@ -282,7 +291,6 @@ def build_dashboard(fx: dict, stock: dict | None, poly: dict | None,
     # FX position rows
     fx_rows = ""
     for t in fx["open_trades"]:
-        tag = "T" if t["strategy_id"] == 100 else "PA"
         days = ""
         if t.get("opened_at"):
             try:
@@ -290,29 +298,18 @@ def build_dashboard(fx: dict, stock: dict | None, poly: dict | None,
                 days = f"{d}d"
             except Exception:
                 pass
+        upnl = t.get("unrealized_pnl", 0)
+        upnl_css = "pos" if upnl >= 0 else "neg"
         fx_rows += f"""<tr>
-            <td><span class="badge badge-{tag.lower()}">{tag}</span> <b>{t['symbol']}</b></td>
+            <td><b>{t['symbol']}</b></td>
             <td>{t['side'].upper()}</td>
             <td>{t.get('quantity', '?')}</td>
             <td>{t['entry_price']}</td>
+            <td class="{upnl_css}">${upnl:+,.2f}</td>
             <td>{days}</td>
         </tr>"""
     if not fx_rows:
-        fx_rows = '<tr><td colspan="5" class="empty">No open positions</td></tr>'
-
-    # FX signal rows
-    signal_rows = ""
-    for s in fx.get("signals", [])[:8]:
-        state = json.loads(s["full_state"]) if isinstance(s["full_state"], str) else (s["full_state"] or {})
-        tag = "T" if s["strategy_id"] == 100 else "PA"
-        css = "entry" if s["signal_type"] == "entry" else "exit"
-        signal_rows += f"""<tr>
-            <td>{str(s['generated_at'])[:10]}</td>
-            <td><span class="badge badge-{tag.lower()}">{tag}</span></td>
-            <td><b>{s['symbol']}</b></td>
-            <td class="sig-{css}">{s['signal_type'].upper()}</td>
-            <td>{s['price_at_signal']}</td>
-        </tr>"""
+        fx_rows = '<tr><td colspan="6" class="empty">No open positions</td></tr>'
 
     # Stock section
     stock_html = ""
@@ -401,28 +398,29 @@ def build_dashboard(fx: dict, stock: dict | None, poly: dict | None,
         </div>"""
 
     # FX section
-    fx_pnl = fx["realized_pnl"]
+    fx_acct = fx.get("account", {})
+    fx_equity = fx_acct.get("equity", 0)
+    fx_balance = fx_acct.get("balance", 0)
+    fx_unrealized = fx.get("unrealized_pnl", 0)
+    fx_available = fx_acct.get("available", 0)
     fx_html = f"""
     <div class="bot-card">
         <div class="bot-header">
             <div class="bot-title">FX BOT <span class="bot-tag">Capital.com</span></div>
-            <div class="bot-pnl {'pos' if fx_pnl >= 0 else 'neg'}">${fx_pnl:+,.2f}</div>
+            <div class="bot-pnl {'pos' if fx_unrealized >= 0 else 'neg'}">${fx_unrealized:+,.2f}</div>
         </div>
         <div class="bot-stats">
+            <div class="mini-stat"><span class="label">Equity</span><span class="val">${fx_equity:,.2f}</span></div>
+            <div class="mini-stat"><span class="label">Balance</span><span class="val">${fx_balance:,.2f}</span></div>
+            <div class="mini-stat"><span class="label">Available</span><span class="val">${fx_available:,.2f}</span></div>
             <div class="mini-stat"><span class="label">Open</span><span class="val">{fx['open_count']}</span></div>
-            <div class="mini-stat"><span class="label">Closed</span><span class="val">{fx['total_closed']}</span></div>
-            <div class="mini-stat"><span class="label">Win Rate</span><span class="val">{fx['win_rate']}%</span></div>
             <div class="mini-stat"><span class="label">Regime</span><span class="val regime-{regime_label.lower()}">{regime_label}</span></div>
+            <div class="mini-stat"><span class="label">Currency</span><span class="val">{fx_acct.get('currency', 'USD')}</span></div>
         </div>
         <h3>Open Positions</h3>
         <table>
-            <tr><th>Symbol</th><th>Side</th><th>Lots</th><th>Entry</th><th>Held</th></tr>
+            <tr><th>Symbol</th><th>Side</th><th>Size</th><th>Entry</th><th>P&L</th><th>Held</th></tr>
             {fx_rows}
-        </table>
-        <h3>Recent Signals</h3>
-        <table>
-            <tr><th>Date</th><th>Strategy</th><th>Symbol</th><th>Type</th><th>Price</th></tr>
-            {signal_rows}
         </table>
     </div>"""
 
@@ -626,9 +624,9 @@ tr:hover {{ background: #1a2332; }}
         <div class="sub">VIX: {vix}</div>
     </div>
     <div class="overview-card">
-        <div class="label">FX Win Rate</div>
-        <div class="value yellow">{fx['win_rate']}%</div>
-        <div class="sub">{fx['wins']}/{fx['total_closed']} trades</div>
+        <div class="label">FX Equity</div>
+        <div class="value yellow">${fx.get('account', {}).get('equity', 0):,.0f}</div>
+        <div class="sub">{fx['open_count']} open positions</div>
     </div>
     <div class="overview-card">
         <div class="label">Bots Online</div>

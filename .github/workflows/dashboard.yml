@@ -36,6 +36,10 @@ jobs:
           GH_TOKEN: ${{ secrets.BOT_GITHUB_TOKEN }}
           STOCK_REPO: ${{ vars.STOCK_REPO || 'souhail123456/trading-bot' }}
           POLYMARKET_REPO: ${{ vars.POLYMARKET_REPO || 'souhail123456/polymarket-bot' }}
+          CAPITAL_API_KEY: ${{ secrets.CAPITAL_API_KEY }}
+          CAPITAL_EMAIL: ${{ secrets.CAPITAL_EMAIL }}
+          CAPITAL_PASSWORD: ${{ secrets.CAPITAL_PASSWORD }}
+          CAPITAL_ENV: ${{ vars.CAPITAL_ENV || 'demo' }}
         run: python dashboard.py --static --output docs/index.html
 
       - name: Upload Pages artifact
