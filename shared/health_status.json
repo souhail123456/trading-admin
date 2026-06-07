@@ -1,18 +1,18 @@
 {
-  "checked_at": "2026-06-01T07:24:02.357285+08:00",
+  "checked_at": "2026-06-08T07:24:06.908717+08:00",
   "repo": "trading-admin",
   "services": {
     "capital_com": {
       "status": "ok",
-      "latency_ms": 688
+      "latency_ms": 609
     },
     "telegram": {
       "status": "ok",
-      "latency_ms": 468
+      "latency_ms": 343
     },
     "github_api": {
       "status": "ok",
-      "latency_ms": 247,
+      "latency_ms": 81,
       "remaining": 5000,
       "limit": 5000
     }
