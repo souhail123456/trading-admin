@@ -29,11 +29,11 @@
   "regime": "RANGING",
   "alerts": [],
   "service_status": {
-    "timestamp": "2026-06-25T22:00:35Z",
+    "timestamp": "2026-06-26T21:52:16Z",
     "stock_broker_status": "down",
     "stock_action": "skip_all"
   },
-  "vix": 18.889999389648438,
+  "vix": 18.40999984741211,
   "recommendations": {
     "100": {
       "action": "REDUCE",
@@ -44,14 +44,14 @@
       "reason": "Ranging favors price action reversals"
     }
   },
-  "updated": "2026-06-25T22:00:41Z",
+  "updated": "2026-06-26T21:52:21Z",
   "cross_bot_risk": {
-    "total_positions": 14,
-    "total_exposure": 2734905.94,
+    "total_positions": 13,
+    "total_exposure": 2724183.14,
     "by_bot": {
       "fx": {
-        "count": 3,
-        "total_value": 2573300.8875
+        "count": 2,
+        "total_value": 2562578.088
       },
       "stock": {
         "count": 11,
@@ -63,6 +63,6 @@
       "HIGH_POSITION_COUNT",
       "HIGH_TOTAL_EXPOSURE"
     ],
-    "computed_at": "2026-06-25T22:00:46Z"
+    "computed_at": "2026-06-26T21:52:25Z"
   }
 }
