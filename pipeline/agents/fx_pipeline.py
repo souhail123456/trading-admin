@@ -58,6 +58,67 @@ RANGING_MIN_COMPOSITE_SCORE = 0.05  # composite is ~0.03-0.15 scale (strength*0.
 # ATR cache (session-level, avoids repeated yfinance calls)
 _atr_cache: dict[str, float | None] = {}
 
+# Fallback USDJPY rate when broker is unavailable (updated periodically)
+_FALLBACK_USDJPY = 148.0
+
+# P&L conversion categories based on quote currency
+_JPY_CROSS_PAIRS = {"EURJPY", "GBPJPY", "AUDJPY", "NZDJPY", "CADJPY", "CHFJPY"}
+_USD_BASE_PAIRS = {"USDCAD", "USDCHF", "USDJPY"}
+_USD_QUOTE_PAIRS = {"EURUSD", "GBPUSD", "AUDUSD", "NZDUSD"}
+# Other crosses (EURGBP etc.) use exit_price-based conversion as approximation
+
+
+def _get_usdjpy_rate(broker) -> float:
+    """Fetch current USDJPY rate from broker, fallback to hardcoded value."""
+    if broker:
+        try:
+            price_data = broker.get_price("USDJPY")
+            if price_data and price_data.get("bid"):
+                return float(price_data["bid"])
+        except Exception:
+            pass
+    return _FALLBACK_USDJPY
+
+
+def calculate_fx_pnl(
+    symbol: str,
+    side: str,
+    entry_price: float,
+    exit_price: float,
+    qty_micro_lots: float,
+    broker=None,
+) -> float:
+    """Calculate P&L in USD for an FX trade.
+
+    Args:
+        symbol: Currency pair (e.g. "EURUSD", "GBPJPY")
+        side: "long" or "short"
+        entry_price: Entry price
+        exit_price: Exit price
+        qty_micro_lots: Position size in micro-lots (1 micro-lot = 1000 units)
+        broker: Broker instance for fetching USDJPY rate (optional)
+
+    Returns:
+        P&L in USD.
+
+    Formula by pair type (qty is in micro-lots, * 1000 converts to units):
+      - USD-quote (EURUSD, GBPUSD, etc.):  diff * qty * 1000
+      - JPY crosses (GBPJPY, EURJPY, etc.): diff * qty * 1000 / USDJPY
+      - USD-base (USDCAD, USDCHF, USDJPY):  diff * qty * 1000 / exit_price
+      - Other crosses: diff * qty * 1000 (approximate, treated as USD-quote)
+    """
+    price_diff = (exit_price - entry_price) if side == "long" else (entry_price - exit_price)
+    raw_pnl = price_diff * qty_micro_lots * 1000
+
+    if symbol in _JPY_CROSS_PAIRS:
+        usdjpy = _get_usdjpy_rate(broker)
+        return raw_pnl / usdjpy
+    elif symbol in _USD_BASE_PAIRS:
+        return raw_pnl / exit_price
+    else:
+        # USD-quote pairs and other crosses (EURGBP etc.)
+        return raw_pnl
+
 
 def get_current_regime(conn: sqlite3.Connection) -> dict | None:
     """Load the latest regime classification from global_state.json or agent_log.
@@ -209,7 +270,7 @@ def monitor_positions(conn: sqlite3.Connection, broker=None, dry_run: bool = Fal
                 if exit_price and t.get("entry_price"):
                     entry = float(t["entry_price"])
                     qty = float(t.get("quantity", 1))
-                    pnl = ((exit_price - entry) if t["side"] == "long" else (entry - exit_price)) * qty
+                    pnl = calculate_fx_pnl(t["symbol"], t["side"], entry, exit_price, qty, broker)
 
                 if not dry_run:
                     conn.execute(
@@ -265,7 +326,7 @@ def monitor_positions(conn: sqlite3.Connection, broker=None, dry_run: bool = Fal
                 if exit_price and t.get("entry_price"):
                     entry = float(t["entry_price"])
                     qty = float(t.get("quantity", 1))
-                    pnl = ((exit_price - entry) if t["side"] == "long" else (entry - exit_price)) * qty
+                    pnl = calculate_fx_pnl(t["symbol"], t["side"], entry, exit_price, qty, broker)
 
                 if not dry_run:
                     conn.execute(
@@ -429,10 +490,7 @@ def monitor_positions(conn: sqlite3.Connection, broker=None, dry_run: bool = Fal
                 if exit_price and t.get("entry_price"):
                     entry = float(t["entry_price"])
                     qty = float(t.get("quantity", 1))
-                    if t["side"] == "long":
-                        pnl = (exit_price - entry) * qty
-                    else:
-                        pnl = (entry - exit_price) * qty
+                    pnl = calculate_fx_pnl(t["symbol"], t["side"], entry, exit_price, qty, broker)
 
                 conn.execute(
                     """UPDATE paper_trades
@@ -726,10 +784,7 @@ def execute_decisions(conn: sqlite3.Connection, decisions: list[dict], dry_run: 
                     if exit_price and trade.get("entry_price"):
                         entry = float(trade["entry_price"])
                         qty = float(trade.get("quantity", 1))
-                        if trade["side"] == "long":
-                            pnl = (float(exit_price) - entry) * qty
-                        else:
-                            pnl = (entry - float(exit_price)) * qty
+                        pnl = calculate_fx_pnl(d["symbol"], trade["side"], entry, float(exit_price), qty, broker)
 
                     conn.execute(
                         """UPDATE paper_trades
