@@ -209,7 +209,7 @@ def monitor_positions(conn: sqlite3.Connection, broker=None, dry_run: bool = Fal
                 if exit_price and t.get("entry_price"):
                     entry = float(t["entry_price"])
                     qty = float(t.get("quantity", 1))
-                    pnl = ((exit_price - entry) if t["side"] == "long" else (entry - exit_price)) * qty * 1000
+                    pnl = ((exit_price - entry) if t["side"] == "long" else (entry - exit_price)) * qty
 
                 if not dry_run:
                     conn.execute(
@@ -265,7 +265,7 @@ def monitor_positions(conn: sqlite3.Connection, broker=None, dry_run: bool = Fal
                 if exit_price and t.get("entry_price"):
                     entry = float(t["entry_price"])
                     qty = float(t.get("quantity", 1))
-                    pnl = ((exit_price - entry) if t["side"] == "long" else (entry - exit_price)) * qty * 1000
+                    pnl = ((exit_price - entry) if t["side"] == "long" else (entry - exit_price)) * qty
 
                 if not dry_run:
                     conn.execute(
@@ -430,9 +430,9 @@ def monitor_positions(conn: sqlite3.Connection, broker=None, dry_run: bool = Fal
                     entry = float(t["entry_price"])
                     qty = float(t.get("quantity", 1))
                     if t["side"] == "long":
-                        pnl = (exit_price - entry) * qty * 1000  # micro lots * 1000
+                        pnl = (exit_price - entry) * qty
                     else:
-                        pnl = (entry - exit_price) * qty * 1000
+                        pnl = (entry - exit_price) * qty
 
                 conn.execute(
                     """UPDATE paper_trades
@@ -727,9 +727,9 @@ def execute_decisions(conn: sqlite3.Connection, decisions: list[dict], dry_run: 
                         entry = float(trade["entry_price"])
                         qty = float(trade.get("quantity", 1))
                         if trade["side"] == "long":
-                            pnl = (float(exit_price) - entry) * qty * 1000
+                            pnl = (float(exit_price) - entry) * qty
                         else:
-                            pnl = (entry - float(exit_price)) * qty * 1000
+                            pnl = (entry - float(exit_price)) * qty
 
                     conn.execute(
                         """UPDATE paper_trades
