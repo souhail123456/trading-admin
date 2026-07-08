@@ -72,10 +72,8 @@ def _seed_fx_strategies(conn: sqlite3.Connection) -> None:
                 (s["id"], s["name"], s["entry_rule"], s["exit_rule"], s["universe"], s["parameters"]),
             )
         else:
-            # Update parameters if missing
-            row = conn.execute("SELECT parameters FROM strategies WHERE id = ?", (s["id"],)).fetchone()
-            if not dict(row).get("parameters"):
-                conn.execute("UPDATE strategies SET parameters = ? WHERE id = ?", (s["parameters"], s["id"]))
+            # Always sync parameters to ensure correct keys
+            conn.execute("UPDATE strategies SET parameters = ? WHERE id = ?", (s["parameters"], s["id"]))
     conn.commit()
 
 

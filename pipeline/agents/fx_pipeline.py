@@ -749,6 +749,8 @@ def execute_decisions(conn: sqlite3.Connection, decisions: list[dict], dry_run: 
                     continue
 
                 # Broker confirmed — now write to DB with order ID
+                # Use actual broker fill price, fall back to signal price
+                fill_price = result.get("level") or d["price_at_signal"]
                 conn.execute(
                     """INSERT INTO paper_trades
                        (strategy_id, signal_id, symbol, side, entry_price,
@@ -756,9 +758,9 @@ def execute_decisions(conn: sqlite3.Connection, decisions: list[dict], dry_run: 
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 'open', ?, ?)""",
                     (
                         d["strategy_id"], d.get("signal_id"),
-                        d["symbol"], d["side"], d["price_at_signal"],
+                        d["symbol"], d["side"], fill_price,
                         d["micro_lots"],
-                        f"FX {d['strategy']}: {d['symbol']} @ {d['price_at_signal']}",
+                        f"FX {d['strategy']}: {d['symbol']} @ {fill_price}",
                         d["risk_pct"],
                         broker_order_id,
                         datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ"),

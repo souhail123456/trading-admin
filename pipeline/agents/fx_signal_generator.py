@@ -100,17 +100,17 @@ def fx_trend_signals(data: dict[str, pd.DataFrame], params: dict | None = None) 
         if above:
             candidates.append((ticker, composite, state))
         else:
-            # Check if just dropped below (exit signal)
-            if len(df) >= 2 and df.iloc[-2]["close"] > sma.iloc[-2]:
-                signals.append({
-                    "strategy": "fx_trend",
-                    "strategy_id": FX_TREND_STRATEGY_ID,
-                    "symbol": _clean_symbol(ticker),
-                    "side": "long",
-                    "signal_type": "exit",
-                    "price_at_signal": round(float(latest["close"]), 5),
-                    "full_state": {**state, "reason": "dropped_below_sma"},
-                })
+            # Exit signal: price is below SMA-200
+            # Fire on any day below (not just crossunder day) to avoid missing exits
+            signals.append({
+                "strategy": "fx_trend",
+                "strategy_id": FX_TREND_STRATEGY_ID,
+                "symbol": _clean_symbol(ticker),
+                "side": "long",
+                "signal_type": "exit",
+                "price_at_signal": round(float(latest["close"]), 5),
+                "full_state": {**state, "reason": "below_sma"},
+            })
 
     # Top N by composite score (trend strength * 0.7 + carry * 0.3)
     candidates.sort(key=lambda x: x[1], reverse=True)

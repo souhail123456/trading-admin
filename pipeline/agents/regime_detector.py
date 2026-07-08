@@ -101,7 +101,8 @@ def get_fx_adx() -> dict[str, float]:
 
 def classify_regime(vix: float | None, fx_adx: dict[str, float]) -> dict:
     """Classify market regime based on VIX and ADX."""
-    avg_adx = np.mean(list(fx_adx.values())) if fx_adx else 20
+    # Default to 22 (neutral zone between RANGING=20 and TRENDING=25) when no data
+    avg_adx = np.mean(list(fx_adx.values())) if fx_adx else 22
 
     # Determine regime
     if vix is not None and vix >= VIX_CRISIS:
