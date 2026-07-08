@@ -83,8 +83,14 @@ def analyze_strategy(conn: sqlite3.Connection, strategy_id: int) -> dict:
             "alerts": [],
         }
 
-    # Basic stats
-    pnls = [float(t.get("pnl", 0) or 0) for t in closed]
+    # Basic stats — clamp outliers from old unit-conversion bugs
+    # (demo account: any single trade P&L outside ±$10k is garbage)
+    PNL_MAX = 10_000.0
+    raw_pnls = [float(t.get("pnl", 0) or 0) for t in closed]
+    pnls = [max(-PNL_MAX, min(PNL_MAX, p)) for p in raw_pnls]
+    skipped = sum(1 for r, c in zip(raw_pnls, pnls) if r != c)
+    if skipped:
+        log.warning(f"Strategy {strategy_id}: clamped {skipped} trade(s) with |P&L| > ${PNL_MAX:,.0f}")
     wins = sum(1 for p in pnls if p > 0)
     losses = sum(1 for p in pnls if p < 0)
     total_pnl = sum(pnls)

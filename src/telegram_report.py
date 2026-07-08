@@ -4,6 +4,7 @@ Trading Admin — Unified Telegram Reports
 Sends consolidated reports across all 3 bots to Telegram.
 """
 
+import html
 import os
 from datetime import datetime, timedelta, timezone
 
@@ -139,13 +140,13 @@ def _build_stock_lines(s: dict) -> list[str]:
         lines.append(f"  Open positions: {len(open_pos)}")
         for p in open_pos:
             unrealized = p.get("unrealized_pnl", 0)
-            lines.append(f"    {p['symbol']} {p['side']} {p['shares']}@${p['entry']} "
+            lines.append(f"    {html.escape(str(p['symbol']))} {html.escape(str(p['side']))} {p['shares']}@${p['entry']} "
                          f"(${unrealized:+,.2f})")
 
     if closed_count > 0:
         lines.append(f"  Closed: {closed_count} | W/L: {s['win_count']}W/{s['loss_count']}L ({win_rate:.0f}%)")
 
-    lines.append(f"  Last run: {s.get('last_run') or 'N/A'}")
+    lines.append(f"  Last run: {html.escape(str(s.get('last_run') or 'N/A'))}")
     return lines
 
 
@@ -156,7 +157,7 @@ def _build_fx_lines(s: dict) -> list[str]:
     balance = s.get("account_balance") or s.get("balance")
     broker = s.get('broker', 'Capital.com')
 
-    lines = [f"<b>FX BOT</b> ({broker})"]
+    lines = [f"<b>FX BOT</b> ({html.escape(str(broker))})"]
 
     if balance:
         lines.append(f"  Balance: ${balance:,.2f} (P&L: ${s['total_pnl']:+,.2f})")
@@ -166,23 +167,23 @@ def _build_fx_lines(s: dict) -> list[str]:
     # Regime info
     regime = s.get("regime")
     if regime:
-        lines.append(f"  Regime: {regime}")
+        lines.append(f"  Regime: {html.escape(str(regime))}")
 
     # Open positions with details
     open_trades = s.get("open_trades", [])
     lines.append(f"  Open positions: {len(open_trades)}")
     for t in open_trades:
-        symbol = t.get("symbol", "?")
-        side = t.get("side", "?")
+        symbol = html.escape(str(t.get("symbol", "?")))
+        side = html.escape(str(t.get("side", "?")))
         qty = t.get("quantity", "?")
         entry = t.get("entry_price", "?")
         strat_id = t.get("strategy_id")
         tag = "T" if strat_id == 100 else "PA" if strat_id == 101 else "?"
-        opened = (t.get("opened_at") or "?")[:10]
+        opened = html.escape(str((t.get("opened_at") or "?")[:10]))
         lines.append(f"    [{tag}] {symbol} {side.upper()} {qty}@{entry} ({opened})")
 
     lines.append(f"  Closed: {closed_count} | W/L: {s['win_count']}W/{s['loss_count']}L ({win_rate:.0f}%)")
-    lines.append(f"  Last run: {s.get('last_run') or 'N/A'}")
+    lines.append(f"  Last run: {html.escape(str(s.get('last_run') or 'N/A'))}")
 
     return lines
 
@@ -209,7 +210,7 @@ def _build_poly_lines(s: dict) -> list[str]:
         f"  P&L: ${s['total_pnl']:+,.2f} (resolved)",
         f"  Trades: {s['total_trades']} ({s.get('open_positions', 0)} open)",
         f"  W/L: {s['win_count']}W / {s['loss_count']}L ({win_rate:.0f}%)",
-        f"  Last run: {s.get('last_run') or 'N/A'}",
+        f"  Last run: {html.escape(str(s.get('last_run') or 'N/A'))}",
     ]
 
     # EV bot breakdown
@@ -253,14 +254,14 @@ def _build_signal_report(signals: list[dict], portfolio: dict | None = None) -> 
         lines.append(f"<b>ENTRY SIGNALS ({len(entries)})</b>")
         for s in entries:
             tag = "TREND" if "trend" in s.get("strategy", "") else "PA"
-            lines.append(f"  [{tag}] {s['symbol']} LONG @ {s['price_at_signal']}")
+            lines.append(f"  [{tag}] {html.escape(str(s['symbol']))} LONG @ {s['price_at_signal']}")
         lines.append("")
 
     if exits:
         lines.append(f"<b>EXIT SIGNALS ({len(exits)})</b>")
         for s in exits:
             tag = "TREND" if "trend" in s.get("strategy", "") else "PA"
-            lines.append(f"  [{tag}] {s['symbol']} EXIT @ {s['price_at_signal']}")
+            lines.append(f"  [{tag}] {html.escape(str(s['symbol']))} EXIT @ {s['price_at_signal']}")
         lines.append("")
 
     if not signals:

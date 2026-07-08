@@ -984,7 +984,7 @@ def run_daily(dry_run: bool = False, db_path: str | None = None):
                 # Sync: detect broker positions missing from DB
                 broker_positions = broker_test.get_positions()
                 db_open = conn.execute(
-                    "SELECT symbol, broker_order_id FROM paper_trades WHERE status = 'open' AND strategy_id IN (100, 101)"
+                    "SELECT id, symbol, broker_order_id, side, entry_price, quantity FROM paper_trades WHERE status = 'open' AND strategy_id IN (100, 101)"
                 ).fetchall()
                 db_deal_ids = {dict(r).get("broker_order_id") for r in db_open}
                 db_symbols = {dict(r)["symbol"] for r in db_open}
@@ -1005,6 +1005,51 @@ def run_daily(dry_run: bool = False, db_path: str | None = None):
                         )
                         conn.commit()
                         print(f"    Imported: {epic} {side} @ {bp['entry_price']}, deal={bp['deal_id']}")
+
+                # Reverse sync: detect DB positions that no longer exist on the broker
+                # (stop loss hit, manual close, margin call, etc.)
+                broker_deal_ids = {bp["deal_id"] for bp in broker_positions}
+                broker_epics = {bp["epic"].upper().replace("/", "") for bp in broker_positions}
+                now_str = datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")
+                for row in db_open:
+                    r = dict(row)
+                    db_deal_id = r.get("broker_order_id")
+                    db_symbol = r["symbol"]
+                    # Position is still live if its deal_id OR its symbol is present on the broker
+                    deal_id_match = db_deal_id and db_deal_id in broker_deal_ids
+                    symbol_match = db_symbol in broker_epics
+                    if deal_id_match or symbol_match:
+                        continue
+                    # Position is gone from broker — mark it closed with best-effort P&L
+                    print(f"  SYNC: DB position {db_symbol} (id={r['id']}, deal={db_deal_id}) not found on broker — closing in DB")
+                    try:
+                        price_data = broker_test.get_price(db_symbol)
+                        exit_price = price_data.get("bid") if r["side"] == "long" else price_data.get("ask")
+                        exit_price = float(exit_price) if exit_price else float(r["entry_price"])
+                    except Exception as price_err:
+                        print(f"    WARNING: Could not fetch price for {db_symbol}: {price_err} — using entry_price as exit")
+                        exit_price = float(r["entry_price"])
+                    try:
+                        pnl = calculate_fx_pnl(
+                            db_symbol,
+                            r["side"],
+                            float(r["entry_price"]),
+                            exit_price,
+                            float(r["quantity"]),
+                            broker_test,
+                        )
+                    except Exception as pnl_err:
+                        print(f"    WARNING: P&L calculation failed for {db_symbol}: {pnl_err} — recording $0 P&L")
+                        pnl = 0.0
+                    conn.execute(
+                        """UPDATE paper_trades
+                           SET status = 'closed', exit_price = ?, pnl = ?, closed_at = ?,
+                               exit_reason = 'broker_sync_missing'
+                           WHERE id = ?""",
+                        (exit_price, pnl, now_str, r["id"]),
+                    )
+                    conn.commit()
+                    print(f"    Closed: {db_symbol} {r['side']} @ {exit_price} (entry={r['entry_price']}), P&L=${pnl:.2f}")
 
                 if not broker_positions:
                     print(f"  No open positions on broker")

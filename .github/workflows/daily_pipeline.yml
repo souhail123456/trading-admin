@@ -27,9 +27,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: data/pipeline.db
-          key: pipeline-db-${{ github.run_number }}
+          key: pipeline-db-v62-${{ github.run_number }}
           restore-keys: |
-            pipeline-db-
+            pipeline-db-v62-
 
       - name: Clean ghost trades (no broker_order_id)
         run: |
@@ -121,4 +121,4 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: data/pipeline.db
-          key: pipeline-db-${{ github.run_number }}
+          key: pipeline-db-v62-${{ github.run_number }}
