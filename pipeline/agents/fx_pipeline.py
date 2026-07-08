@@ -979,7 +979,14 @@ def run_daily(dry_run: bool = False, db_path: str | None = None):
             broker_test = _get_broker()
             if broker_test:
                 acct = broker_test.get_account()
-                print(f"  CONNECTED: {mode} | balance=${acct.get('balance', '?')} | equity=${acct.get('equity', '?')}")
+                live_balance = acct.get("balance")
+                if live_balance is not None:
+                    global ACCOUNT_BALANCE
+                    ACCOUNT_BALANCE = float(live_balance)
+                    print(f"  CONNECTED: {mode} | balance=${ACCOUNT_BALANCE:.2f} | equity=${acct.get('equity', '?')}")
+                    print(f"  Using live account balance: ${ACCOUNT_BALANCE:.2f} (overrides env var default)")
+                else:
+                    print(f"  CONNECTED: {mode} | balance=${acct.get('balance', '?')} | equity=${acct.get('equity', '?')}")
 
                 # Sync: detect broker positions missing from DB
                 broker_positions = broker_test.get_positions()
@@ -1126,16 +1133,22 @@ def run_daily(dry_run: bool = False, db_path: str | None = None):
     print("\n[2/6] Generating FX signals...")
     signals = generate_fx_signals(dry_run=dry_run, db_path=db_path)
 
-    # Filter signals based on regime
-    if paused_strategies or reduced_strategies:
+    # Filter signals based on regime recommendations
+    # PAUSE → skip entries entirely
+    # REDUCE → skip entries entirely (position size reduction is too weak a filter for trend in ranging)
+    # ACTIVE → normal execution
+    blocked_strategies = paused_strategies | reduced_strategies
+    if blocked_strategies:
         filtered = []
         for s in signals:
             sid = s.get("strategy_id")
             if s["signal_type"] == "exit":
-                # Always allow exits
+                # Always allow exits regardless of regime
                 filtered.append(s)
             elif sid in paused_strategies:
                 print(f"  REGIME PAUSE: skipping {s['symbol']} entry (strategy {sid})")
+            elif sid in reduced_strategies:
+                print(f"  REGIME REDUCE: skipping {s['symbol']} entry (strategy {sid} blocked — not executing in current regime)")
             else:
                 filtered.append(s)
         signals = filtered
@@ -1144,13 +1157,6 @@ def run_daily(dry_run: bool = False, db_path: str | None = None):
     print("\n[3/6] Risk management...")
     if signals:
         decisions = fx_risk_check(conn, signals)
-
-        # Halve position sizes for REDUCE strategies
-        for d in decisions:
-            if d.get("approved") and d.get("action") == "entry" and d.get("strategy_id") in reduced_strategies:
-                d["micro_lots"] = max(d["micro_lots"] // 2, 1)
-                d["risk_amount"] = round(d["risk_amount"] / 2, 2)
-                print(f"  REGIME REDUCE: {d['symbol']} position halved to {d['micro_lots']} micro lots")
 
         approved = [d for d in decisions if d["approved"]]
         vetoed = [d for d in decisions if not d["approved"]]
