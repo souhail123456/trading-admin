@@ -19,6 +19,7 @@ Usage:
 """
 
 import argparse
+import html as _html
 import json
 import logging
 import os
@@ -861,7 +862,7 @@ def _send_fx_telegram(conn: sqlite3.Connection, signals: list[dict], mode: str,
     if closed_by_monitor:
         lines.append(f"<b>MONITOR EXITS ({len(closed_by_monitor)})</b>")
         for c in closed_by_monitor:
-            lines.append(f"  {c['symbol']} — {c['close_reason']}")
+            lines.append(f"  {c['symbol']} — {_html.escape(str(c['close_reason']))}")
         lines.append("")
 
     if not signals and not closed_by_monitor:
@@ -889,7 +890,7 @@ def _send_fx_telegram(conn: sqlite3.Connection, signals: list[dict], mode: str,
         lines.append("")
         lines.append(f"<b>ALERTS ({len(perf_alerts)})</b>")
         for a in perf_alerts:
-            lines.append(f"  [{a['severity']}] {a['message']}")
+            lines.append(f"  [{a['severity']}] {_html.escape(a['message'])}")
 
     msg_text = "\n".join(lines)
     # Telegram has a 4096 char limit
