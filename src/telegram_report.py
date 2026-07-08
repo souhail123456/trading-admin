@@ -150,23 +150,39 @@ def _build_stock_lines(s: dict) -> list[str]:
 
 
 def _build_fx_lines(s: dict) -> list[str]:
+    closed_count = s['total_trades'] - s['open_positions']
     win_rate = (s["win_count"] / (s["win_count"] + s["loss_count"]) * 100) if (s["win_count"] + s["loss_count"]) > 0 else 0
-    lines = [
-        f"<b>FX BOT</b> ({s.get('broker', 'Capital.com')})",
-        f"  P&L: ${s['total_pnl']:+,.2f} (realized)",
-        f"  Open: {s['open_positions']} position(s)",
-        f"  Closed: {s['total_trades'] - s['open_positions']} | Win rate: {win_rate:.0f}%",
-        f"  Last run: {s.get('last_run') or 'N/A'}",
-    ]
 
-    if s.get("open_trades"):
-        lines.append("  Positions:")
-        for t in s["open_trades"]:
-            symbol = t.get("symbol", "?")
-            side = t.get("side", "?")
-            qty = t.get("quantity", "?")
-            entry = t.get("entry_price", "?")
-            lines.append(f"    {symbol} {side} {qty} lots @ {entry}")
+    balance = s.get("account_balance") or s.get("balance")
+    broker = s.get('broker', 'Capital.com')
+
+    lines = [f"<b>FX BOT</b> ({broker})"]
+
+    if balance:
+        lines.append(f"  Balance: ${balance:,.2f} (P&L: ${s['total_pnl']:+,.2f})")
+    else:
+        lines.append(f"  P&L: ${s['total_pnl']:+,.2f} (realized)")
+
+    # Regime info
+    regime = s.get("regime")
+    if regime:
+        lines.append(f"  Regime: {regime}")
+
+    # Open positions with details
+    open_trades = s.get("open_trades", [])
+    lines.append(f"  Open positions: {len(open_trades)}")
+    for t in open_trades:
+        symbol = t.get("symbol", "?")
+        side = t.get("side", "?")
+        qty = t.get("quantity", "?")
+        entry = t.get("entry_price", "?")
+        strat_id = t.get("strategy_id")
+        tag = "T" if strat_id == 100 else "PA" if strat_id == 101 else "?"
+        opened = (t.get("opened_at") or "?")[:10]
+        lines.append(f"    [{tag}] {symbol} {side.upper()} {qty}@{entry} ({opened})")
+
+    lines.append(f"  Closed: {closed_count} | W/L: {s['win_count']}W/{s['loss_count']}L ({win_rate:.0f}%)")
+    lines.append(f"  Last run: {s.get('last_run') or 'N/A'}")
 
     return lines
 

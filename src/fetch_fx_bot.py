@@ -115,5 +115,25 @@ def fetch_fx_stats(db_path: str | None = None) -> dict:
     except Exception:
         stats["strategies"] = []
 
+    # Regime from shared state
+    try:
+        import json as _json
+        gs_path = Path(__file__).parent.parent / "shared" / "global_state.json"
+        if gs_path.exists():
+            gs = _json.loads(gs_path.read_text())
+            regime_data = gs.get("regime_detector", {})
+            regime = regime_data.get("regime")
+            if regime:
+                vix = regime_data.get("vix")
+                adx = regime_data.get("avg_adx")
+                parts = [regime]
+                if vix:
+                    parts.append(f"VIX:{vix}")
+                if adx:
+                    parts.append(f"ADX:{adx}")
+                stats["regime"] = " ".join(parts)
+    except Exception:
+        pass
+
     conn.close()
     return stats
