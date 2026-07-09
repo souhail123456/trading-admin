@@ -181,7 +181,7 @@ def _check_yfinance(timeout: int = 10) -> dict:
 def _check_alpaca(timeout: int = 10) -> dict:
     key = os.environ.get("ALPACA_API_KEY")
     if not key:
-        return {"status": "no_key", "message": "ALPACA_API_KEY not set (lives in stock bot repo)"}
+        return {"status": "no_key", "message": "Alpaca broker DOWN: ALPACA_API_KEY not set (lives in stock bot repo)"}
     try:
         t0 = time.time()
         secret = os.environ.get("ALPACA_SECRET_KEY", "")
@@ -193,10 +193,18 @@ def _check_alpaca(timeout: int = 10) -> dict:
             acct = r.json()
             return {"status": "ok", "latency_ms": latency,
                     "message": f"Balance: ${float(acct.get('equity', 0)):,.2f}"}
+        elif r.status_code == 401:
+            return {"status": "error", "message": "Alpaca broker DOWN: invalid/expired API key (HTTP 401)"}
+        elif r.status_code == 403:
+            return {"status": "error", "message": "Alpaca broker DOWN: forbidden — check API key permissions (HTTP 403)"}
         else:
-            return {"status": "error", "message": f"HTTP {r.status_code}"}
+            return {"status": "error", "message": f"Alpaca broker DOWN: HTTP {r.status_code}"}
+    except requests.exceptions.Timeout:
+        return {"status": "error", "message": "Alpaca broker DOWN: connection timed out"}
+    except requests.exceptions.ConnectionError:
+        return {"status": "error", "message": "Alpaca broker DOWN: connection refused — API may be offline"}
     except Exception as e:
-        return {"status": "error", "message": str(e)}
+        return {"status": "error", "message": f"Alpaca broker DOWN: {e}"}
 
 
 def _check_anthropic(timeout: int = 10) -> dict:

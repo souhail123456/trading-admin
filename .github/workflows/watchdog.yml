@@ -1,0 +1,162 @@
+name: Bot Watchdog
+
+on:
+  schedule:
+    - cron: "0 * * * *"
+  workflow_dispatch:
+
+jobs:
+  watchdog:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.BOT_GITHUB_TOKEN }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check bot staleness and alert
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python3 -c "
+          import json, os, sys, urllib.request, urllib.error
+          from datetime import datetime, timezone, timedelta
+
+          STALE_THRESHOLDS = {
+              'fx_bot': 26,
+              'stock_bot': 26,
+              'research_pipeline': 170,  # weekly
+              'polymarket_bot': 2,
+          }
+          DEDUP_HOURS = 12
+
+          def load_json(path):
+              try:
+                  with open(path) as f:
+                      return json.load(f)
+              except Exception:
+                  return {}
+
+          def fetch_remote(url):
+              try:
+                  req = urllib.request.Request(url, headers={'User-Agent': 'watchdog'})
+                  with urllib.request.urlopen(req, timeout=10) as resp:
+                      return json.loads(resp.read().decode())
+              except Exception:
+                  return {}
+
+          def send_telegram(msg):
+              token = os.environ.get('TELEGRAM_BOT_TOKEN')
+              chat_id = os.environ.get('TELEGRAM_CHAT_ID')
+              if not token or not chat_id:
+                  print(f'No Telegram creds — would alert: {msg}')
+                  return
+              data = json.dumps({'chat_id': chat_id, 'text': msg, 'parse_mode': 'HTML'}).encode()
+              req = urllib.request.Request(
+                  f'https://api.telegram.org/bot{token}/sendMessage',
+                  data=data,
+                  headers={'Content-Type': 'application/json'},
+              )
+              try:
+                  urllib.request.urlopen(req, timeout=10)
+              except Exception as e:
+                  print(f'Telegram send failed: {e}')
+
+          def parse_ts(ts_str):
+              if not ts_str:
+                  return None
+              # Handle various ISO formats with/without timezone
+              for fmt in ('%Y-%m-%dT%H:%M:%S.%f%z', '%Y-%m-%dT%H:%M:%S%z',
+                          '%Y-%m-%dT%H:%M:%S.%fZ', '%Y-%m-%dT%H:%M:%SZ',
+                          '%Y-%m-%dT%H:%M:%S.%f', '%Y-%m-%dT%H:%M:%S'):
+                  try:
+                      dt = datetime.strptime(ts_str, fmt)
+                      if dt.tzinfo is None:
+                          dt = dt.replace(tzinfo=timezone.utc)
+                      return dt
+                  except ValueError:
+                      continue
+              return None
+
+          # Collect all bot statuses
+          all_status = {}
+
+          # Local: shared/bot_status.json
+          local = load_json('shared/bot_status.json')
+          all_status.update(local)
+
+          # Remote: stock bot
+          stock = fetch_remote('https://raw.githubusercontent.com/souhail123456/trading-bot/main/memory/bot_status.json')
+          all_status.update(stock)
+
+          # Remote: polymarket bot
+          poly = fetch_remote('https://raw.githubusercontent.com/souhail123456/polymarket-bot/main/logs/bot_status.json')
+          all_status.update(poly)
+
+          print(f'Collected status for: {list(all_status.keys())}')
+
+          # Load dedup state
+          state_path = 'shared/watchdog_state.json'
+          state = load_json(state_path)
+          if 'last_alert_ts' not in state:
+              state['last_alert_ts'] = {}
+
+          now = datetime.now(timezone.utc)
+          alerts = []
+
+          for bot_name, threshold_hours in STALE_THRESHOLDS.items():
+              bot_data = all_status.get(bot_name, {})
+              last_run_str = bot_data.get('last_run')
+              if not last_run_str:
+                  # Bot not found in any status file — skip (may not exist yet)
+                  print(f'  {bot_name}: no status data found')
+                  continue
+
+              last_run = parse_ts(last_run_str)
+              if not last_run:
+                  print(f'  {bot_name}: could not parse timestamp: {last_run_str}')
+                  continue
+
+              age_hours = (now - last_run).total_seconds() / 3600
+              print(f'  {bot_name}: last_run={last_run_str}, age={age_hours:.1f}h, threshold={threshold_hours}h')
+
+              if age_hours > threshold_hours:
+                  # Check dedup
+                  last_alert_str = state['last_alert_ts'].get(bot_name)
+                  last_alert = parse_ts(last_alert_str) if last_alert_str else None
+
+                  if last_alert and (now - last_alert).total_seconds() / 3600 < DEDUP_HOURS:
+                      print(f'  {bot_name}: STALE but alert suppressed (last alert {last_alert_str})')
+                      continue
+
+                  alerts.append(f'{bot_name}: last run {age_hours:.1f}h ago (threshold: {threshold_hours}h)')
+                  state['last_alert_ts'][bot_name] = now.strftime('%Y-%m-%dT%H:%M:%SZ')
+
+          if alerts:
+              msg_lines = ['<b>Watchdog Alert</b>', ''] + [f'  - {a}' for a in alerts]
+              send_telegram('\n'.join(msg_lines))
+              print(f'Sent alert for {len(alerts)} stale bot(s)')
+          else:
+              print('All bots within threshold — no alerts')
+
+          # Save state
+          os.makedirs(os.path.dirname(state_path) or '.', exist_ok=True)
+          with open(state_path, 'w') as f:
+              json.dump(state, f, indent=2)
+          print(f'Watchdog state saved to {state_path}')
+          "
+
+      - name: Commit watchdog state
+        run: |
+          git config user.name "trading-admin[bot]"
+          git config user.email "bot@trading-admin"
+          git add shared/watchdog_state.json
+          git diff --cached --quiet && echo "No state changes" && exit 0
+          git commit -m "Update watchdog state $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          git push
