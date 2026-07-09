@@ -36,6 +36,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.BOT_GITHUB_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           CAPITAL_API_KEY: ${{ secrets.CAPITAL_API_KEY }}
           CAPITAL_EMAIL: ${{ secrets.CAPITAL_EMAIL }}
           CAPITAL_PASSWORD: ${{ secrets.CAPITAL_PASSWORD }}
@@ -43,7 +44,41 @@ jobs:
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-        run: python3 -m pipeline.agents.api_health --json --fallback > /tmp/api_health.json
+        run: |
+          python3 -m pipeline.agents.api_health --json --fallback > /tmp/api_health.json
+          python3 -c "
+          import json, os, urllib.request
+
+          with open('/tmp/api_health.json') as f:
+              results = json.load(f)
+
+          # Check for critical broker failures and send explicit Telegram alerts
+          broker_alerts = []
+          for r in results:
+              if r.get('name') == 'Alpaca' and r.get('status') in ('error', 'no_key'):
+                  broker_alerts.append(f\"Alpaca broker DOWN: {r.get('message', 'unknown error')}\")
+              if r.get('name') == 'Capital.com' and r.get('status') in ('error', 'no_key'):
+                  broker_alerts.append(f\"Capital.com broker DOWN: {r.get('message', 'unknown error')}\")
+
+          if broker_alerts:
+              token = os.environ.get('TELEGRAM_BOT_TOKEN')
+              chat_id = os.environ.get('TELEGRAM_CHAT_ID')
+              if token and chat_id:
+                  msg = '<b>Broker Health Alert</b>\n\n' + '\n'.join(f'  - {a}' for a in broker_alerts)
+                  data = json.dumps({'chat_id': chat_id, 'text': msg, 'parse_mode': 'HTML'}).encode()
+                  req = urllib.request.Request(
+                      f'https://api.telegram.org/bot{token}/sendMessage',
+                      data=data,
+                      headers={'Content-Type': 'application/json'},
+                  )
+                  try:
+                      urllib.request.urlopen(req, timeout=10)
+                      print(f'Broker health alert sent: {broker_alerts}')
+                  except Exception as e:
+                      print(f'Failed to send broker alert: {e}')
+              else:
+                  print(f'BROKER ALERT (no Telegram): {broker_alerts}')
+          "
 
       - name: Run FX daily pipeline
         env:
