@@ -29,7 +29,7 @@
   "regime": "TRENDING",
   "alerts": [],
   "service_status": {
-    "timestamp": "2026-07-08T22:30:10Z",
+    "timestamp": "2026-07-09T04:57:06Z",
     "stock_broker_status": "down",
     "stock_action": "skip_all"
   },
@@ -44,7 +44,7 @@
       "reason": "Trending with PA confirmation"
     }
   },
-  "updated": "2026-07-08T22:30:14Z",
+  "updated": "2026-07-09T04:57:12Z",
   "cross_bot_risk": {
     "total_positions": 11,
     "total_exposure": 117016.82,
@@ -62,6 +62,6 @@
     "flags": [
       "HIGH_POSITION_COUNT"
     ],
-    "computed_at": "2026-07-08T22:30:23Z"
+    "computed_at": "2026-07-09T04:57:17Z"
   }
 }
