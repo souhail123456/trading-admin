@@ -110,6 +110,13 @@ jobs:
       - name: Export FX trades
         run: python3 src/export_fx_trades.py
 
+      - name: Backfill history (one-time, remove after first run)
+        env:
+          GH_TOKEN: ${{ secrets.BOT_GITHUB_TOKEN }}
+          STOCK_REPO: ${{ vars.STOCK_REPO || 'souhail123456/trading-bot' }}
+          POLYMARKET_REPO: ${{ vars.POLYMARKET_REPO || 'souhail123456/polymarket-bot' }}
+        run: python3 src/backfill_history.py
+
       - name: Update unified history
         env:
           GH_TOKEN: ${{ secrets.BOT_GITHUB_TOKEN }}
