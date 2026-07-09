@@ -229,8 +229,9 @@ def collect_polymarket_events(existing_ids: set) -> list[dict]:
             if trade_id in existing_ids:
                 continue
 
-            # Normalize fields — polymarket trades may have varying schemas
+            # Normalize fields — polymarket trades have realized_pnl, won, size_usd, fee_usd
             ts = trade.get("timestamp") or trade.get("created_at") or trade.get("time") or ""
+            resolved = trade.get("resolved", False)
             events.append({
                 "event": "trade",
                 "bot": "polymarket",
@@ -238,11 +239,15 @@ def collect_polymarket_events(existing_ids: set) -> list[dict]:
                 "trade_id": trade_id,
                 "symbol": trade.get("market") or trade.get("question") or trade.get("symbol", ""),
                 "side": trade.get("side") or trade.get("outcome") or "",
-                "entry_price": trade.get("entry_price") or trade.get("price") or trade.get("avg_price"),
+                "entry_price": trade.get("entry_price") or trade.get("price"),
                 "exit_price": trade.get("exit_price") or trade.get("sell_price"),
-                "quantity": trade.get("quantity") or trade.get("amount") or trade.get("size"),
-                "pnl": trade.get("pnl") or trade.get("profit"),
-                "status": trade.get("status", ""),
+                "size_usd": trade.get("size_usd") or trade.get("amount"),
+                "pnl": trade.get("realized_pnl") if trade.get("realized_pnl") is not None else trade.get("pnl"),
+                "won": trade.get("won"),
+                "fee_usd": trade.get("fee_usd"),
+                "status": "resolved" if resolved else trade.get("status", "open"),
+                "strategy": trade.get("strategy", prefix.replace("poly_", "")),
+                "category": trade.get("category"),
             })
 
     print(f"[polymarket] {len(events)} new trade events")
