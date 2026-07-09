@@ -841,6 +841,117 @@ def execute_decisions(conn: sqlite3.Connection, decisions: list[dict], dry_run: 
 # Telegram + Status
 # ---------------------------------------------------------------------------
 
+def _send_telegram(message: str):
+    """Send a plain Telegram message (for alerts/warnings)."""
+    import requests as _req
+
+    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    if not bot_token or not chat_id:
+        log.warning("Telegram credentials not set — skipping alert")
+        return
+    try:
+        _req.post(
+            f"https://api.telegram.org/bot{bot_token}/sendMessage",
+            json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"},
+            timeout=10,
+        ).raise_for_status()
+    except Exception as e:
+        log.warning(f"Telegram alert failed: {e}")
+        # Retry without HTML
+        try:
+            _req.post(
+                f"https://api.telegram.org/bot{bot_token}/sendMessage",
+                json={"chat_id": chat_id, "text": message.replace("<b>", "").replace("</b>", "")},
+                timeout=10,
+            ).raise_for_status()
+        except Exception as e2:
+            log.error(f"Telegram alert retry failed: {e2}")
+
+
+def reconcile_broker_vs_db(conn: sqlite3.Connection, broker) -> list[str]:
+    """Reconcile broker positions against DB paper_trades.
+
+    Returns list of mismatch descriptions (empty = all synced).
+    Actions:
+      - Broker position missing from DB -> INSERT into paper_trades, log warning
+      - DB position missing from broker -> UPDATE status='orphaned', log warning
+    Sends Telegram alert on any mismatch.
+    """
+    mismatches: list[str] = []
+
+    try:
+        broker_positions = broker.get_positions()
+    except Exception as e:
+        msg = f"Reconciliation FAILED: could not fetch broker positions: {e}"
+        log.error(msg)
+        return [msg]
+
+    db_open = conn.execute(
+        "SELECT id, symbol, broker_order_id, side, entry_price, quantity, strategy_id "
+        "FROM paper_trades WHERE status='open' AND strategy_id IN (100, 101)"
+    ).fetchall()
+
+    # Build lookup sets
+    db_deal_ids = {}
+    for row in db_open:
+        r = dict(row)
+        if r.get("broker_order_id"):
+            db_deal_ids[r["broker_order_id"]] = r
+
+    broker_deal_ids = {bp["deal_id"] for bp in broker_positions}
+
+    now_str = datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # 1) Broker position missing from DB -> INSERT
+    for bp in broker_positions:
+        if bp["deal_id"] not in db_deal_ids:
+            epic = bp["epic"].upper().replace("/", "")
+            side = "long" if bp["direction"] == "BUY" else "short"
+            msg = (f"RECON: Broker position {epic} (deal={bp['deal_id']}) "
+                   f"missing from DB — inserting")
+            log.warning(msg)
+            mismatches.append(msg)
+
+            conn.execute(
+                """INSERT INTO paper_trades
+                   (strategy_id, symbol, side, entry_price, quantity, thesis,
+                    risk_pct, risk_approved, status, broker_order_id, opened_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 1, 'open', ?, ?)""",
+                (TREND_STRATEGY_ID, epic, side, bp["entry_price"], bp["size"],
+                 f"Reconciled from broker: {epic} {side} @ {bp['entry_price']}",
+                 MAX_RISK_PER_TRADE * 100, bp["deal_id"],
+                 bp.get("created_date", now_str)),
+            )
+            conn.commit()
+
+    # 2) DB position missing from broker -> mark orphaned
+    for deal_id, db_row in db_deal_ids.items():
+        if deal_id not in broker_deal_ids:
+            msg = (f"RECON: DB position {db_row['symbol']} "
+                   f"(id={db_row['id']}, deal={deal_id}) "
+                   f"not found on broker — marking orphaned")
+            log.warning(msg)
+            mismatches.append(msg)
+
+            conn.execute(
+                "UPDATE paper_trades SET status='orphaned' WHERE id = ?",
+                (db_row["id"],),
+            )
+            conn.commit()
+
+    # Send Telegram alert on any mismatch
+    if mismatches:
+        alert_lines = [
+            "<b>FX Reconciliation Alert</b>",
+            f"Found {len(mismatches)} mismatch(es):",
+            "",
+        ] + [f"  - {_html.escape(m)}" for m in mismatches]
+        _send_telegram("\n".join(alert_lines))
+
+    return mismatches
+
+
 def _send_fx_telegram(conn: sqlite3.Connection, signals: list[dict], mode: str,
                       closed_by_monitor: list[dict] = None, regime: dict = None,
                       perf_alerts: list[dict] = None):
@@ -1099,6 +1210,26 @@ def run_daily(dry_run: bool = False, db_path: str | None = None):
             print(f"  ERROR: Broker connection failed: {e}")
             print(f"  Continuing in SQLITE-ONLY mode — signals will be generated but NOT executed")
             mode = "SQLITE-ONLY (broker auth failed)"
+
+    # Reconciliation: diff broker positions vs DB before any signal generation
+    if not dry_run:
+        print("\n[RECON] Reconciling broker vs DB positions...")
+        try:
+            broker_recon = _get_broker()
+            if broker_recon:
+                recon_mismatches = reconcile_broker_vs_db(conn, broker_recon)
+                if recon_mismatches:
+                    print(f"  {len(recon_mismatches)} mismatch(es) found and resolved")
+                    for m in recon_mismatches:
+                        print(f"    {m}")
+                else:
+                    print("  Broker and DB are in sync")
+                broker_recon.disconnect()
+            else:
+                print("  No broker available — skipping reconciliation")
+        except Exception as e:
+            log.error(f"Reconciliation failed: {e}")
+            print(f"  Reconciliation error: {e}")
 
     # Step 0: Monitor existing positions (time stops, % stops)
     print("\n[0/6] Monitoring open positions...")
