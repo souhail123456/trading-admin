@@ -219,6 +219,25 @@ class CapitalBroker:
         log.info(f"Closed deal: {deal_id}")
         return data
 
+    def update_stop(self, deal_id: str, stop_level: float) -> dict:
+        """Amend a position's stop-loss level at the broker.
+
+        Uses Capital.com PUT /positions/{dealId} endpoint.
+        Returns the confirmation dict or raises on failure.
+        """
+        body = {"stopLevel": round(stop_level, 5)}
+        log.info(f"Updating stop for {deal_id}: stopLevel={stop_level:.5f}")
+        data = self._request("PUT", f"/api/v1/positions/{deal_id}", json=body)
+        # Confirm the amendment if a dealReference is returned
+        if "dealReference" in data:
+            try:
+                confirm = self._request("GET", f"/api/v1/confirms/{data['dealReference']}")
+                log.info(f"Stop update confirmed: {confirm.get('dealStatus', 'UNKNOWN')}")
+                return confirm
+            except Exception as e:
+                log.warning(f"Could not confirm stop update for {deal_id}: {e}")
+        return data
+
     def close_all(self) -> list:
         """Close all open positions."""
         positions = self.get_positions()

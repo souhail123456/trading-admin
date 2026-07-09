@@ -228,6 +228,29 @@ def _close_broker_position(broker, symbol: str, broker_order_id: str | None):
 # Monitor: check open positions for time/stop exits
 # ---------------------------------------------------------------------------
 
+def _try_update_broker_stop(broker, deal_id: str, new_stop: float, symbol: str, current_broker_stop: float | None) -> bool:
+    """Push a trailing stop update to the broker if the new level improves on the existing one.
+
+    Returns True if the broker stop was updated, False otherwise.
+    'Improves' means the stop moved in the profitable direction (higher for long, lower for short —
+    caller is responsible for only calling this when the stop is favorable).
+    """
+    if not broker or not deal_id:
+        return False
+    # Skip if broker already has this stop or a better one
+    if current_broker_stop is not None and abs(new_stop - current_broker_stop) < 1e-6:
+        return False
+    try:
+        from pipeline.agents.broker_capital import CapitalBroker
+        if isinstance(broker, CapitalBroker):
+            broker.update_stop(deal_id, new_stop)
+            log.info(f"  [TRAIL] {symbol}: broker stop updated to {new_stop:.5f}")
+            return True
+    except Exception as e:
+        log.warning(f"  [TRAIL] {symbol}: failed to update broker stop: {e}")
+    return False
+
+
 def monitor_positions(conn: sqlite3.Connection, broker=None, dry_run: bool = False) -> list[dict]:
     """
     Check open positions for exits that should trigger.
@@ -238,6 +261,15 @@ def monitor_positions(conn: sqlite3.Connection, broker=None, dry_run: bool = Fal
     """
     closed = []
     now = datetime.now()
+
+    # Pre-fetch broker positions to get current stop levels
+    broker_stop_levels: dict[str, float | None] = {}
+    if broker:
+        try:
+            for bp in broker.get_positions():
+                broker_stop_levels[bp["deal_id"]] = bp.get("stop_level")
+        except Exception:
+            pass
 
     # Load strategy params from DB
     pa_params = get_strategy_params(conn, PA_STRATEGY_ID) or _DEFAULT_PA_PARAMS

@@ -2,8 +2,8 @@ name: Daily Trading Pipeline
 
 on:
   schedule:
-    # Run Mon-Fri at 21:30 UTC (after US market close, 30min after report) — 5:30 AM+1 Shanghai
-    - cron: "30 21 * * 1-5"
+    # Run Mon-Fri at 07:00 UTC (London open, tighter spreads) — 3:00 PM Shanghai
+    - cron: "0 7 * * 1-5"
   workflow_dispatch: # Allow manual trigger
 
 jobs:
@@ -31,20 +31,6 @@ jobs:
           restore-keys: |
             pipeline-db-v62-
 
-      - name: Clean ghost trades (no broker_order_id)
-        run: |
-          python3 -c "
-          import sqlite3, os
-          db = 'data/pipeline.db'
-          if os.path.exists(db):
-              conn = sqlite3.connect(db)
-              cur = conn.execute(\"UPDATE paper_trades SET status='closed', closed_at=datetime('now'), pnl=0 WHERE broker_order_id IS NULL AND status IN ('open', 'pending')\")
-              if cur.rowcount > 0:
-                  print(f'Cleaned {cur.rowcount} ghost trades (no broker confirmation)')
-              conn.commit()
-              conn.close()
-          "
-
       - name: API health check with fallback
         continue-on-error: true
         env:
@@ -69,6 +55,26 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python3 -m pipeline.agents.fx_pipeline --daily
 
+      - name: Clean ghost trades (no broker_order_id, post-reconciliation)
+        run: |
+          python3 -c "
+          import sqlite3, os
+          db = 'data/pipeline.db'
+          if os.path.exists(db):
+              conn = sqlite3.connect(db)
+              cur = conn.execute(\"UPDATE paper_trades SET status='ghost', pnl=NULL WHERE broker_order_id IS NULL AND status IN ('open', 'pending')\")
+              if cur.rowcount > 0:
+                  print(f'Flagged {cur.rowcount} ghost trades (no broker confirmation)')
+              conn.commit()
+              conn.close()
+          "
+
+      - name: Persist pipeline DB to shared/
+        if: always()
+        run: |
+          mkdir -p shared
+          cp data/pipeline.db shared/pipeline.db 2>/dev/null && echo "Copied pipeline.db to shared/" || echo "No pipeline.db to copy"
+
       - name: Update bot status
         if: always()
         run: |
@@ -87,7 +93,7 @@ jobs:
           status['fx_bot'] = {
               'last_run': now,
               'status': 'ok',
-              'next_run': 'next weekday 21:30 UTC (5:30 AM Shanghai)'
+              'next_run': 'next weekday 07:00 UTC (3:00 PM Shanghai)'
           }
 
           import os
@@ -122,7 +128,7 @@ jobs:
         run: |
           git config user.name "trading-admin[bot]"
           git config user.email "bot@trading-admin"
-          git add shared/global_state.json shared/bot_status.json shared/daily_history.jsonl shared/fx_trades.jsonl
+          git add shared/global_state.json shared/bot_status.json shared/daily_history.jsonl shared/fx_trades.jsonl shared/pipeline.db
           git diff --cached --quiet && echo "No shared state changes" && exit 0
           git commit -m "Update shared state $(date -u +%Y-%m-%d)"
           git push
