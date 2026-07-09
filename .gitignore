@@ -5,3 +5,8 @@ venv/
 .venv/
 data/ohlcv/
 data/pipeline.db
+
+pipeline.db
+data/pipeline.db-shm
+data/pipeline.db-wal
+data/pipeline.db
