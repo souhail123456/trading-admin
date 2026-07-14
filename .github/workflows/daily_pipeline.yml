@@ -163,7 +163,7 @@ jobs:
         run: |
           git config user.name "trading-admin[bot]"
           git config user.email "bot@trading-admin"
-          git add shared/global_state.json shared/bot_status.json shared/daily_history.jsonl shared/fx_trades.jsonl shared/pipeline.db
+          git add -f shared/global_state.json shared/bot_status.json shared/daily_history.jsonl shared/fx_trades.jsonl shared/pipeline.db
           git diff --cached --quiet && echo "No shared state changes" && exit 0
           git commit -m "Update shared state $(date -u +%Y-%m-%d)"
           git push
