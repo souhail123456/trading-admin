@@ -29,9 +29,9 @@
   "regime": "TRENDING",
   "alerts": [],
   "service_status": {
-    "timestamp": "2026-07-15T09:09:18Z"
+    "timestamp": "2026-07-16T09:12:54Z"
   },
-  "vix": 16.260000228881836,
+  "vix": 15.850000381469727,
   "recommendations": {
     "100": {
       "action": "ACTIVE",
@@ -42,7 +42,7 @@
       "reason": "Trending with PA confirmation"
     }
   },
-  "updated": "2026-07-15T09:09:25Z",
+  "updated": "2026-07-16T09:13:03Z",
   "cross_bot_risk": {
     "total_positions": 9,
     "total_exposure": 466538.83,
@@ -60,6 +60,6 @@
     "flags": [
       "HIGH_TOTAL_EXPOSURE"
     ],
-    "computed_at": "2026-07-15T09:09:30Z"
+    "computed_at": "2026-07-16T09:13:10Z"
   }
 }
