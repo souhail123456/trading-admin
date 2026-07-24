@@ -81,20 +81,54 @@ def get_vix() -> float | None:
     return None
 
 
+def _flatten_yf_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Flatten yfinance MultiIndex columns (introduced in yfinance >=0.2.x)."""
+    if isinstance(df.columns, pd.MultiIndex):
+        # e.g. ('Close', 'EURUSD=X') → 'Close'
+        df = df.copy()
+        df.columns = [col[0] for col in df.columns]
+    return df
+
+
 def get_fx_adx() -> dict[str, float]:
-    """Compute ADX for major FX pairs."""
+    """Compute ADX for major FX pairs.
+
+    Primary source: yfinance (EURUSD=X format).
+    Fallback: Capital.com broker candles if yfinance returns empty or fails.
+    """
     pairs = {"EURUSD": "EURUSD=X", "GBPUSD": "GBPUSD=X", "USDJPY": "USDJPY=X"}
     results = {}
 
     for name, ticker in pairs.items():
         try:
-            df = yf.download(ticker, period="60d", progress=False)
-            if not df.empty:
+            df = yf.download(ticker, period="60d", progress=False, auto_adjust=True)
+            df = _flatten_yf_df(df)
+            if not df.empty and "High" in df.columns and len(df) >= 30:
                 adx = compute_adx(df)
                 if adx is not None:
                     results[name] = round(adx, 1)
-        except Exception:
-            pass
+                    log.info(f"ADX {name} (yfinance): {adx:.1f}")
+                    continue
+        except Exception as e:
+            log.warning(f"yfinance failed for {name}: {e}")
+
+        # Fallback: Capital.com candles
+        try:
+            from pipeline.agents.broker_capital import CapitalBroker
+            broker = CapitalBroker()
+            candles = broker.get_candles(name, granularity="DAY", count=60)
+            broker.disconnect()
+            if candles and len(candles) >= 30:
+                df = pd.DataFrame(candles).rename(columns={
+                    "open": "Open", "high": "High", "low": "Low",
+                    "close": "Close", "volume": "Volume",
+                })
+                adx = compute_adx(df)
+                if adx is not None:
+                    results[name] = round(adx, 1)
+                    log.info(f"ADX {name} (Capital.com fallback): {adx:.1f}")
+        except Exception as e:
+            log.warning(f"Capital.com fallback failed for {name}: {e}")
 
     return results
 

@@ -9,7 +9,7 @@ Unified runner for the forex trading pipeline:
   5. Portfolio status + Telegram alert
 
 Execution matches backtested rules:
-  - Trend (ID 100): hold while above SMA-200, monthly rebalance, no fixed SL/TP
+  - Trend (ID 100): hold while above SMA-200, monthly rebalance, 80-pip SL / 240-pip TP (3:1 R:R)
   - Price Action (ID 101): max 15-day hold, 3% stop loss, exit on bearish pattern
 
 Usage:
@@ -36,7 +36,7 @@ log = logging.getLogger(__name__)
 # Risk parameters
 ACCOUNT_BALANCE = float(os.environ.get("FX_ACCOUNT_BALANCE", "10000"))
 LEVERAGE = float(os.environ.get("FX_LEVERAGE", "500"))
-MAX_RISK_PER_TRADE = 0.02  # 2% per trade
+MAX_RISK_PER_TRADE = 0.04  # 4% per trade (demo account, $295 balance)
 MAX_POSITIONS = 3
 
 # Strategy IDs
@@ -44,7 +44,7 @@ TREND_STRATEGY_ID = 100
 PA_STRATEGY_ID = 101
 
 # Defaults (overridden by DB parameters)
-_DEFAULT_TREND_PARAMS = {"stop_loss_pips": 80, "max_hold_days": None, "stop_loss_pct": None}
+_DEFAULT_TREND_PARAMS = {"stop_loss_pips": 80, "take_profit_pips": 240, "max_hold_days": None, "stop_loss_pct": None}
 _DEFAULT_PA_PARAMS = {"stop_loss_pips": 40, "max_hold_days": 15, "stop_loss_pct": 0.03}
 
 # Safety net: trend positions without explicit max_hold get closed after this many days
@@ -432,6 +432,8 @@ def monitor_positions(conn: sqlite3.Connection, broker=None, dry_run: bool = Fal
                     atr = get_atr(t["symbol"])
 
                     if atr and atr > 0:
+                        deal_id = t.get("broker_order_id")
+                        current_broker_stop = broker_stop_levels.get(deal_id)
                         if side == "long":
                             unrealized = current - entry
                             if unrealized >= atr_multiplier * atr:
@@ -444,6 +446,7 @@ def monitor_positions(conn: sqlite3.Connection, broker=None, dry_run: bool = Fal
                                 else:
                                     log.info(f"  [TRAIL] {t['symbol']}: ATR={atr:.5f}, "
                                              f"unrealized={unrealized:+.5f}, trailing stop @ {effective_stop:.5f}")
+                                    _try_update_broker_stop(broker, deal_id, effective_stop, t["symbol"], current_broker_stop)
                             elif unrealized >= 1 * atr:
                                 # Break-even lock
                                 effective_stop = entry
@@ -453,6 +456,7 @@ def monitor_positions(conn: sqlite3.Connection, broker=None, dry_run: bool = Fal
                                 else:
                                     log.info(f"  [TRAIL] {t['symbol']}: ATR={atr:.5f}, "
                                              f"unrealized={unrealized:+.5f}, stop=break-even @ {entry:.5f}")
+                                    _try_update_broker_stop(broker, deal_id, effective_stop, t["symbol"], current_broker_stop)
                             else:
                                 # Initial stop: Nx ATR below entry (regime-aware)
                                 effective_stop = entry - atr_multiplier * atr
@@ -463,6 +467,7 @@ def monitor_positions(conn: sqlite3.Connection, broker=None, dry_run: bool = Fal
                                 else:
                                     log.info(f"  [TRAIL] {t['symbol']}: ATR={atr:.5f}, "
                                              f"unrealized={unrealized:+.5f}, initial stop @ {effective_stop:.5f}")
+                                    _try_update_broker_stop(broker, deal_id, effective_stop, t["symbol"], current_broker_stop)
                         else:
                             # Short position: mirror logic
                             unrealized = entry - current
@@ -475,6 +480,7 @@ def monitor_positions(conn: sqlite3.Connection, broker=None, dry_run: bool = Fal
                                 else:
                                     log.info(f"  [TRAIL] {t['symbol']}: ATR={atr:.5f}, "
                                              f"unrealized={unrealized:+.5f}, trailing stop @ {effective_stop:.5f}")
+                                    _try_update_broker_stop(broker, deal_id, effective_stop, t["symbol"], current_broker_stop)
                             elif unrealized >= 1 * atr:
                                 effective_stop = entry
                                 if current >= effective_stop:
@@ -483,6 +489,7 @@ def monitor_positions(conn: sqlite3.Connection, broker=None, dry_run: bool = Fal
                                 else:
                                     log.info(f"  [TRAIL] {t['symbol']}: ATR={atr:.5f}, "
                                              f"unrealized={unrealized:+.5f}, stop=break-even @ {entry:.5f}")
+                                    _try_update_broker_stop(broker, deal_id, effective_stop, t["symbol"], current_broker_stop)
                             else:
                                 effective_stop = entry + atr_multiplier * atr
                                 if current >= effective_stop:
@@ -492,6 +499,7 @@ def monitor_positions(conn: sqlite3.Connection, broker=None, dry_run: bool = Fal
                                 else:
                                     log.info(f"  [TRAIL] {t['symbol']}: ATR={atr:.5f}, "
                                              f"unrealized={unrealized:+.5f}, initial stop @ {effective_stop:.5f}")
+                                    _try_update_broker_stop(broker, deal_id, effective_stop, t["symbol"], current_broker_stop)
                     else:
                         # ATR unavailable — fall back to fixed 80-pip stop
                         pip_mult = 0.01 if "JPY" in t["symbol"] else 0.0001
@@ -699,10 +707,11 @@ def fx_risk_check(conn: sqlite3.Connection, signals: list[dict]) -> list[dict]:
             decisions.append({**signal, "approved": False, "reason": corr_reason})
             continue
 
-        # Strategy-specific stop loss from DB
+        # Strategy-specific stop loss / take profit from DB
         params = get_strategy_params(conn, signal["strategy_id"])
         default = _DEFAULT_TREND_PARAMS if signal["strategy_id"] == TREND_STRATEGY_ID else _DEFAULT_PA_PARAMS
         stop_pips = params.get("stop_loss_pips", default["stop_loss_pips"])
+        tp_pips = params.get("take_profit_pips", default.get("take_profit_pips"))
 
         # Position sizing: risk amount / (stop_pips * pip_value)
         pip_value = 0.10  # approx for micro lot
@@ -722,6 +731,7 @@ def fx_risk_check(conn: sqlite3.Connection, signals: list[dict]) -> list[dict]:
             "micro_lots": volume,
             "risk_amount": round(risk_amount, 2),
             "stop_pips": stop_pips,
+            "take_profit_pips": tp_pips,
             "risk_pct": MAX_RISK_PER_TRADE * 100,
             **({"corr_note": corr_reason} if corr_reason else {}),
         })
@@ -749,8 +759,9 @@ def execute_decisions(conn: sqlite3.Connection, decisions: list[dict], dry_run: 
             continue
 
         if d["action"] == "entry":
+            tp_str = f", tp={d['take_profit_pips']}pips" if d.get("take_profit_pips") else ""
             log.info(f"  ENTRY: {d['symbol']} {d['micro_lots']} micro lots, "
-                     f"risk=${d['risk_amount']} ({d['risk_pct']}%), stop={d['stop_pips']}pips "
+                     f"risk=${d['risk_amount']} ({d['risk_pct']}%), stop={d['stop_pips']}pips{tp_str} "
                      f"[{'TREND' if d['strategy_id'] == TREND_STRATEGY_ID else 'PA'}]")
 
             if not dry_run:
@@ -767,7 +778,7 @@ def execute_decisions(conn: sqlite3.Connection, decisions: list[dict], dry_run: 
                         units=units,
                         side=d["side"],
                         stop_loss_pips=d["stop_pips"],
-                        take_profit_pips=None,
+                        take_profit_pips=d.get("take_profit_pips"),
                     )
                     broker_order_id = result.get("deal_id") or result.get("trade_id")
                     log.info(f"    Broker order: {result}")
