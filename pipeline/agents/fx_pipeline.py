@@ -73,6 +73,29 @@ _USD_BASE_PAIRS = {"USDCAD", "USDCHF", "USDJPY"}
 _USD_QUOTE_PAIRS = {"EURUSD", "GBPUSD", "AUDUSD", "NZDUSD"}
 # Other crosses (EURGBP etc.) use exit_price-based conversion as approximation
 
+# Overnight swap benchmark rates (approximate, mid-2025)
+_BENCHMARK_RATES = {
+    "USD": 0.0425,  # SOFR
+    "EUR": 0.0240,
+    "GBP": 0.0400,
+    "JPY": 0.0025,
+    "CHF": 0.0025,
+    "AUD": 0.0385,
+    "CAD": 0.0275,
+    "NZD": 0.0325,
+}
+_ADMIN_FEE = 0.0001096  # Capital.com daily markup (0.01096% per day)
+
+# Currency conversion fee for non-USD-quote pairs (Capital.com)
+_FX_CONVERSION_FEE = 0.0070  # 0.70% per open/close = 1.40% round-trip
+
+# Typical spreads in pips (used in position sizing)
+TYPICAL_SPREADS_PIPS = {
+    "EURUSD": 0.6, "GBPUSD": 0.9, "USDJPY": 0.8, "USDCHF": 1.2,
+    "AUDUSD": 0.8, "USDCAD": 1.2, "NZDUSD": 1.5, "EURGBP": 1.2,
+    "EURJPY": 1.5, "GBPJPY": 2.0,
+}
+
 
 def _get_usdjpy_rate(broker) -> float:
     """Fetch current USDJPY rate from broker, fallback to hardcoded value."""
@@ -86,6 +109,56 @@ def _get_usdjpy_rate(broker) -> float:
     return _FALLBACK_USDJPY
 
 
+def estimate_swap_cost(
+    symbol: str,
+    side: str,
+    entry_price: float,
+    qty_micro_lots: float,
+    days_held: int,
+    broker=None,
+) -> float:
+    """Estimate overnight swap (financing) cost in USD for holding an FX position.
+
+    Capital.com formula:
+      Long pays:  (base_rate + admin_fee) - (quote_rate - admin_fee) per day = net daily rate
+      Short earns: reversed, but usually still costs due to admin markup
+    Notional value = qty_micro_lots * 1000 * entry_price (in quote currency), converted to USD.
+    Wednesday triples for Sat/Sun — every 7 calendar days adds 2 extra swap days.
+
+    Returns estimated total swap cost (positive = you pay, negative = you earn).
+    """
+    base_ccy = symbol[:3]
+    quote_ccy = symbol[3:]
+    base_rate = _BENCHMARK_RATES.get(base_ccy, 0.03)
+    quote_rate = _BENCHMARK_RATES.get(quote_ccy, 0.03)
+
+    if side == "long":
+        # Long: pay base rate + admin, receive quote rate - admin
+        net_daily_rate = (base_rate + _ADMIN_FEE) - (quote_rate - _ADMIN_FEE)
+    else:
+        # Short: receive base rate - admin, pay quote rate + admin
+        net_daily_rate = (quote_rate + _ADMIN_FEE) - (base_rate - _ADMIN_FEE)
+
+    # Notional in quote currency, then convert to USD
+    notional_quote = qty_micro_lots * 1000 * entry_price
+    if quote_ccy == "USD":
+        notional_usd = notional_quote
+    elif quote_ccy == "JPY":
+        usdjpy = _get_usdjpy_rate(broker)
+        notional_usd = notional_quote / usdjpy
+    else:
+        # Approximate: treat quote currency as ~1:1 to USD (close enough for CHF, CAD, GBP, EUR)
+        notional_usd = notional_quote
+
+    # Swap days: calendar days + 2 extra for each complete week (Wednesday triple covers Sat/Sun)
+    extra_days = (days_held // 7) * 2
+    swap_days = days_held + extra_days
+
+    daily_cost = net_daily_rate * notional_usd / 365
+    total_cost = daily_cost * swap_days
+    return total_cost
+
+
 def calculate_fx_pnl(
     symbol: str,
     side: str,
@@ -93,8 +166,9 @@ def calculate_fx_pnl(
     exit_price: float,
     qty_micro_lots: float,
     broker=None,
+    days_held: int | None = None,
 ) -> float:
-    """Calculate P&L in USD for an FX trade.
+    """Calculate P&L in USD for an FX trade, optionally deducting swap and conversion fees.
 
     Args:
         symbol: Currency pair (e.g. "EURUSD", "GBPJPY")
@@ -103,9 +177,10 @@ def calculate_fx_pnl(
         exit_price: Exit price
         qty_micro_lots: Position size in micro-lots (1 micro-lot = 1000 units)
         broker: Broker instance for fetching USDJPY rate (optional)
+        days_held: If provided, deduct estimated overnight swap cost and FX conversion fee.
 
     Returns:
-        P&L in USD.
+        P&L in USD (net of fees when days_held is provided).
 
     Formula by pair type (qty is in micro-lots, * 1000 converts to units):
       - USD-quote (EURUSD, GBPUSD, etc.):  diff * qty * 1000
@@ -118,12 +193,28 @@ def calculate_fx_pnl(
 
     if symbol in _JPY_CROSS_PAIRS:
         usdjpy = _get_usdjpy_rate(broker)
-        return raw_pnl / usdjpy
+        pnl = raw_pnl / usdjpy
     elif symbol in _USD_BASE_PAIRS:
-        return raw_pnl / exit_price
+        pnl = raw_pnl / exit_price
     else:
         # USD-quote pairs and other crosses (EURGBP etc.)
-        return raw_pnl
+        pnl = raw_pnl
+
+    if days_held is not None:
+        # Fee 1: overnight swap cost
+        swap = estimate_swap_cost(symbol, side, entry_price, qty_micro_lots, days_held, broker)
+        pnl -= swap
+        if swap != 0:
+            log.debug(f"  [FEES] {symbol}: swap cost ${swap:.4f} ({days_held}d held)")
+
+        # Fee 2: currency conversion fee for non-USD-quote pairs (0.70% open + 0.70% close)
+        quote_ccy = symbol[3:]
+        if quote_ccy != "USD":
+            conversion_fee = abs(pnl) * _FX_CONVERSION_FEE * 2
+            pnl -= conversion_fee
+            log.debug(f"  [FEES] {symbol}: conversion fee ${conversion_fee:.4f} (quote={quote_ccy})")
+
+    return pnl
 
 
 def get_current_regime(conn: sqlite3.Connection) -> dict | None:
@@ -364,7 +455,13 @@ def monitor_positions(conn: sqlite3.Connection, broker=None, dry_run: bool = Fal
                 if exit_price and t.get("entry_price"):
                     entry = float(t["entry_price"])
                     qty = float(t.get("quantity", 1))
-                    pnl = calculate_fx_pnl(t["symbol"], t["side"], entry, exit_price, qty, broker)
+                    crisis_days = None
+                    if t.get("opened_at"):
+                        try:
+                            crisis_days = (now - datetime.strptime(t["opened_at"][:19], "%Y-%m-%dT%H:%M:%S")).days
+                        except Exception:
+                            pass
+                    pnl = calculate_fx_pnl(t["symbol"], t["side"], entry, exit_price, qty, broker, days_held=crisis_days)
 
                 if not dry_run:
                     conn.execute(
@@ -420,7 +517,13 @@ def monitor_positions(conn: sqlite3.Connection, broker=None, dry_run: bool = Fal
                 if exit_price and t.get("entry_price"):
                     entry = float(t["entry_price"])
                     qty = float(t.get("quantity", 1))
-                    pnl = calculate_fx_pnl(t["symbol"], t["side"], entry, exit_price, qty, broker)
+                    ranging_days = None
+                    if t.get("opened_at"):
+                        try:
+                            ranging_days = (now - datetime.strptime(t["opened_at"][:19], "%Y-%m-%dT%H:%M:%S")).days
+                        except Exception:
+                            pass
+                    pnl = calculate_fx_pnl(t["symbol"], t["side"], entry, exit_price, qty, broker, days_held=ranging_days)
 
                 if not dry_run:
                     conn.execute(
@@ -449,6 +552,14 @@ def monitor_positions(conn: sqlite3.Connection, broker=None, dry_run: bool = Fal
         should_close = False
         close_reason = ""
 
+        # Compute days_held once for use in P&L fee calculations
+        days_held: int | None = None
+        if t.get("opened_at"):
+            try:
+                days_held = (now - datetime.strptime(t["opened_at"][:19], "%Y-%m-%dT%H:%M:%S")).days
+            except Exception:
+                pass
+
         # Get params for this strategy
         params = pa_params if t["strategy_id"] == PA_STRATEGY_ID else trend_params
         max_hold = params.get("max_hold_days")
@@ -459,10 +570,7 @@ def monitor_positions(conn: sqlite3.Connection, broker=None, dry_run: bool = Fal
         effective_max_hold = max_hold if max_hold else (TREND_SAFETY_MAX_HOLD if is_trend else None)
 
         # Check max hold period
-        if effective_max_hold and t.get("opened_at"):
-            opened = datetime.strptime(t["opened_at"][:19], "%Y-%m-%dT%H:%M:%S")
-            days_held = (now - opened).days
-
+        if effective_max_hold and days_held is not None:
             if days_held >= effective_max_hold:
                 should_close = True
                 label = "Safety max hold" if not max_hold else "Max hold"
@@ -636,12 +744,13 @@ def monitor_positions(conn: sqlite3.Connection, broker=None, dry_run: bool = Fal
                     except Exception:
                         pass
 
-                # Calculate P&L
+                # Calculate P&L (include fees if we know how long we held)
                 pnl = None
                 if exit_price and t.get("entry_price"):
                     entry = float(t["entry_price"])
                     qty = float(t.get("quantity", 1))
-                    pnl = calculate_fx_pnl(t["symbol"], t["side"], entry, exit_price, qty, broker)
+                    pnl = calculate_fx_pnl(t["symbol"], t["side"], entry, exit_price, qty, broker,
+                                           days_held=days_held)
 
                 conn.execute(
                     """UPDATE paper_trades
@@ -823,10 +932,13 @@ def fx_risk_check(conn: sqlite3.Connection, signals: list[dict]) -> list[dict]:
         stop_pips = params.get("stop_loss_pips", default["stop_loss_pips"])
         tp_pips = params.get("take_profit_pips", default.get("take_profit_pips"))
 
-        # Position sizing: risk amount / (stop_pips * pip_value)
+        # Position sizing: risk amount / (effective_stop_pips * pip_value)
+        # Spread immediately puts us at a loss, so effective stop distance is narrower
         pip_value = 0.10  # approx for micro lot
         risk_amount = ACCOUNT_BALANCE * MAX_RISK_PER_TRADE
-        micro_lots = risk_amount / (stop_pips * pip_value)
+        spread_pips = TYPICAL_SPREADS_PIPS.get(symbol, 1.0)
+        effective_stop_pips = max(stop_pips - spread_pips, 1.0)  # floor at 1 pip
+        micro_lots = risk_amount / (effective_stop_pips * pip_value)
         volume = max(int(micro_lots), 1)
 
         # Apply correlation size reduction
@@ -927,20 +1039,28 @@ def execute_decisions(conn: sqlite3.Connection, decisions: list[dict], dry_run: 
             if not dry_run:
                 # Get broker order ID before closing
                 trade_row = conn.execute(
-                    "SELECT id, broker_order_id, entry_price, quantity, side FROM paper_trades WHERE symbol = ? AND status = 'open' LIMIT 1",
+                    "SELECT id, broker_order_id, entry_price, quantity, side, opened_at FROM paper_trades WHERE symbol = ? AND status = 'open' LIMIT 1",
                     (d["symbol"],),
                 ).fetchone()
 
                 if trade_row:
                     trade = dict(trade_row)
 
-                    # Calculate P&L
+                    # Calculate P&L (include fees based on how long we held)
                     pnl = None
                     exit_price = d.get("price_at_signal")
                     if exit_price and trade.get("entry_price"):
                         entry = float(trade["entry_price"])
                         qty = float(trade.get("quantity", 1))
-                        pnl = calculate_fx_pnl(d["symbol"], trade["side"], entry, float(exit_price), qty, broker)
+                        exit_days = None
+                        if trade.get("opened_at"):
+                            try:
+                                exit_days = (datetime.now() - datetime.strptime(
+                                    trade["opened_at"][:19], "%Y-%m-%dT%H:%M:%S")).days
+                            except Exception:
+                                pass
+                        pnl = calculate_fx_pnl(d["symbol"], trade["side"], entry, float(exit_price), qty, broker,
+                                               days_held=exit_days)
 
                     conn.execute(
                         """UPDATE paper_trades
