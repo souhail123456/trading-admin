@@ -88,7 +88,7 @@ def detect_pin_bar(df: pd.DataFrame, wick_ratio: float = 2.0) -> pd.DataFrame:
     hammer = (
         valid &
         (lw >= wick_ratio * ba) &           # long lower wick
-        (uw < ba * 0.5) &                   # small upper wick
+        (uw < ba * 1.0) &                   # small upper wick (< body size)
         (ba > 0)                            # has a real body
     ).astype(int)
 
@@ -127,11 +127,11 @@ def detect_doji(df: pd.DataFrame, threshold: float = 0.1) -> pd.DataFrame:
 
 def detect_swing_points(df: pd.DataFrame, lookback: int = 5) -> pd.DataFrame:
     """
-    Swing high: high is highest in ±lookback window.
-    Swing low: low is lowest in ±lookback window.
+    Swing high: high is highest in prior lookback+1 bars (no lookahead).
+    Swing low: low is lowest in prior lookback+1 bars (no lookahead).
     """
-    rolling_high = df["high"].rolling(2 * lookback + 1, center=True).max()
-    rolling_low = df["low"].rolling(2 * lookback + 1, center=True).min()
+    rolling_high = df["high"].rolling(lookback + 1, center=False).max()
+    rolling_low = df["low"].rolling(lookback + 1, center=False).min()
 
     swing_high = (df["high"] == rolling_high).astype(int)
     swing_low = (df["low"] == rolling_low).astype(int)
@@ -219,7 +219,7 @@ def weekly_trend(df: pd.DataFrame, sma_period: int = 20) -> pd.Series:
 # Combined signal scorer
 # ---------------------------------------------------------------------------
 
-def detect_all_patterns(df: pd.DataFrame) -> pd.DataFrame:
+def detect_all_patterns(df: pd.DataFrame, min_score: int = 2) -> pd.DataFrame:
     """
     Run all pattern detectors on a single ticker's OHLCV DataFrame.
     Returns a DataFrame with all pattern columns + a composite score.
@@ -227,8 +227,9 @@ def detect_all_patterns(df: pd.DataFrame) -> pd.DataFrame:
     Score logic:
       Bullish: +1 per bullish pattern (engulfing, hammer, bullish BoS)
                +1 if weekly uptrend
+               +1 if doji after bearish candle (reversal indecision)
                -1 per bearish pattern
-      Entry signal when score >= 2 (multiple confirmations)
+      Entry signal when score >= min_score (multiple confirmations)
     """
     eng = detect_engulfing(df)
     pin = detect_pin_bar(df)
@@ -239,6 +240,12 @@ def detect_all_patterns(df: pd.DataFrame) -> pd.DataFrame:
     patterns = pd.concat([eng, pin, doj, struct], axis=1)
     patterns["weekly_trend"] = wt
 
+    # Doji reversal context: doji after a bearish candle = bullish indecision
+    prev_bearish = (_body(df).shift(1) < 0).astype(int)
+    prev_bullish = (_body(df).shift(1) > 0).astype(int)
+    doji_bull = (patterns["doji"] & prev_bearish).astype(int)
+    doji_bear = (patterns["doji"] & prev_bullish).astype(int)
+
     # Composite bullish score
     patterns["bull_score"] = (
         patterns["bullish_engulfing"]
@@ -246,6 +253,7 @@ def detect_all_patterns(df: pd.DataFrame) -> pd.DataFrame:
         + patterns["bullish_bos"]
         + patterns["higher_low"]
         + (patterns["weekly_trend"] == 1).astype(int)
+        + doji_bull
     )
 
     # Composite bearish score
@@ -255,14 +263,15 @@ def detect_all_patterns(df: pd.DataFrame) -> pd.DataFrame:
         + patterns["bearish_bos"]
         + patterns["lower_high"]
         + (patterns["weekly_trend"] == -1).astype(int)
+        + doji_bear
     )
 
     # Net score: positive = bullish, negative = bearish
     patterns["net_score"] = patterns["bull_score"] - patterns["bear_score"]
 
-    # Entry signal: need >= 2 bullish confirmations and no strong bearish
-    patterns["bull_signal"] = ((patterns["bull_score"] >= 2) & (patterns["bear_score"] == 0)).astype(int)
-    patterns["bear_signal"] = ((patterns["bear_score"] >= 2) & (patterns["bull_score"] == 0)).astype(int)
+    # Entry signal: need >= min_score bullish confirmations and allow up to 1 opposing signal
+    patterns["bull_signal"] = ((patterns["bull_score"] >= min_score) & (patterns["bear_score"] <= 1)).astype(int)
+    patterns["bear_signal"] = ((patterns["bear_score"] >= min_score) & (patterns["bull_score"] <= 1)).astype(int)
 
     return patterns
 

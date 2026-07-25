@@ -105,16 +105,32 @@ def check_correlation(positions: list[dict]) -> list[dict]:
     return alerts
 
 
-def check_global_drawdown(conn: sqlite3.Connection) -> dict:
-    """Check total realized P&L drawdown across all FX trades."""
+def check_global_drawdown(conn: sqlite3.Connection, broker=None) -> dict:
+    """Check total P&L drawdown (realized + unrealized) across all FX trades.
+
+    If broker is provided, fetches live positions and adds unrealized P&L to
+    the equity curve so a large open loss can trigger the kill switch before
+    it closes.
+    """
     closed = conn.execute(
         "SELECT pnl, closed_at FROM paper_trades WHERE status = 'closed' AND strategy_id IN (100, 101) ORDER BY closed_at"
     ).fetchall()
 
     if not closed:
-        return {"peak_pnl": 0, "current_pnl": 0, "drawdown": 0, "drawdown_pct": 0, "alert": None}
+        return {"peak_pnl": 0, "current_pnl": 0, "drawdown": 0, "drawdown_pct": 0, "unrealized_pnl": 0, "alert": None}
 
     pnls = [dict(r).get("pnl", 0) or 0 for r in closed]
+
+    # Add unrealized P&L from live broker positions
+    unrealized_pnl = 0.0
+    if broker is not None:
+        try:
+            positions = broker.get_positions()
+            unrealized_pnl = sum(float(p.get("unrealized_pnl", 0)) for p in positions)
+            log.info(f"Unrealized P&L from broker: ${unrealized_pnl:+.2f} across {len(positions)} position(s)")
+        except Exception as e:
+            log.warning(f"Could not fetch broker positions for drawdown check: {e}")
+
     cumulative = 0
     peak = 0
     max_dd = 0
@@ -127,6 +143,14 @@ def check_global_drawdown(conn: sqlite3.Connection) -> dict:
         if dd < max_dd:
             max_dd = dd
 
+    # Factor in unrealized P&L as a forward-looking equity point
+    current_equity = cumulative + unrealized_pnl
+    if current_equity > peak:
+        peak = current_equity
+    dd_with_unrealized = current_equity - peak
+    if dd_with_unrealized < max_dd:
+        max_dd = dd_with_unrealized
+
     dd_pct = (max_dd / peak * 100) if peak > 0 else 0
 
     alert = None
@@ -134,20 +158,32 @@ def check_global_drawdown(conn: sqlite3.Connection) -> dict:
         alert = {
             "type": "global_drawdown",
             "severity": "CRITICAL",
-            "message": f"Global drawdown {dd_pct:.1f}% breaches {GLOBAL_DD_LIMIT_PCT}% limit — KILL SWITCH",
+            "message": (
+                f"Global drawdown {dd_pct:.1f}% breaches {GLOBAL_DD_LIMIT_PCT}% limit — KILL SWITCH"
+                + (f" (includes ${unrealized_pnl:+.2f} unrealized)" if unrealized_pnl != 0 else "")
+            ),
         }
 
     return {
         "peak_pnl": round(peak, 2),
-        "current_pnl": round(cumulative, 2),
+        "current_pnl": round(current_equity, 2),
+        "realized_pnl": round(cumulative, 2),
+        "unrealized_pnl": round(unrealized_pnl, 2),
         "drawdown": round(max_dd, 2),
         "drawdown_pct": round(dd_pct, 1),
         "alert": alert,
     }
 
 
-def run_risk_check(db_path: str | None = None) -> dict:
-    """Run full cross-bot risk check."""
+def run_risk_check(db_path: str | None = None, broker=None) -> dict:
+    """Run full cross-bot risk check.
+
+    Args:
+        db_path: Optional path to SQLite database.
+        broker: Optional broker instance (e.g. CapitalBroker). When provided,
+                live unrealized P&L is included in the drawdown calculation so
+                a large open loss triggers the kill switch before the trade closes.
+    """
     conn = init_db(db_path)
 
     print(f"\n{'='*60}")
@@ -172,9 +208,10 @@ def run_risk_check(db_path: str | None = None) -> dict:
     corr_alerts = check_correlation(fx_exposure["positions"])
     all_alerts.extend(corr_alerts)
 
-    # Global drawdown
-    dd = check_global_drawdown(conn)
-    print(f"\n  Drawdown: ${dd['drawdown']:+.2f} ({dd['drawdown_pct']}% from peak ${dd['peak_pnl']})")
+    # Global drawdown (realized + unrealized if broker available)
+    dd = check_global_drawdown(conn, broker=broker)
+    unrealized_str = f" | Unrealized: ${dd.get('unrealized_pnl', 0):+.2f}" if dd.get('unrealized_pnl') else ""
+    print(f"\n  Drawdown: ${dd['drawdown']:+.2f} ({dd['drawdown_pct']}% from peak ${dd['peak_pnl']}){unrealized_str}")
     if dd["alert"]:
         all_alerts.append(dd["alert"])
 

@@ -20,10 +20,12 @@ Usage:
 import argparse
 import json
 import logging
+import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
+import requests
 
 from pipeline.db import init_db, log_agent_action
 
@@ -44,6 +46,31 @@ BACKTEST_BENCHMARKS = {
     100: {"name": "FX Trend-Following", "oos_sharpe": 2.51, "oos_win_rate": 77, "oos_max_dd": -3.1},
     101: {"name": "FX Price Action", "oos_sharpe": 1.02, "oos_win_rate": 66, "oos_max_dd": -5.0},
 }
+
+
+def _send_telegram(message: str):
+    """Send a Telegram alert message."""
+    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    if not bot_token or not chat_id:
+        log.warning("Telegram credentials not set — skipping alert")
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{bot_token}/sendMessage",
+            json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"},
+            timeout=10,
+        ).raise_for_status()
+    except Exception as e:
+        log.warning(f"Telegram alert failed: {e}")
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{bot_token}/sendMessage",
+                json={"chat_id": chat_id, "text": message.replace("<b>", "").replace("</b>", "")},
+                timeout=10,
+            ).raise_for_status()
+        except Exception as e2:
+            log.warning(f"Telegram retry also failed: {e2}")
 
 
 def compute_rolling_sharpe(returns: list[float], window: int = 30) -> float | None:
@@ -229,6 +256,15 @@ def run_monitor(strategy_id: int | None = None, db_path: str | None = None) -> l
     total_alerts = sum(len(r["alerts"]) for r in results)
     critical = sum(1 for r in results for a in r["alerts"] if a["severity"] == "CRITICAL")
     print(f"\n  Summary: {total_alerts} alert(s), {critical} critical")
+
+    # Send Telegram alert if there are any alerts
+    all_alerts = [(r, a) for r in results for a in r["alerts"]]
+    if all_alerts:
+        lines = [f"<b>Performance Monitor — {datetime.now().strftime('%Y-%m-%d %H:%M')} UTC</b>"]
+        for r, a in all_alerts:
+            lines.append(f"[{a['severity']}] {r['name']}: {a['message']}")
+        lines.append(f"\n{total_alerts} alert(s), {critical} critical")
+        _send_telegram("\n".join(lines))
 
     return results
 

@@ -59,16 +59,37 @@ def _clean_symbol(ticker: str) -> str:
 # FX Trend-following signals
 # ---------------------------------------------------------------------------
 
-def fx_trend_signals(data: dict[str, pd.DataFrame], params: dict | None = None) -> list[dict]:
+def fx_trend_signals(
+    data: dict[str, pd.DataFrame],
+    params: dict | None = None,
+    open_positions: list[dict] | None = None,
+) -> list[dict]:
     """
-    Scan FX pairs: which are above SMA? Rank by trend strength.
+    Scan FX pairs for trend-following signals (both long and short).
+
+    Entry logic:
+      - Price ABOVE SMA-200 and pair NOT held → long entry candidate (ranked by composite score)
+      - Price BELOW SMA-200 and pair NOT held → short entry candidate (ranked by abs composite score)
+
+    Exit logic (position-aware — only fires for pairs we actually hold):
+      - Holding LONG and price dropped BELOW SMA-200 → exit long signal
+      - Holding SHORT and price rose ABOVE SMA-200 → exit short signal
+
     Parameters read from DB strategy params.
+    open_positions: list of dicts with at least {"symbol": str, "side": "long"|"short"}
     """
     params = params or {}
     sma_period = params.get("sma_period", 200)
     top_n = params.get("top_n", 3)
     signals = []
-    candidates = []
+
+    # Build lookup of currently held positions: symbol -> side
+    held: dict[str, str] = {}
+    for pos in (open_positions or []):
+        held[pos["symbol"]] = pos.get("side", "long")
+
+    long_candidates = []   # pairs above SMA not currently held
+    short_candidates = []  # pairs below SMA not currently held
 
     for ticker, df in data.items():
         if len(df) < sma_period + 10:
@@ -83,7 +104,11 @@ def fx_trend_signals(data: dict[str, pd.DataFrame], params: dict | None = None) 
         pair = _clean_symbol(ticker)
         carry = calculate_carry(pair)
         carry_normalized = carry / 10.0
-        composite = float(strength) * 0.7 + carry_normalized * 0.3
+
+        # Long composite: positive strength (above SMA) + carry
+        long_composite = float(strength) * 0.7 + carry_normalized * 0.3
+        # Short composite: abs(strength) (below SMA) minus carry (pay carry when short base)
+        short_composite = abs(float(strength)) * 0.7 - carry_normalized * 0.3
 
         state = {
             "close": round(float(latest["close"]), 5),
@@ -92,36 +117,77 @@ def fx_trend_signals(data: dict[str, pd.DataFrame], params: dict | None = None) 
             "trend_strength": round(float(strength), 4),
             "carry_pct": round(carry, 2),
             "carry_normalized": round(carry_normalized, 4),
-            "composite_score": round(composite, 4),
+            "composite_score": round(long_composite, 4),
             "date": str(df.index[-1].date()),
             "pair": pair,
         }
 
-        if above:
-            candidates.append((ticker, composite, state))
-        else:
-            # Exit signal: price is below SMA-200
-            # Fire on any day below (not just crossunder day) to avoid missing exits
-            signals.append({
-                "strategy": "fx_trend",
-                "strategy_id": FX_TREND_STRATEGY_ID,
-                "symbol": _clean_symbol(ticker),
-                "side": "long",
-                "signal_type": "exit",
-                "price_at_signal": round(float(latest["close"]), 5),
-                "full_state": {**state, "reason": "below_sma"},
-            })
+        current_side = held.get(pair)
 
-    # Top N by composite score (trend strength * 0.7 + carry * 0.3)
-    candidates.sort(key=lambda x: x[1], reverse=True)
-    for ticker, composite, state in candidates[:top_n]:
-        log.info(f"  CARRY: {state['pair']} carry={state['carry_pct']:+.2f}% "
+        if above:
+            # --- Price is ABOVE SMA-200 ---
+            if current_side == "short":
+                # Holding a short and price rose back above SMA → exit short
+                log.info(f"  EXIT SHORT: {pair} — price {state['close']} rose above SMA {state['sma_200']}")
+                signals.append({
+                    "strategy": "fx_trend",
+                    "strategy_id": FX_TREND_STRATEGY_ID,
+                    "symbol": pair,
+                    "side": "short",
+                    "signal_type": "exit",
+                    "price_at_signal": state["close"],
+                    "full_state": {**state, "reason": "above_sma_short_exit"},
+                })
+            elif current_side is None:
+                # Not holding this pair → long entry candidate
+                long_candidates.append((ticker, long_composite, state))
+            # If already holding long: stay in trade, no signal
+
+        else:
+            # --- Price is BELOW SMA-200 ---
+            if current_side == "long":
+                # Holding a long and price dropped below SMA → exit long
+                log.info(f"  EXIT LONG: {pair} — price {state['close']} dropped below SMA {state['sma_200']}")
+                signals.append({
+                    "strategy": "fx_trend",
+                    "strategy_id": FX_TREND_STRATEGY_ID,
+                    "symbol": pair,
+                    "side": "long",
+                    "signal_type": "exit",
+                    "price_at_signal": state["close"],
+                    "full_state": {**state, "reason": "below_sma_long_exit"},
+                })
+            elif current_side is None:
+                # Not holding this pair → short entry candidate
+                short_state = {**state, "composite_score": round(short_composite, 4)}
+                short_candidates.append((ticker, short_composite, short_state))
+            # If already holding short: stay in trade, no signal
+
+    # Top N long entries by composite score (trend_strength * 0.7 + carry * 0.3)
+    long_candidates.sort(key=lambda x: x[1], reverse=True)
+    for ticker, composite, state in long_candidates[:top_n]:
+        log.info(f"  LONG ENTRY: {state['pair']} carry={state['carry_pct']:+.2f}% "
                  f"trend={state['trend_strength']:.4f} composite={state['composite_score']:.4f}")
         signals.append({
             "strategy": "fx_trend",
             "strategy_id": FX_TREND_STRATEGY_ID,
             "symbol": _clean_symbol(ticker),
             "side": "long",
+            "signal_type": "entry",
+            "price_at_signal": state["close"],
+            "full_state": state,
+        })
+
+    # Top N short entries by short composite score (abs(strength) * 0.7 - carry * 0.3)
+    short_candidates.sort(key=lambda x: x[1], reverse=True)
+    for ticker, composite, state in short_candidates[:top_n]:
+        log.info(f"  SHORT ENTRY: {state['pair']} carry={state['carry_pct']:+.2f}% "
+                 f"trend={state['trend_strength']:.4f} short_composite={state['composite_score']:.4f}")
+        signals.append({
+            "strategy": "fx_trend",
+            "strategy_id": FX_TREND_STRATEGY_ID,
+            "symbol": _clean_symbol(ticker),
+            "side": "short",
             "signal_type": "entry",
             "price_at_signal": state["close"],
             "full_state": state,
@@ -145,7 +211,7 @@ def fx_pa_signals(data: dict[str, pd.DataFrame], params: dict | None = None) -> 
         if len(df) < 200:
             continue
 
-        patterns = detect_all_patterns(df)
+        patterns = detect_all_patterns(df, min_score=min_score)
         if patterns.empty:
             continue
 
@@ -225,8 +291,17 @@ def generate_fx_signals(dry_run: bool = False, db_path: str | None = None) -> li
     log.info(f"Trend params: {trend_params}")
     log.info(f"PA params: {pa_params}")
 
+    # Load open trend positions so exit/entry logic is position-aware
+    open_trend_rows = conn.execute(
+        "SELECT symbol, side FROM paper_trades WHERE status = 'open' AND strategy_id = ?",
+        (FX_TREND_STRATEGY_ID,),
+    ).fetchall()
+    open_trend_positions = [dict(r) for r in open_trend_rows]
+    open_pos_desc = [p["symbol"] + " " + p["side"] for p in open_trend_positions]
+    log.info(f"Open trend positions: {open_pos_desc}")
+
     log.info("\n--- FX Trend Signals ---")
-    t_sigs = fx_trend_signals(data, params=trend_params)
+    t_sigs = fx_trend_signals(data, params=trend_params, open_positions=open_trend_positions)
     all_signals.extend(t_sigs)
     for s in t_sigs:
         log.info(f"  [{s['signal_type'].upper()}] {s['symbol']} @ {s['price_at_signal']} "
@@ -262,7 +337,7 @@ def generate_fx_signals(dry_run: bool = False, db_path: str | None = None) -> li
         print(f"\nENTRY SIGNALS ({len(entries)}):")
         for s in entries:
             tag = "TREND" if "trend" in s["strategy"] else "PA"
-            print(f"  [{tag}] {s['symbol']:>8} LONG @ {s['price_at_signal']}")
+            print(f"  [{tag}] {s['symbol']:>8} {s['side'].upper()} @ {s['price_at_signal']}")
 
     if exits:
         print(f"\nEXIT SIGNALS ({len(exits)}):")

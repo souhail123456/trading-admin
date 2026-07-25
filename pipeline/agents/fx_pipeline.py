@@ -59,6 +59,11 @@ RANGING_MIN_COMPOSITE_SCORE = 0.05  # composite is ~0.03-0.15 scale (strength*0.
 # ATR cache (session-level, avoids repeated yfinance calls)
 _atr_cache: dict[str, float | None] = {}
 
+# Scale-out tracker: set of paper_trade IDs that have already been partially closed
+# Persists across monitor calls within the same process run.
+# A "[SCALED]" marker is also written to the thesis field for cross-run persistence.
+_scaled_out_ids: set[int] = set()
+
 # Fallback USDJPY rate when broker is unavailable (updated periodically)
 _FALLBACK_USDJPY = 148.0
 
@@ -251,6 +256,58 @@ def _try_update_broker_stop(broker, deal_id: str, new_stop: float, symbol: str, 
     return False
 
 
+def _ensure_broker_tp(broker, open_trades: list, conn: sqlite3.Connection):
+    """Set take-profit on broker for any open position that is missing one.
+
+    Reads tp_pips from DB strategy params and computes limit level from entry price.
+    Only fires the API call when the broker position has no limitLevel set.
+    """
+    if not broker:
+        return
+
+    # Pre-fetch broker positions to check existing TP levels
+    try:
+        broker_positions = {bp["deal_id"]: bp for bp in broker.get_positions()}
+    except Exception:
+        return
+
+    trend_params = get_strategy_params(conn, TREND_STRATEGY_ID) or _DEFAULT_TREND_PARAMS
+    pa_params = get_strategy_params(conn, PA_STRATEGY_ID) or _DEFAULT_PA_PARAMS
+
+    for row in open_trades:
+        t = dict(row)
+        deal_id = t.get("broker_order_id")
+        if not deal_id or deal_id not in broker_positions:
+            continue
+
+        bp = broker_positions[deal_id]
+        if bp.get("profit_level") is not None:
+            continue  # already has TP set
+
+        params = trend_params if t["strategy_id"] == TREND_STRATEGY_ID else pa_params
+        tp_pips = params.get("take_profit_pips")
+        if not tp_pips:
+            continue
+
+        entry = float(t["entry_price"])
+        is_jpy = "JPY" in t["symbol"]
+        pip_size = 0.01 if is_jpy else 0.0001
+        side = t.get("side", "long")
+
+        if side == "long":
+            limit_level = entry + tp_pips * pip_size
+        else:
+            limit_level = entry - tp_pips * pip_size
+
+        try:
+            from pipeline.agents.broker_capital import CapitalBroker
+            if isinstance(broker, CapitalBroker):
+                broker.update_tp(deal_id, limit_level)
+                log.info(f"  [TP] {t['symbol']}: set broker TP to {limit_level:.5f} ({tp_pips} pips from entry {entry})")
+        except Exception as e:
+            log.warning(f"  [TP] {t['symbol']}: failed to set broker TP: {e}")
+
+
 def monitor_positions(conn: sqlite3.Connection, broker=None, dry_run: bool = False) -> list[dict]:
     """
     Check open positions for exits that should trigger.
@@ -278,6 +335,10 @@ def monitor_positions(conn: sqlite3.Connection, broker=None, dry_run: bool = Fal
     open_trades = conn.execute(
         "SELECT * FROM paper_trades WHERE status = 'open' AND strategy_id IN (100, 101)"
     ).fetchall()
+
+    # Ensure all open positions have TP set on broker
+    if not dry_run:
+        _ensure_broker_tp(broker, open_trades, conn)
 
     # --- Regime-aware position management ---
     regime_data = get_current_regime(conn)
@@ -434,6 +495,12 @@ def monitor_positions(conn: sqlite3.Connection, broker=None, dry_run: bool = Fal
                     if atr and atr > 0:
                         deal_id = t.get("broker_order_id")
                         current_broker_stop = broker_stop_levels.get(deal_id)
+                        trade_id = t["id"]
+                        # Check if this position has already been scaled out (50% partial close at 1R)
+                        already_scaled = (
+                            trade_id in _scaled_out_ids
+                            or "[SCALED]" in (t.get("thesis") or "")
+                        )
                         if side == "long":
                             unrealized = current - entry
                             if unrealized >= atr_multiplier * atr:
@@ -448,7 +515,28 @@ def monitor_positions(conn: sqlite3.Connection, broker=None, dry_run: bool = Fal
                                              f"unrealized={unrealized:+.5f}, trailing stop @ {effective_stop:.5f}")
                                     _try_update_broker_stop(broker, deal_id, effective_stop, t["symbol"], current_broker_stop)
                             elif unrealized >= 1 * atr:
-                                # Break-even lock
+                                # Scale-out at 1R: close 50%, move stop to break-even
+                                if not already_scaled and not dry_run and deal_id:
+                                    try:
+                                        qty = float(t.get("quantity") or 1)
+                                        close_units = int(qty * 1000 * 0.5)  # 50% in units
+                                        from pipeline.agents.broker_capital import CapitalBroker
+                                        if isinstance(broker, CapitalBroker) and close_units >= 1000:
+                                            broker.partial_close(deal_id, close_units)
+                                            new_qty = round(qty * 0.5, 4)
+                                            conn.execute(
+                                                "UPDATE paper_trades SET quantity = ?, thesis = thesis || ' [SCALED]' WHERE id = ?",
+                                                (new_qty, trade_id),
+                                            )
+                                            conn.commit()
+                                            _scaled_out_ids.add(trade_id)
+                                            log.info(f"  [SCALE] {t['symbol']}: scaled out 50% at 1R "
+                                                     f"(units_closed={close_units}, new_qty={new_qty})")
+                                    except Exception as e:
+                                        log.warning(f"  [SCALE] {t['symbol']}: partial close failed: {e}")
+                                elif not already_scaled:
+                                    log.info(f"  [SCALE] {t['symbol']}: 1R reached — would scale out 50% (dry-run or no deal_id)")
+                                # Move stop to break-even regardless of whether partial close fired
                                 effective_stop = entry
                                 if current <= effective_stop:
                                     should_close = True
@@ -482,6 +570,28 @@ def monitor_positions(conn: sqlite3.Connection, broker=None, dry_run: bool = Fal
                                              f"unrealized={unrealized:+.5f}, trailing stop @ {effective_stop:.5f}")
                                     _try_update_broker_stop(broker, deal_id, effective_stop, t["symbol"], current_broker_stop)
                             elif unrealized >= 1 * atr:
+                                # Scale-out at 1R: close 50%, move stop to break-even
+                                if not already_scaled and not dry_run and deal_id:
+                                    try:
+                                        qty = float(t.get("quantity") or 1)
+                                        close_units = int(qty * 1000 * 0.5)  # 50% in units
+                                        from pipeline.agents.broker_capital import CapitalBroker
+                                        if isinstance(broker, CapitalBroker) and close_units >= 1000:
+                                            broker.partial_close(deal_id, close_units)
+                                            new_qty = round(qty * 0.5, 4)
+                                            conn.execute(
+                                                "UPDATE paper_trades SET quantity = ?, thesis = thesis || ' [SCALED]' WHERE id = ?",
+                                                (new_qty, trade_id),
+                                            )
+                                            conn.commit()
+                                            _scaled_out_ids.add(trade_id)
+                                            log.info(f"  [SCALE] {t['symbol']}: scaled out 50% at 1R "
+                                                     f"(units_closed={close_units}, new_qty={new_qty})")
+                                    except Exception as e:
+                                        log.warning(f"  [SCALE] {t['symbol']}: partial close failed: {e}")
+                                elif not already_scaled:
+                                    log.info(f"  [SCALE] {t['symbol']}: 1R reached — would scale out 50% (dry-run or no deal_id)")
+                                # Move stop to break-even regardless
                                 effective_stop = entry
                                 if current >= effective_stop:
                                     should_close = True

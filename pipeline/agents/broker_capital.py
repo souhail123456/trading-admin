@@ -112,11 +112,30 @@ class CapitalBroker:
 
     def _request(self, method: str, path: str, **kwargs) -> dict:
         url = f"{self.base_url}{path}"
-        resp = requests.request(method, url, headers=self._headers(), timeout=60, **kwargs)
-        if resp.status_code >= 400:
-            log.error(f"Capital.com API error {resp.status_code}: {resp.text[:300]}")
-        resp.raise_for_status()
-        return resp.json() if resp.text else {}
+        max_retries = 3
+        last_exc: Exception | None = None
+        for attempt in range(max_retries + 1):
+            try:
+                resp = requests.request(method, url, headers=self._headers(), timeout=60, **kwargs)
+                if resp.status_code >= 400:
+                    log.error(f"Capital.com API error {resp.status_code}: {resp.text[:300]}")
+                # Retry on rate-limit (429) or transient server errors (5xx)
+                if attempt < max_retries and (resp.status_code == 429 or 500 <= resp.status_code < 600):
+                    wait = 2 ** attempt  # 1s, 2s, 4s
+                    log.warning(f"Capital.com {resp.status_code} — retry {attempt + 1}/{max_retries} in {wait}s")
+                    time.sleep(wait)
+                    continue
+                resp.raise_for_status()
+                return resp.json() if resp.text else {}
+            except requests.exceptions.RequestException as e:
+                last_exc = e
+                if attempt < max_retries:
+                    wait = 2 ** attempt  # 1s, 2s, 4s
+                    log.warning(f"Capital.com request error ({e}) — retry {attempt + 1}/{max_retries} in {wait}s")
+                    time.sleep(wait)
+                else:
+                    raise
+        raise last_exc  # unreachable, satisfies type checker
 
     def _epic(self, symbol: str) -> str:
         """Normalize symbol to Capital.com epic."""
@@ -219,6 +238,27 @@ class CapitalBroker:
         log.info(f"Closed deal: {deal_id}")
         return data
 
+    def partial_close(self, deal_id: str, size: float) -> dict:
+        """Partially close a position by deal ID.
+
+        Args:
+            deal_id: The deal ID of the open position to partially close.
+            size: Number of units to close (not units to keep).
+                  E.g. if position is 2000 units and you pass size=1000,
+                  1000 units are closed, leaving 1000 open.
+
+        Capital.com supports partial close via DELETE /positions/{dealId}
+        with a body containing the size to close.
+        """
+        size = max(int(size), 1000)  # minimum 1000 units
+        data = self._request(
+            "DELETE",
+            f"/api/v1/positions/{deal_id}",
+            json={"size": size},
+        )
+        log.info(f"Partial close: deal={deal_id}, units_closed={size}")
+        return data
+
     def update_stop(self, deal_id: str, stop_level: float) -> dict:
         """Amend a position's stop-loss level at the broker.
 
@@ -236,6 +276,23 @@ class CapitalBroker:
                 return confirm
             except Exception as e:
                 log.warning(f"Could not confirm stop update for {deal_id}: {e}")
+        return data
+
+    def update_tp(self, deal_id: str, limit_level: float) -> dict:
+        """Amend a position's take-profit (limit) level at the broker.
+
+        Uses Capital.com PUT /positions/{dealId} endpoint.
+        """
+        body = {"limitLevel": round(limit_level, 5)}
+        log.info(f"Updating TP for {deal_id}: limitLevel={limit_level:.5f}")
+        data = self._request("PUT", f"/api/v1/positions/{deal_id}", json=body)
+        if "dealReference" in data:
+            try:
+                confirm = self._request("GET", f"/api/v1/confirms/{data['dealReference']}")
+                log.info(f"TP update confirmed: {confirm.get('dealStatus', 'UNKNOWN')}")
+                return confirm
+            except Exception as e:
+                log.warning(f"Could not confirm TP update for {deal_id}: {e}")
         return data
 
     def close_all(self) -> list:

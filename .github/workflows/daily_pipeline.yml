@@ -4,6 +4,10 @@ on:
   schedule:
     # Run Mon-Fri at 07:00 UTC (London open, tighter spreads) — 3:00 PM Shanghai
     - cron: "0 7 * * 1-5"
+    # Run Mon-Fri at 13:00 UTC (NY open / London-NY overlap — highest liquidity)
+    - cron: "0 13 * * 1-5"
+    # Run Mon-Fri at 22:00 UTC (Asia open — covers Tokyo/Sydney session)
+    - cron: "0 22 * * 1-5"
   workflow_dispatch: # Allow manual trigger
 
 jobs:

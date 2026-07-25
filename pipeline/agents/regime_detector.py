@@ -133,58 +133,102 @@ def get_fx_adx() -> dict[str, float]:
     return results
 
 
+def _classify_pair_regime(adx: float) -> str:
+    """Classify a single pair's regime based on its ADX value."""
+    if adx >= ADX_TRENDING:
+        return "TRENDING"
+    elif adx <= ADX_RANGING:
+        return "RANGING"
+    else:
+        return "NEUTRAL"
+
+
 def classify_regime(vix: float | None, fx_adx: dict[str, float]) -> dict:
-    """Classify market regime based on VIX and ADX."""
+    """Classify market regime based on VIX and per-pair ADX.
+
+    Global regime (CRISIS/VOLATILE) is driven by VIX and overrides everything.
+    Per-pair regime is derived independently from each pair's ADX — a pair with
+    ADX > 25 is TRENDING regardless of what other pairs are doing, and a pair
+    with ADX < 20 is RANGING regardless.
+    """
     # Default to 22 (neutral zone between RANGING=20 and TRENDING=25) when no data
     avg_adx = np.mean(list(fx_adx.values())) if fx_adx else 22
 
-    # Determine regime
+    # --- Global regime (VIX-driven crisis/volatility) ---
     if vix is not None and vix >= VIX_CRISIS:
-        regime = "CRISIS"
+        global_regime = "CRISIS"
         description = f"VIX {vix:.1f} — extreme fear, risk off"
     elif vix is not None and vix >= VIX_VOLATILE:
-        regime = "VOLATILE"
+        global_regime = "VOLATILE"
         description = f"VIX {vix:.1f} — elevated volatility"
     elif avg_adx >= ADX_TRENDING:
-        regime = "TRENDING"
+        global_regime = "TRENDING"
         description = f"Avg ADX {avg_adx:.1f} — strong directional moves"
     elif avg_adx <= ADX_RANGING:
-        regime = "RANGING"
+        global_regime = "RANGING"
         description = f"Avg ADX {avg_adx:.1f} — low directional movement"
     else:
-        regime = "TRENDING"
+        global_regime = "TRENDING"
         description = f"Avg ADX {avg_adx:.1f} — moderate trend"
 
-    # Strategy recommendations
+    # --- Per-pair regime classification ---
+    # Each pair gets its own trend verdict independent of other pairs.
+    # Global CRISIS/VOLATILE overrides per-pair to apply risk-off everywhere.
+    pair_regimes: dict[str, dict] = {}
+    for pair, adx in fx_adx.items():
+        if global_regime in ("CRISIS", "VOLATILE"):
+            pair_regime = global_regime
+            pair_action = "PAUSE" if global_regime == "CRISIS" else "REDUCE"
+            pair_reason = f"Global {global_regime} (VIX={vix:.1f}) overrides pair ADX"
+        else:
+            pair_regime = _classify_pair_regime(adx)
+            if pair_regime == "TRENDING":
+                pair_action = "ACTIVE"
+                pair_reason = f"ADX {adx:.1f} > {ADX_TRENDING} — trending, trend entries OK"
+            elif pair_regime == "RANGING":
+                pair_action = "REDUCE"
+                pair_reason = f"ADX {adx:.1f} < {ADX_RANGING} — ranging, avoid trend entries"
+            else:
+                pair_action = "ACTIVE"
+                pair_reason = f"ADX {adx:.1f} neutral ({ADX_RANGING}-{ADX_TRENDING}) — moderate trend"
+        pair_regimes[pair] = {
+            "regime": pair_regime,
+            "adx": adx,
+            "action": pair_action,
+            "reason": pair_reason,
+        }
+
+    # --- Strategy-level recommendations (global, backward-compatible) ---
     recommendations = {}
 
-    if regime == "CRISIS":
+    if global_regime == "CRISIS":
         recommendations = {
             100: {"action": "PAUSE", "reason": "Crisis mode — no new trend entries"},
             101: {"action": "PAUSE", "reason": "Crisis mode — no new PA entries"},
         }
-    elif regime == "VOLATILE":
+    elif global_regime == "VOLATILE":
         recommendations = {
             100: {"action": "REDUCE", "reason": "High vol — halve position sizes, widen stops"},
             101: {"action": "PAUSE", "reason": "High vol — PA patterns unreliable"},
         }
-    elif regime == "RANGING":
+    elif global_regime == "RANGING":
         recommendations = {
             100: {"action": "REDUCE", "reason": "Ranging market — trend signals weaker"},
             101: {"action": "ACTIVE", "reason": "Ranging favors price action reversals"},
         }
-    else:  # TRENDING
+    else:  # TRENDING / NEUTRAL
         recommendations = {
             100: {"action": "ACTIVE", "reason": "Trending market — ideal for trend strategy"},
             101: {"action": "ACTIVE", "reason": "Trending with PA confirmation"},
         }
 
     return {
-        "regime": regime,
+        "regime": global_regime,
         "description": description,
         "vix": round(vix, 1) if vix else None,
         "avg_adx": round(avg_adx, 1),
         "fx_adx": fx_adx,
+        "pair_regimes": pair_regimes,
         "recommendations": recommendations,
         "timestamp": datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
@@ -211,6 +255,10 @@ def run_regime_detection(db_path: str | None = None) -> dict:
 
     print(f"\n  REGIME: {result['regime']}")
     print(f"  {result['description']}")
+
+    print(f"\n  PER-PAIR REGIMES:")
+    for pair, pr in result.get("pair_regimes", {}).items():
+        print(f"    {pair}: {pr['regime']} (ADX={pr['adx']:.1f}) — {pr['action']}")
 
     print(f"\n  STRATEGY RECOMMENDATIONS:")
     for sid, rec in result["recommendations"].items():
