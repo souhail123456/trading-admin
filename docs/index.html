@@ -1,0 +1,557 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Trading Admin Dashboard</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace;
+    background: #0a0e17;
+    color: #e0e0e0;
+    padding: 20px;
+    max-width: 1400px;
+    margin: 0 auto;
+}
+
+/* Header */
+.header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 24px;
+    padding-bottom: 16px;
+    border-bottom: 1px solid #1e2a3a;
+}
+.header h1 { color: #00d4aa; font-size: 24px; }
+.header .meta { color: #666; font-size: 13px; }
+
+/* Overview cards */
+.overview {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 14px;
+    margin-bottom: 24px;
+}
+.overview-card {
+    background: #111827;
+    border: 1px solid #1e2a3a;
+    border-radius: 10px;
+    padding: 18px;
+}
+.overview-card .label { color: #666; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
+.overview-card .value { font-size: 28px; font-weight: bold; margin-top: 6px; }
+.overview-card .sub { font-size: 12px; color: #555; margin-top: 4px; }
+
+/* Colors */
+.pos { color: #00d4aa; }
+.neg { color: #ef4444; }
+.green { color: #00d4aa; }
+.blue { color: #3b82f6; }
+.yellow { color: #f59e0b; }
+.red { color: #ef4444; }
+.dim { color: #555; }
+
+/* Regime */
+.regime-trending { color: #00d4aa; }
+.regime-ranging { color: #f59e0b; }
+.regime-volatile { color: #ef4444; }
+.regime-crisis { color: #ef4444; font-weight: bold; }
+.regime-n\/a { color: #666; }
+
+/* Chart */
+.chart-container {
+    background: #111827;
+    border: 1px solid #1e2a3a;
+    border-radius: 10px;
+    margin-bottom: 24px;
+    overflow: hidden;
+}
+.chart-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 10px 16px;
+    border-bottom: 1px solid #1e2a3a;
+}
+.chart-title { color: #00d4aa; font-size: 16px; font-weight: bold; }
+#chart { padding: 8px 4px 0; }
+
+/* Bot cards */
+.bots { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; margin-bottom: 24px; }
+.bot-card {
+    background: #111827;
+    border: 1px solid #1e2a3a;
+    border-radius: 10px;
+    padding: 16px;
+    overflow: hidden;
+}
+.bot-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 14px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid #1e2a3a;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+.bot-title { font-size: 14px; font-weight: bold; }
+.bot-tag {
+    background: #1e2a3a;
+    color: #888;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 10px;
+    font-weight: normal;
+    margin-left: 6px;
+}
+.bot-pnl { font-size: 18px; font-weight: bold; }
+.market-status {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 10px;
+    font-weight: bold;
+    margin-left: 6px;
+}
+.market-open { background: #0d3320; color: #00d4aa; }
+.market-closed { background: #3b1111; color: #ef4444; }
+.market-247 { background: #1a1a33; color: #8b5cf6; }
+.live-tag { background: #0d3320; color: #00d4aa; }
+.offline-tag { background: #33260d; color: #f59e0b; }
+.bot-stats {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 8px;
+    margin-bottom: 14px;
+}
+.mini-stat {
+    background: #0d1520;
+    border-radius: 6px;
+    padding: 8px 10px;
+}
+.mini-stat .label { display: block; font-size: 10px; color: #555; text-transform: uppercase; }
+.mini-stat .val { display: block; font-size: 13px; font-weight: bold; margin-top: 2px; }
+
+h3 {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: #555;
+    margin: 14px 0 8px;
+}
+
+/* Tables */
+table { width: 100%; border-collapse: collapse; }
+th {
+    text-align: left;
+    padding: 5px 8px;
+    font-size: 10px;
+    text-transform: uppercase;
+    color: #444;
+    border-bottom: 1px solid #1e2a3a;
+}
+td { padding: 6px 8px; font-size: 12px; border-bottom: 1px solid #0d1520; }
+tr:hover { background: #1a2332; }
+.empty { text-align: center; color: #555; padding: 16px !important; }
+
+.badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 10px;
+    font-weight: bold;
+}
+.badge-t { background: #0d3320; color: #00d4aa; }
+.badge-pa { background: #1e1a33; color: #8b5cf6; }
+.flag-badge {
+    display: inline-block;
+    background: #3b1111;
+    color: #ef4444;
+    padding: 3px 10px;
+    border-radius: 4px;
+    font-size: 10px;
+    font-weight: bold;
+    margin: 2px 4px 2px 0;
+}
+
+.sig-entry { color: #00d4aa; font-weight: bold; }
+.sig-exit { color: #ef4444; font-weight: bold; }
+
+/* Bar rows (winners/losers, currency exposure, weather side P&L) */
+.bar-row { display: flex; align-items: center; gap: 8px; margin: 6px 0; font-size: 12px; }
+.bar-label { width: 96px; flex-shrink: 0; color: #888; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.bar-track { flex: 1; background: #0d1520; border-radius: 4px; height: 14px; overflow: hidden; }
+.bar-fill { height: 100%; border-radius: 4px; }
+.bar-fill.pos { background: #00d4aa; }
+.bar-fill.neg { background: #ef4444; }
+.bar-value { width: 110px; text-align: right; flex-shrink: 0; font-weight: bold; }
+
+/* Risk section */
+.risk-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 24px; }
+.risk-card {
+    background: #111827;
+    border: 1px solid #1e2a3a;
+    border-radius: 10px;
+    padding: 16px;
+}
+.risk-card h3:first-child { margin-top: 0; }
+
+/* Footer */
+.footer { text-align: center; color: #333; font-size: 11px; margin-top: 24px; padding-top: 16px; border-top: 1px solid #1e2a3a; }
+
+@media (max-width: 1000px) {
+    .bots { grid-template-columns: 1fr; }
+    .overview { grid-template-columns: repeat(2, 1fr); }
+    .bot-stats { grid-template-columns: repeat(2, 1fr); }
+    .risk-grid { grid-template-columns: 1fr 1fr; }
+}
+@media (max-width: 600px) {
+    .risk-grid { grid-template-columns: 1fr; }
+    .overview { grid-template-columns: 1fr 1fr; }
+}
+</style>
+</head>
+<body>
+
+<div class="header">
+    <h1>Trading Admin</h1>
+    <div class="meta">2026-07-26 01:16 | 3/3 bots online</div>
+</div>
+
+<div class="overview">
+    <div class="overview-card">
+        <div class="label">Total P&L</div>
+        <div class="value green">$+10.75</div>
+        <div class="sub">FX $+0 &middot; Stock $+244 &middot; Poly $-234</div>
+    </div>
+    <div class="overview-card">
+        <div class="label">Total Open Positions</div>
+        <div class="value blue">33</div>
+        <div class="sub">FX 3 &middot; Stock 5 &middot; Poly 25</div>
+    </div>
+    <div class="overview-card">
+        <div class="label">Regime</div>
+        <div class="value regime-trending">TRENDING</div>
+        <div class="sub">Trending market — ideal for trend strategy</div>
+    </div>
+    <div class="overview-card">
+        <div class="label">VIX</div>
+        <div class="value yellow">18.8</div>
+        <div class="sub">Normal</div>
+    </div>
+</div>
+
+<div class="chart-container">
+    <div class="chart-header">
+        <span class="chart-title">Portfolio Equity</span>
+        <span style="color:#666;font-size:12px">Stock bot — $100k baseline</span>
+    </div>
+    <div id="chart"><svg viewBox="0 0 1080 260" width="100%" style="height:260px;display:block" role="img" aria-label="Stock portfolio equity curve">
+      <defs>
+        <linearGradient id="eqFill" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stop-color="#00d4aa" stop-opacity="0.30"/>
+          <stop offset="100%" stop-color="#00d4aa" stop-opacity="0.02"/>
+        </linearGradient>
+      </defs>
+      <line x1="58" y1="16.0" x2="1064" y2="16.0" stroke="#1e2a3a" stroke-width="1"/><text x="50" y="20.0" text-anchor="end" font-size="10" fill="#666">$102,139</text><line x1="58" y1="70.5" x2="1064" y2="70.5" stroke="#1e2a3a" stroke-width="1"/><text x="50" y="74.5" text-anchor="end" font-size="10" fill="#666">$100,380</text><line x1="58" y1="125.0" x2="1064" y2="125.0" stroke="#1e2a3a" stroke-width="1"/><text x="50" y="129.0" text-anchor="end" font-size="10" fill="#666">$98,621</text><line x1="58" y1="179.5" x2="1064" y2="179.5" stroke="#1e2a3a" stroke-width="1"/><text x="50" y="183.5" text-anchor="end" font-size="10" fill="#666">$96,863</text><line x1="58" y1="234.0" x2="1064" y2="234.0" stroke="#1e2a3a" stroke-width="1"/><text x="50" y="238.0" text-anchor="end" font-size="10" fill="#666">$95,104</text>
+      <line x1="58" y1="82.3" x2="1064" y2="82.3" stroke="#666" stroke-width="1" stroke-dasharray="4,4"/>
+      <text x="1064" y="78.3" text-anchor="end" font-size="10" fill="#888">$100,000 baseline</text>
+      <path d="M 58.0,50.0 L 72.8,56.2 L 87.6,64.9 L 102.4,61.4 L 117.2,63.0 L 132.0,54.9 L 146.8,52.0 L 161.6,50.7 L 176.4,52.1 L 191.1,50.6 L 205.9,59.8 L 220.7,64.1 L 235.5,53.7 L 250.3,54.7 L 265.1,53.1 L 279.9,52.8 L 294.7,52.4 L 309.5,61.8 L 324.3,61.8 L 339.1,61.8 L 353.9,61.8 L 368.7,61.8 L 383.5,61.8 L 398.3,61.8 L 413.1,61.8 L 427.9,61.8 L 442.6,61.8 L 457.4,61.8 L 472.2,61.8 L 487.0,61.8 L 501.8,61.8 L 516.6,61.8 L 531.4,61.8 L 546.2,61.8 L 561.0,61.8 L 575.8,61.8 L 590.6,61.8 L 605.4,61.8 L 620.2,61.8 L 635.0,61.8 L 649.8,61.8 L 664.6,61.8 L 679.4,61.8 L 694.1,59.4 L 708.9,59.1 L 723.7,59.1 L 738.5,77.7 L 753.3,150.6 L 768.1,152.0 L 782.9,200.0 L 797.7,219.0 L 812.5,164.9 L 827.3,142.8 L 842.1,149.5 L 856.9,142.6 L 871.7,138.4 L 886.5,138.4 L 901.3,109.2 L 916.1,123.5 L 930.9,122.8 L 945.6,99.2 L 960.4,81.1 L 975.2,31.0 L 990.0,85.4 L 1004.8,84.9 L 1019.6,98.8 L 1034.4,80.1 L 1049.2,79.5 L 1064.0,74.7 L 1064.0,234.0 L 58.0,234.0 Z" fill="url(#eqFill)" stroke="none"/>
+      <path d="M 58.0,50.0 L 72.8,56.2 L 87.6,64.9 L 102.4,61.4 L 117.2,63.0 L 132.0,54.9 L 146.8,52.0 L 161.6,50.7 L 176.4,52.1 L 191.1,50.6 L 205.9,59.8 L 220.7,64.1 L 235.5,53.7 L 250.3,54.7 L 265.1,53.1 L 279.9,52.8 L 294.7,52.4 L 309.5,61.8 L 324.3,61.8 L 339.1,61.8 L 353.9,61.8 L 368.7,61.8 L 383.5,61.8 L 398.3,61.8 L 413.1,61.8 L 427.9,61.8 L 442.6,61.8 L 457.4,61.8 L 472.2,61.8 L 487.0,61.8 L 501.8,61.8 L 516.6,61.8 L 531.4,61.8 L 546.2,61.8 L 561.0,61.8 L 575.8,61.8 L 590.6,61.8 L 605.4,61.8 L 620.2,61.8 L 635.0,61.8 L 649.8,61.8 L 664.6,61.8 L 679.4,61.8 L 694.1,59.4 L 708.9,59.1 L 723.7,59.1 L 738.5,77.7 L 753.3,150.6 L 768.1,152.0 L 782.9,200.0 L 797.7,219.0 L 812.5,164.9 L 827.3,142.8 L 842.1,149.5 L 856.9,142.6 L 871.7,138.4 L 886.5,138.4 L 901.3,109.2 L 916.1,123.5 L 930.9,122.8 L 945.6,99.2 L 960.4,81.1 L 975.2,31.0 L 990.0,85.4 L 1004.8,84.9 L 1019.6,98.8 L 1034.4,80.1 L 1049.2,79.5 L 1064.0,74.7" fill="none" stroke="#00d4aa" stroke-width="2"/>
+      <circle cx="58.0" cy="50.0" r="2.5" fill="#00d4aa"><title>2026-04-28: $101,040.54</title></circle><circle cx="72.8" cy="56.2" r="2.5" fill="#00d4aa"><title>2026-04-29: $100,840.43</title></circle><circle cx="87.6" cy="64.9" r="2.5" fill="#00d4aa"><title>2026-04-30: $100,560.59</title></circle><circle cx="102.4" cy="61.4" r="2.5" fill="#00d4aa"><title>2026-05-03: $100,672.33</title></circle><circle cx="117.2" cy="63.0" r="2.5" fill="#00d4aa"><title>2026-05-04: $100,623.54</title></circle><circle cx="132.0" cy="54.9" r="2.5" fill="#00d4aa"><title>2026-05-05: $100,881.90</title></circle><circle cx="146.8" cy="52.0" r="2.5" fill="#00d4aa"><title>2026-05-06: $100,976.14</title></circle><circle cx="161.6" cy="50.7" r="2.5" fill="#00d4aa"><title>2026-05-07: $101,018.30</title></circle><circle cx="176.4" cy="52.1" r="2.5" fill="#00d4aa"><title>2026-05-08: $100,974.62</title></circle><circle cx="191.1" cy="50.6" r="2.5" fill="#00d4aa"><title>2026-05-10: $101,021.11</title></circle><circle cx="205.9" cy="59.8" r="2.5" fill="#00d4aa"><title>2026-05-11: $100,725.19</title></circle><circle cx="220.7" cy="64.1" r="2.5" fill="#00d4aa"><title>2026-05-12: $100,588.09</title></circle><circle cx="235.5" cy="53.7" r="2.5" fill="#00d4aa"><title>2026-05-13: $100,923.10</title></circle><circle cx="250.3" cy="54.7" r="2.5" fill="#00d4aa"><title>2026-05-14: $100,889.88</title></circle><circle cx="265.1" cy="53.1" r="2.5" fill="#00d4aa"><title>2026-05-15: $100,940.08</title></circle><circle cx="279.9" cy="52.8" r="2.5" fill="#00d4aa"><title>2026-05-17: $100,951.24</title></circle><circle cx="294.7" cy="52.4" r="2.5" fill="#00d4aa"><title>2026-05-18: $100,963.92</title></circle><circle cx="309.5" cy="61.8" r="2.5" fill="#00d4aa"><title>2026-05-19: $100,659.66</title></circle><circle cx="324.3" cy="61.8" r="2.5" fill="#00d4aa"><title>2026-05-20: $100,659.65</title></circle><circle cx="339.1" cy="61.8" r="2.5" fill="#00d4aa"><title>2026-05-21: $100,659.65</title></circle><circle cx="353.9" cy="61.8" r="2.5" fill="#00d4aa"><title>2026-05-22: $100,659.65</title></circle><circle cx="368.7" cy="61.8" r="2.5" fill="#00d4aa"><title>2026-05-24: $100,659.65</title></circle><circle cx="383.5" cy="61.8" r="2.5" fill="#00d4aa"><title>2026-05-25: $100,659.65</title></circle><circle cx="398.3" cy="61.8" r="2.5" fill="#00d4aa"><title>2026-05-26: $100,659.65</title></circle><circle cx="413.1" cy="61.8" r="2.5" fill="#00d4aa"><title>2026-05-27: $100,659.65</title></circle><circle cx="427.9" cy="61.8" r="2.5" fill="#00d4aa"><title>2026-05-28: $100,659.65</title></circle><circle cx="442.6" cy="61.8" r="2.5" fill="#00d4aa"><title>2026-05-29: $100,659.65</title></circle><circle cx="457.4" cy="61.8" r="2.5" fill="#00d4aa"><title>2026-05-31: $100,659.65</title></circle><circle cx="472.2" cy="61.8" r="2.5" fill="#00d4aa"><title>2026-06-01: $100,659.65</title></circle><circle cx="487.0" cy="61.8" r="2.5" fill="#00d4aa"><title>2026-06-02: $100,659.65</title></circle><circle cx="501.8" cy="61.8" r="2.5" fill="#00d4aa"><title>2026-06-03: $100,659.65</title></circle><circle cx="516.6" cy="61.8" r="2.5" fill="#00d4aa"><title>2026-06-04: $100,659.65</title></circle><circle cx="531.4" cy="61.8" r="2.5" fill="#00d4aa"><title>2026-06-05: $100,659.65</title></circle><circle cx="546.2" cy="61.8" r="2.5" fill="#00d4aa"><title>2026-06-07: $100,659.65</title></circle><circle cx="561.0" cy="61.8" r="2.5" fill="#00d4aa"><title>2026-06-08: $100,659.65</title></circle><circle cx="575.8" cy="61.8" r="2.5" fill="#00d4aa"><title>2026-06-09: $100,659.65</title></circle><circle cx="590.6" cy="61.8" r="2.5" fill="#00d4aa"><title>2026-06-10: $100,659.65</title></circle><circle cx="605.4" cy="61.8" r="2.5" fill="#00d4aa"><title>2026-06-11: $100,659.65</title></circle><circle cx="620.2" cy="61.8" r="2.5" fill="#00d4aa"><title>2026-06-12: $100,659.65</title></circle><circle cx="635.0" cy="61.8" r="2.5" fill="#00d4aa"><title>2026-06-14: $100,659.65</title></circle><circle cx="649.8" cy="61.8" r="2.5" fill="#00d4aa"><title>2026-06-15: $100,659.65</title></circle><circle cx="664.6" cy="61.8" r="2.5" fill="#00d4aa"><title>2026-06-16: $100,659.65</title></circle><circle cx="679.4" cy="61.8" r="2.5" fill="#00d4aa"><title>2026-06-17: $100,659.65</title></circle><circle cx="694.1" cy="59.4" r="2.5" fill="#00d4aa"><title>2026-06-18: $100,737.42</title></circle><circle cx="708.9" cy="59.1" r="2.5" fill="#00d4aa"><title>2026-06-19: $100,747.72</title></circle><circle cx="723.7" cy="59.1" r="2.5" fill="#00d4aa"><title>2026-06-21: $100,747.72</title></circle><circle cx="738.5" cy="77.7" r="2.5" fill="#00d4aa"><title>2026-06-22: $100,146.11</title></circle><circle cx="753.3" cy="150.6" r="2.5" fill="#00d4aa"><title>2026-06-23: $97,796.28</title></circle><circle cx="768.1" cy="152.0" r="2.5" fill="#00d4aa"><title>2026-06-24: $97,751.34</title></circle><circle cx="782.9" cy="200.0" r="2.5" fill="#00d4aa"><title>2026-06-25: $96,202.35</title></circle><circle cx="797.7" cy="219.0" r="2.5" fill="#00d4aa"><title>2026-06-28: $95,589.20</title></circle><circle cx="812.5" cy="164.9" r="2.5" fill="#00d4aa"><title>2026-06-29: $97,334.50</title></circle><circle cx="827.3" cy="142.8" r="2.5" fill="#00d4aa"><title>2026-06-30: $98,047.57</title></circle><circle cx="842.1" cy="149.5" r="2.5" fill="#00d4aa"><title>2026-07-01: $97,830.85</title></circle><circle cx="856.9" cy="142.6" r="2.5" fill="#00d4aa"><title>2026-07-02: $98,054.93</title></circle><circle cx="871.7" cy="138.4" r="2.5" fill="#00d4aa"><title>2026-07-03: $98,187.98</title></circle><circle cx="886.5" cy="138.4" r="2.5" fill="#00d4aa"><title>2026-07-05: $98,187.98</title></circle><circle cx="901.3" cy="109.2" r="2.5" fill="#00d4aa"><title>2026-07-06: $99,132.73</title></circle><circle cx="916.1" cy="123.5" r="2.5" fill="#00d4aa"><title>2026-07-07: $98,669.69</title></circle><circle cx="930.9" cy="122.8" r="2.5" fill="#00d4aa"><title>2026-07-08: $98,693.22</title></circle><circle cx="945.6" cy="99.2" r="2.5" fill="#00d4aa"><title>2026-07-14: $99,452.89</title></circle><circle cx="960.4" cy="81.1" r="2.5" fill="#00d4aa"><title>2026-07-15: $100,037.90</title></circle><circle cx="975.2" cy="31.0" r="2.5" fill="#00d4aa"><title>2026-07-16: $101,653.47</title></circle><circle cx="990.0" cy="85.4" r="2.5" fill="#00d4aa"><title>2026-07-17: $99,898.71</title></circle><circle cx="1004.8" cy="84.9" r="2.5" fill="#00d4aa"><title>2026-07-20: $99,915.93</title></circle><circle cx="1019.6" cy="98.8" r="2.5" fill="#00d4aa"><title>2026-07-21: $99,467.66</title></circle><circle cx="1034.4" cy="80.1" r="2.5" fill="#00d4aa"><title>2026-07-22: $100,070.84</title></circle><circle cx="1049.2" cy="79.5" r="2.5" fill="#00d4aa"><title>2026-07-23: $100,088.00</title></circle><circle cx="1064.0" cy="74.7" r="2.5" fill="#00d4aa"><title>2026-07-24: $100,244.44</title></circle>
+      <text x="58.0" y="254" text-anchor="middle" font-size="10" fill="#666">2026-04-28</text><text x="561.0" y="254" text-anchor="middle" font-size="10" fill="#666">2026-06-08</text><text x="1064.0" y="254" text-anchor="middle" font-size="10" fill="#666">2026-07-24</text>
+    </svg></div>
+</div>
+
+<div class="bots">
+    
+        <div class="bot-card">
+            <div class="bot-header">
+                <div class="bot-title">STOCK/ETF BOT <span class="bot-tag">Alpaca</span> <span class="market-status market-closed">CLOSED</span></div>
+                <div class="bot-pnl pos">$+244.44 (+0.24%)</div>
+            </div>
+            <div class="bot-stats">
+                <div class="mini-stat"><span class="label">Portfolio</span><span class="val">$100,244.44</span></div>
+                <div class="mini-stat"><span class="label">Cash</span><span class="val">$23,767.03</span></div>
+                <div class="mini-stat"><span class="label">Positions</span><span class="val">5</span></div>
+                <div class="mini-stat"><span class="label">Last Run</span><span class="val">2026-07-24T18:07:51Z</span></div>
+            </div>
+            <table>
+                <tr><th>Symbol</th><th>Side</th><th>Shares</th><th>Entry</th><th>Unrealized</th></tr>
+                <tr>
+                <td><b>AAPL</b></td>
+                <td>BUY</td>
+                <td>47.0</td>
+                <td>$309.865745</td>
+                <td class="pos">$+1,096.71 (+7.5%)</td>
+            </tr><tr>
+                <td><b>SPY</b></td>
+                <td>BUY</td>
+                <td>19.0</td>
+                <td>$736.000526</td>
+                <td class="pos">$+51.29 (+0.4%)</td>
+            </tr><tr>
+                <td><b>XLE</b></td>
+                <td>BUY</td>
+                <td>281.0</td>
+                <td>$53.47</td>
+                <td class="pos">$+1,728.15 (+11.5%)</td>
+            </tr><tr>
+                <td><b>XLF</b></td>
+                <td>BUY</td>
+                <td>267.0</td>
+                <td>$56.23</td>
+                <td class="pos">$+32.04 (+0.2%)</td>
+            </tr><tr>
+                <td><b>XLI</b></td>
+                <td>BUY</td>
+                <td>82.0</td>
+                <td>$182.98</td>
+                <td class="neg">$-21.32 (-0.1%)</td>
+            </tr>
+            </table>
+            <h3>Closed Trades</h3><table><tr><th>Symbol</th><th>Entry</th><th>Exit</th><th>P&L</th></tr><tr>
+                <td>NVDA</td>
+                <td>$201.73</td>
+                <td>$202.05</td>
+                <td class="pos">$+31.68 (+0.2%)</td>
+            </tr><tr>
+                <td>NVDA</td>
+                <td>$208.95</td>
+                <td>$200.37</td>
+                <td class="neg">$-617.76 (-4.1%)</td>
+            </tr><tr>
+                <td>NVDA</td>
+                <td>$203.36</td>
+                <td>$192.33</td>
+                <td class="neg">$-308.84 (-5.4%)</td>
+            </tr><tr>
+                <td>NVDA</td>
+                <td>$203.36</td>
+                <td>$192.34</td>
+                <td class="neg">$-330.60 (-5.4%)</td>
+            </tr><tr>
+                <td>NVDA</td>
+                <td>$203.36</td>
+                <td>$192.6</td>
+                <td class="neg">$-150.64 (-5.3%)</td>
+            </tr></table>
+            <h3>Top Winners / Losers</h3>
+            <div class="bar-row" title="GOOGL">
+        <span class="bar-label">GOOGL</span>
+        <div class="bar-track"><div class="bar-fill pos" style="width:44.0%"></div></div>
+        <span class="bar-value pos">$+449.90</span>
+    </div><div class="bar-row" title="AMZN">
+        <span class="bar-label">AMZN</span>
+        <div class="bar-track"><div class="bar-fill pos" style="width:40.3%"></div></div>
+        <span class="bar-value pos">$+411.52</span>
+    </div><div class="bar-row" title="XLF">
+        <span class="bar-label">XLF</span>
+        <div class="bar-track"><div class="bar-fill pos" style="width:36.7%"></div></div>
+        <span class="bar-value pos">$+374.44</span>
+    </div><div class="bar-row" title="XLK">
+        <span class="bar-label">XLK</span>
+        <div class="bar-track"><div class="bar-fill neg" style="width:100.0%"></div></div>
+        <span class="bar-value neg">$-1,021.59</span>
+    </div><div class="bar-row" title="NVDA">
+        <span class="bar-label">NVDA</span>
+        <div class="bar-track"><div class="bar-fill neg" style="width:60.5%"></div></div>
+        <span class="bar-value neg">$-617.76</span>
+    </div><div class="bar-row" title="GOOGL">
+        <span class="bar-label">GOOGL</span>
+        <div class="bar-track"><div class="bar-fill neg" style="width:48.5%"></div></div>
+        <span class="bar-value neg">$-495.00</span>
+    </div>
+        </div>
+    
+    <div class="bot-card">
+        <div class="bot-header">
+            <div class="bot-title">FX BOT <span class="bot-tag">Capital.com</span> <span class="market-status offline-tag">LOCAL SNAPSHOT</span> <span class="market-status market-closed">CLOSED</span></div>
+            <div class="bot-pnl pos">$+0.00</div>
+        </div>
+        <div class="bot-stats">
+            <div class="mini-stat"><span class="label">Equity</span><span class="val">$0.00</span></div>
+            <div class="mini-stat"><span class="label">Unrealized</span><span class="val pos">$+0.00</span></div>
+            <div class="mini-stat"><span class="label">Realized</span><span class="val pos">$+0.00</span></div>
+            <div class="mini-stat"><span class="label">Open</span><span class="val">3</span></div>
+            <div class="mini-stat"><span class="label">Closed (win%)</span><span class="val">0 (0%)</span></div>
+            <div class="mini-stat"><span class="label">Est. Swap Cost</span><span class="val neg">$+7,038.90</span></div>
+        </div>
+        <h3>Open Positions</h3>
+        <table>
+            <tr><th>Symbol</th><th>Side</th><th>Size</th><th>Entry</th><th>P&L</th><th>Held</th><th>Swap Est.</th></tr>
+            <tr>
+            <td><b>USDCHF</b></td>
+            <td>LONG</td>
+            <td>1000.0</td>
+            <td>0.80844</td>
+            <td><span class="dim">n/a (offline)</span></td>
+            <td>17d</td>
+            <td>$+1870.72</td>
+        </tr><tr>
+            <td><b>USDJPY</b></td>
+            <td>LONG</td>
+            <td>1000.0</td>
+            <td>161.756</td>
+            <td><span class="dim">n/a (offline)</span></td>
+            <td>15d</td>
+            <td>$+2288.19</td>
+        </tr><tr>
+            <td><b>GBPJPY</b></td>
+            <td>LONG</td>
+            <td>1000.0</td>
+            <td>217.085</td>
+            <td><span class="dim">n/a (offline)</span></td>
+            <td>15d</td>
+            <td>$+2879.99</td>
+        </tr>
+        </table>
+    </div>
+    
+        <div class="bot-card">
+            <div class="bot-header">
+                <div class="bot-title">POLYMARKET BOT <span class="bot-tag">Paper</span> <span class="market-status market-247">24/7</span></div>
+                <div class="bot-pnl neg">$-233.69 (-9.6%)</div>
+            </div>
+            <div class="bot-stats">
+                <div class="mini-stat"><span class="label">EV Trades</span><span class="val">54 (25 open)</span></div>
+                <div class="mini-stat"><span class="label">EV Win Rate</span><span class="val">10%</span></div>
+                <div class="mini-stat"><span class="label">EV P&L</span><span class="val">$-116.66</span></div>
+                <div class="mini-stat"><span class="label">Weather Trades</span><span class="val">430 (0 open)</span></div>
+                <div class="mini-stat"><span class="label">Weather Win Rate</span><span class="val">62%</span></div>
+                <div class="mini-stat"><span class="label">Weather P&L</span><span class="val">$-117.03</span></div>
+                <div class="mini-stat"><span class="label">Weather Avg Win</span><span class="val pos">$+2.30</span></div>
+                <div class="mini-stat"><span class="label">Weather Avg Loss</span><span class="val neg">$-4.41</span></div>
+            </div>
+            <h3>Weather P&L by Side</h3>
+            <div class="bar-row" title="YES (18% win)">
+        <span class="bar-label">YES (18% win)</span>
+        <div class="bar-track"><div class="bar-fill neg" style="width:100.0%"></div></div>
+        <span class="bar-value neg">$-111.93</span>
+    </div><div class="bar-row" title="NO (73% win)">
+        <span class="bar-label">NO (73% win)</span>
+        <div class="bar-track"><div class="bar-fill neg" style="width:4.6%"></div></div>
+        <span class="bar-value neg">$-5.10</span>
+    </div>
+            <h3>Recent Trades</h3>
+            <table>
+                <tr><th>Market</th><th>Size</th><th>Status</th><th>P&L</th></tr>
+                <tr><td>Will the highest temperature in Seoul be</td><td>$1.04</td><td>LOST</td><td class="neg">$-1.04 (-100%)</td></tr><tr><td>Internazionali BNL d'Italia: Katerina Si</td><td>$2.87</td><td>WON</td><td class="pos">$+9.61 (+335%)</td></tr><tr><td>Baltimore Orioles vs. Miami Marlins</td><td>$4.35</td><td>LOST</td><td class="neg">$-4.35 (-100%)</td></tr><tr><td>Iran closes its airspace by May 15?</td><td>$3.17</td><td>OPEN</td><td class="">$+0.00 (+0%)</td></tr><tr><td>US x Iran permanent peace deal by May 13</td><td>$2.04</td><td>OPEN</td><td class="">$+0.00 (+0%)</td></tr><tr><td>Will WTI Crude Oil (WTI) hit (LOW) $70 i</td><td>$4.82</td><td>OPEN</td><td class="">$+0.00 (+0%)</td></tr>
+            </table>
+        </div>
+</div>
+
+<h3 style="font-size:13px;letter-spacing:1px;color:#888;margin-bottom:12px">RISK &amp; EXPOSURE</h3>
+
+    <div class="risk-grid">
+        <div class="risk-card">
+            <h3>Currency Exposure (FX)</h3>
+            <div class="bar-row" title="GBP">
+        <span class="bar-label">GBP</span>
+        <div class="bar-track"><div class="bar-fill pos" style="width:100.0%"></div></div>
+        <span class="bar-value pos">$+217,085</span>
+    </div><div class="bar-row" title="USD">
+        <span class="bar-label">USD</span>
+        <div class="bar-track"><div class="bar-fill pos" style="width:74.9%"></div></div>
+        <span class="bar-value pos">$+162,564</span>
+    </div>
+        </div>
+        <div class="risk-card">
+            <h3>Cross-Bot Overlaps</h3>
+            <div class="empty">No overlapping positions detected</div>
+            <h3 style="margin-top:16px">Risk Flags</h3>
+            <span class="flag-badge">HIGH_TOTAL_EXPOSURE</span>
+        </div>
+        <div class="risk-card">
+            <h3>Total Cross-Bot Exposure</h3>
+            <div class="bot-stats" style="grid-template-columns: 1fr 1fr;">
+                <div class="mini-stat"><span class="label">Total Exposure</span><span class="val">$453,240</span></div>
+                <div class="mini-stat"><span class="label">Total Positions</span><span class="val">8</span></div>
+                <div class="mini-stat"><span class="label">FX</span><span class="val">3 pos / $379,649</span></div><div class="mini-stat"><span class="label">STOCK</span><span class="val">5 pos / $73,591</span></div>
+            </div>
+        </div>
+        <div class="risk-card">
+            <h3>Drawdown Status</h3>
+            <div class="bot-stats" style="grid-template-columns: 1fr;">
+                
+        <div class="mini-stat"><span class="label">Current Drawdown</span><span class="val neg">-1.39%</span></div>
+        <div class="mini-stat"><span class="label">Max Drawdown (stock)</span><span class="val neg">-5.40%</span></div>
+        <div class="mini-stat"><span class="label">Peak Equity</span><span class="val">$101,653</span></div>
+            </div>
+        </div>
+    </div>
+
+
+    <div class="bot-card" style="grid-column: 1 / -1; margin-top: 8px;">
+        <div class="bot-header">
+            <div class="bot-title">API STATUS <span class="bot-tag">2/8 OK</span></div>
+        </div>
+        <table>
+            <tr><th>Service</th><th>Bot</th><th>Status</th><th>Latency</th><th>Details</th><th>Fallback</th></tr>
+            <tr>
+            <td><b>GitHub PAT</b></td>
+            <td>Trading Admin</td>
+            <td class="dim"><b>N/A</b></td>
+            <td>-</td>
+            <td style="color:#666;font-size:11px">GH_TOKEN not set</td>
+            <td style="color:#555;font-size:10px">Create new fine-grained PAT at github.com/settings/personal-</td>
+        </tr><tr>
+            <td><b>Telegram Bot</b></td>
+            <td>Trading Admin</td>
+            <td class="dim"><b>N/A</b></td>
+            <td>-</td>
+            <td style="color:#666;font-size:11px">TELEGRAM_BOT_TOKEN not set</td>
+            <td style="color:#555;font-size:10px">Create new bot via @BotFather on Telegram</td>
+        </tr><tr>
+            <td><b>Capital.com</b></td>
+            <td>FX Bot</td>
+            <td class="dim"><b>N/A</b></td>
+            <td>-</td>
+            <td style="color:#666;font-size:11px">CAPITAL_API_KEY or CAPITAL_EMAIL not set</td>
+            <td style="color:#555;font-size:10px">Switch to OANDA: set OANDA_API_KEY + OANDA_ACCOUNT_ID. Or cT</td>
+        </tr><tr>
+            <td><b>yfinance (market data)</b></td>
+            <td>FX Bot</td>
+            <td class="pos"><b>OK</b></td>
+            <td>2055ms</td>
+            <td style="color:#666;font-size:11px">Market data available</td>
+            <td style="color:#555;font-size:10px">No API key needed. If Yahoo Finance is down, data fetch will</td>
+        </tr><tr>
+            <td><b>Alpaca</b></td>
+            <td>Stock Bot</td>
+            <td class="dim"><b>N/A</b></td>
+            <td>-</td>
+            <td style="color:#666;font-size:11px">Alpaca broker DOWN: ALPACA_API_KEY not set (lives in stock bot repo)</td>
+            <td style="color:#555;font-size:10px">Regenerate keys at app.alpaca.markets/brokerage/dashboard/ov</td>
+        </tr><tr>
+            <td><b>Anthropic (Claude)</b></td>
+            <td>Stock Bot</td>
+            <td class="dim"><b>N/A</b></td>
+            <td>-</td>
+            <td style="color:#666;font-size:11px">ANTHROPIC_API_KEY not set (lives in stock bot repo)</td>
+            <td style="color:#555;font-size:10px">Regenerate at console.anthropic.com. Stock bot agent needs t</td>
+        </tr><tr>
+            <td><b>Groq (Llama 3.3 70B)</b></td>
+            <td>Polymarket Bot</td>
+            <td class="dim"><b>N/A</b></td>
+            <td>-</td>
+            <td style="color:#666;font-size:11px">GROQ_API_KEY not set (lives in polymarket bot repo)</td>
+            <td style="color:#555;font-size:10px">Switch to OpenAI or Anthropic. Update bot.py OPENAI client c</td>
+        </tr><tr>
+            <td><b>Polymarket Gamma API</b></td>
+            <td>Polymarket Bot</td>
+            <td class="pos"><b>OK</b></td>
+            <td>336ms</td>
+            <td style="color:#666;font-size:11px">Markets API accessible</td>
+            <td style="color:#555;font-size:10px">Public API, no key needed. If down, bot skips cycle</td>
+        </tr>
+        </table>
+    </div>
+
+<div class="footer">Trading Admin Dashboard | Auto-generated 2026-07-26 01:16 | FX: TRENDING regime source shared/global_state.json | Stock: shared/daily_history.jsonl (local) | Poly: local polymarket-bot clone</div>
+
+</body>
+</html>

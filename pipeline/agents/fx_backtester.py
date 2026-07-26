@@ -79,7 +79,7 @@ def fx_trend_following(
                     candidates.append((t, row["trend_strength"]))
 
         if not candidates:
-            portfolio_returns.append({"date": date, "return": 0.0, "benchmark": 0.0})
+            portfolio_returns.append({"date": date, "return": 0.0, "benchmark": 0.0, "trades_opened": 0})
             continue
 
         candidates.sort(key=lambda x: x[1], reverse=True)
@@ -90,7 +90,7 @@ def fx_trend_following(
         cost = cost_bps / 10000 * 2
         net_return = raw_return - cost
 
-        portfolio_returns.append({"date": date, "return": net_return, "benchmark": 0.0})
+        portfolio_returns.append({"date": date, "return": net_return, "benchmark": 0.0, "trades_opened": len(selected)})
 
     results = pd.DataFrame(portfolio_returns).set_index("date")
     if results.empty:
@@ -179,14 +179,17 @@ def fx_price_action(
                     candidates.append((t, score))
 
             candidates.sort(key=lambda x: x[1], reverse=True)
-            for t, _ in candidates[:slots]:
+            entered = candidates[:slots]
+            for t, _ in entered:
                 if date in data[t].index:
                     positions[t] = {
                         "entry_date": date,
                         "entry_price": data[t].loc[date, "close"],
                     }
+        else:
+            entered = []
 
-        daily_returns.append({"date": date, "return": port_ret, "benchmark": 0.0})
+        daily_returns.append({"date": date, "return": port_ret, "benchmark": 0.0, "trades_opened": len(entered)})
 
     if not daily_returns:
         return pd.DataFrame()
@@ -195,6 +198,7 @@ def fx_price_action(
     monthly = results.resample("ME").agg({
         "return": lambda x: (1 + x).prod() - 1,
         "benchmark": lambda x: (1 + x).prod() - 1,
+        "trades_opened": "sum",
     })
     monthly["cumulative"] = (1 + monthly["return"]).cumprod()
     monthly["bench_cumulative"] = 1.0
@@ -344,12 +348,61 @@ def _split_and_metrics(results: pd.DataFrame, name: str) -> dict | None:
     oos["cumulative"] = (1 + oos["return"]).cumprod()
     oos["bench_cumulative"] = 1.0
 
+    has_trades = "trades_opened" in results.columns
+    split_date = results.index[split].strftime("%Y-%m-%d") if split < len(results) else None
+
     return {
         "in_sample": compute_metrics(ism),
         "out_of_sample": compute_metrics(oos),
         "full": compute_metrics(results),
         "total_months": len(results),
+        "data_start": results.index[0].strftime("%Y-%m-%d"),
+        "data_end": results.index[-1].strftime("%Y-%m-%d"),
+        "split_date": split_date,
+        "trades_in_sample": int(ism["trades_opened"].sum()) if has_trades else None,
+        "trades_out_of_sample": int(oos["trades_opened"].sum()) if has_trades else None,
     }
+
+
+def _store_backtest_run(
+    conn, strategy_id: int, variant_name: str, params: dict, m: dict,
+) -> None:
+    """Persist in-sample / out-of-sample metrics for a variant into backtest_runs,
+    keyed to the given strategy_id (only called for variants that map to a real
+    strategy row, e.g. fx_trend -> 100, fx_price_action -> 101)."""
+    for run_type, metrics, trade_count in [
+        ("in_sample", m["in_sample"], m.get("trades_in_sample")),
+        ("out_of_sample", m["out_of_sample"], m.get("trades_out_of_sample")),
+    ]:
+        if "error" in metrics:
+            log.warning(f"  Skipping DB store for {variant_name} {run_type}: {metrics['error']}")
+            continue
+        conn.execute(
+            """INSERT INTO backtest_runs
+               (strategy_id, run_type, parameters, data_start, data_end,
+                split_point, sharpe, cagr, max_drawdown, win_rate,
+                total_trades, transaction_cost_bps, beat_spy, report)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                strategy_id, run_type, json.dumps(params),
+                m["data_start"], m["data_end"], m["split_date"],
+                metrics.get("sharpe"), metrics.get("cagr"), metrics.get("max_drawdown"),
+                metrics.get("win_rate"), trade_count,
+                params.get("cost_bps"), metrics.get("beat_spy"),
+                json.dumps(metrics),
+            ),
+        )
+    conn.commit()
+    log.info(f"  Stored {variant_name} in_sample/out_of_sample rows in backtest_runs (strategy_id={strategy_id})")
+
+
+# Strategy IDs 100/101 in the `strategies` table — parameters mirrored here
+# so backtest_runs rows can be tied back to the live paper-trading strategies.
+FX_TREND_STRATEGY_ID = 100
+FX_TREND_PARAMS = {"sma_period": 200, "top_n": 3, "cost_bps": 3}
+
+FX_PA_STRATEGY_ID = 101
+FX_PA_PARAMS = {"min_score": 2, "max_positions": 3, "hold_days": 15, "stop_loss": -0.03}
 
 
 def compare_all(db_path: str | None = None) -> dict:
@@ -364,21 +417,23 @@ def compare_all(db_path: str | None = None) -> dict:
 
     # Variant 1
     log.info("\n=== VARIANT 1: FX Trend-Following ===")
-    r = fx_trend_following(data)
+    r = fx_trend_following(data, **FX_TREND_PARAMS)
     m = _split_and_metrics(r, "trend")
     if m:
         results["fx_trend"] = m
         log.info(f"  IS:  {m['in_sample']}")
         log.info(f"  OOS: {m['out_of_sample']}")
+        _store_backtest_run(conn, FX_TREND_STRATEGY_ID, "fx_trend", FX_TREND_PARAMS, m)
 
     # Variant 2
     log.info("\n=== VARIANT 2: FX Price Action ===")
-    r = fx_price_action(data)
+    r = fx_price_action(data, **FX_PA_PARAMS)
     m = _split_and_metrics(r, "price_action")
     if m:
         results["fx_price_action"] = m
         log.info(f"  IS:  {m['in_sample']}")
         log.info(f"  OOS: {m['out_of_sample']}")
+        _store_backtest_run(conn, FX_PA_STRATEGY_ID, "fx_price_action", FX_PA_PARAMS, m)
 
     # Variant 3
     log.info("\n=== VARIANT 3: FX Merged (Trend + PA) ===")

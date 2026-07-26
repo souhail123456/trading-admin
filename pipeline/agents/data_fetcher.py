@@ -16,9 +16,11 @@ Usage:
 """
 
 import argparse
+import glob
 import json
 import logging
 import sqlite3
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -109,15 +111,32 @@ def get_tickers_for_strategy(strategy: dict) -> tuple[list[str], str]:
     return tickers, "unknown_default"
 
 
+def _latest_cached(ticker: str, start: str) -> Path | None:
+    """Find the most recent cached CSV for this ticker/start, regardless of end date."""
+    prefix = f"{ticker.replace('=', '_')}_{start}_"
+    candidates = sorted(CACHE_DIR.glob(f"{prefix}*.csv"))
+    return candidates[-1] if candidates else None
+
+
 def fetch_ohlcv(
     tickers: list[str],
     start: str = "2005-01-01",
     end: str | None = None,
     cache: bool = True,
+    max_retries: int = 3,
+    retry_backoff: float = 5.0,
+    request_delay: float = 1.5,
 ) -> dict[str, pd.DataFrame]:
     """
     Fetch OHLCV data for a list of tickers.
-    Caches each ticker as a parquet file.
+    Caches each ticker as a CSV file.
+
+    Yahoo Finance intermittently throttles/rejects rapid sequential requests
+    (surfaces as a spurious "possibly delisted" error even for valid, liquid
+    tickers). To make this resilient we retry with backoff, pace requests
+    with a small delay, and fall back to the most recent cached copy of the
+    ticker (even if its end-date doesn't match today) rather than silently
+    dropping the ticker from the dataset.
     """
     if end is None:
         end = datetime.now().strftime("%Y-%m-%d")
@@ -132,13 +151,22 @@ def fetch_ohlcv(
             results[ticker] = pd.read_csv(cache_path, index_col=0, parse_dates=True)
             continue
 
-        log.info(f"  {ticker}: downloading...")
-        try:
-            df = yf.download(ticker, start=start, end=end, progress=False)
-            if df.empty:
-                log.warning(f"  {ticker}: no data returned")
-                continue
+        df = None
+        for attempt in range(1, max_retries + 1):
+            log.info(f"  {ticker}: downloading... (attempt {attempt}/{max_retries})")
+            try:
+                candidate = yf.download(ticker, start=start, end=end, progress=False)
+                if candidate is not None and not candidate.empty:
+                    df = candidate
+                    break
+                log.warning(f"  {ticker}: no data returned (attempt {attempt}/{max_retries})")
+            except Exception as e:
+                log.error(f"  {ticker}: failed — {e} (attempt {attempt}/{max_retries})")
 
+            if attempt < max_retries:
+                time.sleep(retry_backoff * attempt)
+
+        if df is not None:
             # Flatten multi-level columns if present
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
@@ -151,8 +179,18 @@ def fetch_ohlcv(
                 df.to_csv(cache_path)
 
             results[ticker] = df
-        except Exception as e:
-            log.error(f"  {ticker}: failed — {e}")
+        else:
+            # All retries exhausted — fall back to the most recent cache
+            # for this ticker (better than dropping it from the universe).
+            fallback = _latest_cached(ticker, start) if cache else None
+            if fallback:
+                log.warning(f"  {ticker}: download failed after {max_retries} attempts — "
+                            f"using stale cache {fallback.name}")
+                results[ticker] = pd.read_csv(fallback, index_col=0, parse_dates=True)
+            else:
+                log.error(f"  {ticker}: download failed after {max_retries} attempts, no cache available — skipping")
+
+        time.sleep(request_delay)
 
     return results
 
