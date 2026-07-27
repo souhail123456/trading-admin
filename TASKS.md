@@ -15,25 +15,30 @@
 - **Stock Bot new strategies:** Asset Class TF (strategy 18, 5 ETFs, SMA-200) and Sector Momentum (strategy 5, top 3 of 10 SPDR sectors). Both have ownership ledgers to prevent cross-strategy conflicts. GitHub Actions workflows fire 1st trading day of month.
 - **Dashboard:** Summary cards, per-bot P&L, inline SVG equity curve, risk section, dark theme
 
-### Current state:
-- FX Bot: 3 open trades (USDCHF, USDJPY, GBPJPY) on strategy 100, running 3x daily
+### Current state (Jul 27):
+- FX Bot: 2 open trades — USDJPY long @161.756 (Jul 10), USDCHF long @0.81869 (Jul 27). Realized P&L: $8.61 (2 closed). Trailing stop active on USDJPY @163.05.
 - Stock Bot: holding AAPL, AMZN, GOOGL, QQQ, SPY, XLE. Churn loop fix deployed (May). Exit fix deployed (Jul 26).
-- Weather Bot: running with per-side Kelly fix
+- Weather Bot: running with per-side Kelly fix. Bankroll reset Jul 26.
 - Events Bot: running every 30 min, batched LLM + Gemini search live
 - New strategies: Asset Class TF + Sector Momentum ready, first run Aug 1
 
-### Bugs found from Jul 27 pipeline run:
-- [x] PA strategy 101 still generating signals despite being killed — fixed, pushed
-- [x] PnL inflated 1000x — DB stores raw units but calc multiplied by 1000 again. GBPJPY corrected from $3,314 to $7.09
-- [x] FX_ACCOUNT_BALANCE defaults to $10,000 but real demo is ~$287 — fixed: now reads live equity from broker at runtime.
+### Bugs found & fixed (Jul 27):
+- [x] PA strategy 101 still generating signals — kill was overwritten by pipeline DB commit. Re-killed, pushed.
+- [x] PnL inflated 1000x — morning run used old code (before fix pushed). Trade 8 corrected: $3,314 → $6.74. Trade 10 used correct formula ($1.87).
+- [x] FX_ACCOUNT_BALANCE sizing — live equity fix working ($299.41 used, 1 micro lot sizing). Added $300 fallback in workflow.
+- [x] "SQLITE-ONLY (broker auth failed)" was NOT a broker issue — caused by missing `exit_reason` column in paper_trades table. PRE step sync crashed on it. Column added to DB + schema.
+- [x] Unhandled _get_broker() exception at step 3 — wrapped in try/except.
+- [x] Double broker.disconnect() — execute_decisions now only disconnects if it created the broker.
 
-### Checks to run next session (verify 2026-07-26 changes):
-- [ ] FX Bot: scale-out at 1R — did any trade hit 1R and trigger 50% close + break-even stop?
-- [ ] FX Bot: swap cost tracking — check a live trade's calculated swap vs Capital.com dashboard
-- [ ] FX Bot: conversion fee deducted in P&L calc — compare calculated vs actual broker P&L
-- [ ] FX Bot: strategy 101 not generating signals anymore (killed in DB)
-- [ ] FX Bot: 3x daily schedule (07:00, 13:00, 22:00 UTC) — check GitHub Actions run history
-- [ ] FX Bot: shorts — did any pair below SMA-200 generate a short entry?
+### Verified from Jul 27 pipeline logs:
+- [x] FX Bot: scale-out at 1R — YES, USDCHF scaled out 50% at 1R (500k units closed, qty→500)
+- [x] FX Bot: shorts — YES, 3 short entries generated (EURUSD, EURGBP, NZDUSD) — vetoed by max positions
+- [x] FX Bot: strategy 101 PA signals — STILL generating (kill overwritten). Re-killed, will verify next run.
+- [x] FX Bot: live equity sizing — $299.41 equity used, 1 micro lot per trade (correct for $287 account)
+- [x] FX Bot: broker placing real trades — USDCHF + GBPJPY entries have broker_order_ids
+- [ ] FX Bot: 3x daily schedule (07:00, 13:00, 22:00 UTC) — only see 10:41 and 15:41 runs, need to verify 22:00
+- [ ] FX Bot: swap cost tracking — no closed long-held trade yet with swap breakdown
+- [ ] FX Bot: conversion fee — no closed non-USD trade with fee breakdown visible yet
 - [ ] Stock Bot: exit reconciliation — any "ATTEMPTED CUT — FILL FAILED" entries in trade log? Did force-close trigger?
 - [ ] Stock Bot: XLF/XLI churn stopped? No more buy-cut-buy-cut cycles?
 - [ ] Stock Bot: realized P&L trend — still bleeding or stabilizing after exit fix?
