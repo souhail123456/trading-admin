@@ -307,12 +307,19 @@ def generate_fx_signals(dry_run: bool = False, db_path: str | None = None) -> li
         log.info(f"  [{s['signal_type'].upper()}] {s['symbol']} @ {s['price_at_signal']} "
                  f"(strength: {s['full_state'].get('trend_strength', 'N/A')})")
 
-    log.info("\n--- FX Price Action Signals ---")
-    pa_sigs = fx_pa_signals(data, params=pa_params)
-    all_signals.extend(pa_sigs)
-    for s in pa_sigs:
-        log.info(f"  [{s['signal_type'].upper()}] {s['symbol']} @ {s['price_at_signal']} "
-                 f"(bull={s['full_state'].get('bull_score')}, bear={s['full_state'].get('bear_score')})")
+    pa_status = conn.execute(
+        "SELECT status FROM strategies WHERE id = ?", (FX_PA_STRATEGY_ID,)
+    ).fetchone()
+    if pa_status and pa_status["status"] == "killed":
+        log.info("\n--- FX Price Action Signals --- SKIPPED (strategy killed)")
+        pa_sigs = []
+    else:
+        log.info("\n--- FX Price Action Signals ---")
+        pa_sigs = fx_pa_signals(data, params=pa_params)
+        all_signals.extend(pa_sigs)
+        for s in pa_sigs:
+            log.info(f"  [{s['signal_type'].upper()}] {s['symbol']} @ {s['price_at_signal']} "
+                     f"(bull={s['full_state'].get('bull_score')}, bear={s['full_state'].get('bear_score')})")
 
     if not all_signals:
         log.info("\nNo FX signals today.")
