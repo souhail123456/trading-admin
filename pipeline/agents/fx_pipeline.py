@@ -122,7 +122,7 @@ def estimate_swap_cost(
     Capital.com formula:
       Long pays:  (base_rate + admin_fee) - (quote_rate - admin_fee) per day = net daily rate
       Short earns: reversed, but usually still costs due to admin markup
-    Notional value = qty_micro_lots * 1000 * entry_price (in quote currency), converted to USD.
+    Notional value = qty (raw units) * entry_price (in quote currency), converted to USD.
     Wednesday triples for Sat/Sun — every 7 calendar days adds 2 extra swap days.
 
     Returns estimated total swap cost (positive = you pay, negative = you earn).
@@ -140,7 +140,7 @@ def estimate_swap_cost(
         net_daily_rate = (quote_rate + _ADMIN_FEE) - (base_rate - _ADMIN_FEE)
 
     # Notional in quote currency, then convert to USD
-    notional_quote = qty_micro_lots * 1000 * entry_price
+    notional_quote = qty_micro_lots * entry_price
     if quote_ccy == "USD":
         notional_usd = notional_quote
     elif quote_ccy == "JPY":
@@ -182,14 +182,14 @@ def calculate_fx_pnl(
     Returns:
         P&L in USD (net of fees when days_held is provided).
 
-    Formula by pair type (qty is in micro-lots, * 1000 converts to units):
-      - USD-quote (EURUSD, GBPUSD, etc.):  diff * qty * 1000
-      - JPY crosses (GBPJPY, EURJPY, etc.): diff * qty * 1000 / USDJPY
-      - USD-base (USDCAD, USDCHF, USDJPY):  diff * qty * 1000 / exit_price
-      - Other crosses: diff * qty * 1000 (approximate, treated as USD-quote)
+    Formula by pair type (qty is in raw units as stored by Capital.com):
+      - USD-quote (EURUSD, GBPUSD, etc.):  diff * qty
+      - JPY crosses (GBPJPY, EURJPY, etc.): diff * qty / USDJPY
+      - USD-base (USDCAD, USDCHF, USDJPY):  diff * qty / exit_price
+      - Other crosses: diff * qty (approximate, treated as USD-quote)
     """
     price_diff = (exit_price - entry_price) if side == "long" else (entry_price - exit_price)
-    raw_pnl = price_diff * qty_micro_lots * 1000
+    raw_pnl = price_diff * qty_micro_lots
 
     if symbol in _JPY_CROSS_PAIRS:
         usdjpy = _get_usdjpy_rate(broker)
@@ -1024,7 +1024,7 @@ def execute_decisions(conn: sqlite3.Connection, decisions: list[dict], dry_run: 
                     (
                         d["strategy_id"], d.get("signal_id"),
                         d["symbol"], d["side"], fill_price,
-                        d["micro_lots"],
+                        d["micro_lots"] * 1000,
                         f"FX {d['strategy']}: {d['symbol']} @ {fill_price}",
                         d["risk_pct"],
                         broker_order_id,
