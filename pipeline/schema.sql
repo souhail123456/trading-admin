@@ -150,6 +150,7 @@ CREATE TABLE IF NOT EXISTS paper_trades (
     risk_veto_reason TEXT,
     opened_at       TEXT,
     closed_at       TEXT,
+    exit_reason     TEXT,
     created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
 );
 
