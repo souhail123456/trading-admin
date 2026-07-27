@@ -849,7 +849,7 @@ def check_correlation_guard(
     return True, "", 1.0
 
 
-def fx_risk_check(conn: sqlite3.Connection, signals: list[dict]) -> list[dict]:
+def fx_risk_check(conn: sqlite3.Connection, signals: list[dict], broker=None) -> list[dict]:
     """
     FX risk manager:
     - Max 3 positions total (regime-adjusted)
@@ -880,6 +880,17 @@ def fx_risk_check(conn: sqlite3.Connection, signals: list[dict]) -> list[dict]:
     if current_exp:
         exp_str = ", ".join(f"{c}:{v:+d}" for c, v in sorted(current_exp.items()) if v != 0)
         log.info(f"  Currency exposure: {exp_str}")
+
+    account_equity = ACCOUNT_BALANCE
+    if broker:
+        try:
+            acct = broker.get_account()
+            account_equity = acct.get("equity", ACCOUNT_BALANCE)
+            log.info(f"  Live account equity: ${account_equity:.2f}")
+        except Exception:
+            log.info(f"  Using fallback balance: ${ACCOUNT_BALANCE:.2f}")
+    else:
+        log.info(f"  Using env/default balance: ${ACCOUNT_BALANCE:.2f}")
 
     decisions = []
 
@@ -935,7 +946,7 @@ def fx_risk_check(conn: sqlite3.Connection, signals: list[dict]) -> list[dict]:
         # Position sizing: risk amount / (effective_stop_pips * pip_value)
         # Spread immediately puts us at a loss, so effective stop distance is narrower
         pip_value = 0.10  # approx for micro lot
-        risk_amount = ACCOUNT_BALANCE * MAX_RISK_PER_TRADE
+        risk_amount = account_equity * MAX_RISK_PER_TRADE
         spread_pips = TYPICAL_SPREADS_PIPS.get(symbol, 1.0)
         effective_stop_pips = max(stop_pips - spread_pips, 1.0)  # floor at 1 pip
         micro_lots = risk_amount / (effective_stop_pips * pip_value)
@@ -971,9 +982,10 @@ def fx_risk_check(conn: sqlite3.Connection, signals: list[dict]) -> list[dict]:
 # Execute
 # ---------------------------------------------------------------------------
 
-def execute_decisions(conn: sqlite3.Connection, decisions: list[dict], dry_run: bool = False):
+def execute_decisions(conn: sqlite3.Connection, decisions: list[dict], dry_run: bool = False, broker=None):
     """Execute approved decisions on DB and broker."""
-    broker = _get_broker() if not dry_run else None
+    if broker is None and not dry_run:
+        broker = _get_broker()
 
     for d in decisions:
         if not d["approved"]:
@@ -1559,8 +1571,9 @@ def run_daily(dry_run: bool = False, db_path: str | None = None):
 
     # Step 3: Risk check
     print("\n[3/6] Risk management...")
+    broker = _get_broker() if not dry_run else None
     if signals:
-        decisions = fx_risk_check(conn, signals)
+        decisions = fx_risk_check(conn, signals, broker=broker)
 
         approved = [d for d in decisions if d["approved"]]
         vetoed = [d for d in decisions if not d["approved"]]
@@ -1568,10 +1581,16 @@ def run_daily(dry_run: bool = False, db_path: str | None = None):
 
         # Step 4: Execute
         print("\n[4/6] Executing...")
-        execute_decisions(conn, decisions, dry_run=dry_run)
+        execute_decisions(conn, decisions, dry_run=dry_run, broker=broker)
     else:
         print("  No signals to evaluate.")
         print("\n[4/6] Nothing to execute.")
+
+    if broker:
+        try:
+            broker.disconnect()
+        except Exception:
+            pass
 
     # Step 5: Performance monitor
     print("\n[5/6] Performance check...")
