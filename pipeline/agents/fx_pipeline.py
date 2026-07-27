@@ -984,8 +984,10 @@ def fx_risk_check(conn: sqlite3.Connection, signals: list[dict], broker=None) ->
 
 def execute_decisions(conn: sqlite3.Connection, decisions: list[dict], dry_run: bool = False, broker=None):
     """Execute approved decisions on DB and broker."""
+    owns_broker = False
     if broker is None and not dry_run:
         broker = _get_broker()
+        owns_broker = True
 
     for d in decisions:
         if not d["approved"]:
@@ -1086,7 +1088,7 @@ def execute_decisions(conn: sqlite3.Connection, decisions: list[dict], dry_run: 
                     if broker:
                         _close_broker_position(broker, d["symbol"], trade.get("broker_order_id"))
 
-    if broker:
+    if owns_broker and broker:
         broker.disconnect()
 
 
@@ -1571,7 +1573,13 @@ def run_daily(dry_run: bool = False, db_path: str | None = None):
 
     # Step 3: Risk check
     print("\n[3/6] Risk management...")
-    broker = _get_broker() if not dry_run else None
+    broker = None
+    if not dry_run:
+        try:
+            broker = _get_broker()
+        except Exception as e:
+            log.warning(f"Broker unavailable for risk check: {e}")
+            print(f"  Broker unavailable — sizing from env/default balance")
     if signals:
         decisions = fx_risk_check(conn, signals, broker=broker)
 
