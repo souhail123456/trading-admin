@@ -29,9 +29,9 @@
   "regime": "TRENDING",
   "alerts": [],
   "service_status": {
-    "timestamp": "2026-07-24T20:02:25Z"
+    "timestamp": "2026-07-27T10:42:17Z"
   },
-  "vix": 18.829999923706055,
+  "vix": 17.600000381469727,
   "recommendations": {
     "100": {
       "action": "ACTIVE",
@@ -42,14 +42,14 @@
       "reason": "Trending with PA confirmation"
     }
   },
-  "updated": "2026-07-24T20:02:31Z",
+  "updated": "2026-07-27T10:42:35Z",
   "cross_bot_risk": {
-    "total_positions": 8,
-    "total_exposure": 453239.98,
+    "total_positions": 7,
+    "total_exposure": 235750.76,
     "by_bot": {
       "fx": {
-        "count": 3,
-        "total_value": 379649.44
+        "count": 2,
+        "total_value": 162160.22
       },
       "stock": {
         "count": 5,
@@ -60,6 +60,6 @@
     "flags": [
       "HIGH_TOTAL_EXPOSURE"
     ],
-    "computed_at": "2026-07-24T20:02:36Z"
+    "computed_at": "2026-07-27T10:42:56Z"
   }
 }
