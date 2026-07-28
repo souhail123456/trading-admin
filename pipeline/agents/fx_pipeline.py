@@ -37,7 +37,7 @@ log = logging.getLogger(__name__)
 ACCOUNT_BALANCE = float(os.environ.get("FX_ACCOUNT_BALANCE", "10000"))
 LEVERAGE = float(os.environ.get("FX_LEVERAGE", "500"))
 MAX_RISK_PER_TRADE = 0.04  # 4% per trade (demo account, $295 balance)
-MAX_POSITIONS = 3
+MAX_POSITIONS = 5
 
 # Strategy IDs
 TREND_STRATEGY_ID = 100
@@ -48,10 +48,11 @@ _DEFAULT_TREND_PARAMS = {"stop_loss_pips": 80, "take_profit_pips": 240, "max_hol
 _DEFAULT_PA_PARAMS = {"stop_loss_pips": 40, "max_hold_days": 15, "stop_loss_pct": 0.03}
 
 # Safety net: trend positions without explicit max_hold get closed after this many days
-TREND_SAFETY_MAX_HOLD = 90
+TREND_SAFETY_MAX_HOLD = 30
+TAKE_PROFIT_ATR_MULT = 3.0  # close at 3R profit (3x ATR from entry)
 
 # Regime-aware limits
-RANGING_MAX_TREND_POSITIONS = 2  # allow 2 trend positions in ranging (was 1 — too restrictive, bot never traded)
+RANGING_MAX_TREND_POSITIONS = 3  # capped in ranging regime
 VOLATILE_ATR_MULTIPLIER = 1.5   # tighter stops in volatile (vs 2.0 normal)
 NORMAL_ATR_MULTIPLIER = 2.0
 RANGING_MIN_COMPOSITE_SCORE = 0.05  # composite is ~0.03-0.15 scale (strength*0.7 + carry/10*0.3)
@@ -604,13 +605,17 @@ def monitor_positions(conn: sqlite3.Connection, broker=None, dry_run: bool = Fal
                         deal_id = t.get("broker_order_id")
                         current_broker_stop = broker_stop_levels.get(deal_id)
                         trade_id = t["id"]
-                        # Check if this position has already been scaled out (50% partial close at 1R)
                         already_scaled = (
                             trade_id in _scaled_out_ids
                             or "[SCALED]" in (t.get("thesis") or "")
                         )
-                        if side == "long":
-                            unrealized = current - entry
+                        unrealized = (current - entry) if side == "long" else (entry - current)
+                        # Take-profit at 3R — lock in big winners
+                        if unrealized >= TAKE_PROFIT_ATR_MULT * atr:
+                            should_close = True
+                            close_reason = (f"Take profit at {TAKE_PROFIT_ATR_MULT:.0f}R "
+                                            f"(unrealized={unrealized:+.5f}, {TAKE_PROFIT_ATR_MULT:.0f}xATR={TAKE_PROFIT_ATR_MULT*atr:.5f})")
+                        elif side == "long":
                             if unrealized >= atr_multiplier * atr:
                                 # Profit trail: lock in at current - 1x ATR
                                 effective_stop = current - atr
@@ -664,9 +669,7 @@ def monitor_positions(conn: sqlite3.Connection, broker=None, dry_run: bool = Fal
                                     log.info(f"  [TRAIL] {t['symbol']}: ATR={atr:.5f}, "
                                              f"unrealized={unrealized:+.5f}, initial stop @ {effective_stop:.5f}")
                                     _try_update_broker_stop(broker, deal_id, effective_stop, t["symbol"], current_broker_stop)
-                        else:
-                            # Short position: mirror logic
-                            unrealized = entry - current
+                        elif side == "short":
                             if unrealized >= atr_multiplier * atr:
                                 effective_stop = current + atr
                                 if current >= effective_stop:
