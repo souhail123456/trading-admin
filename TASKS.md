@@ -28,25 +28,30 @@
 - [x] Asset Class TF workflow — verified, cron fires days 1-3 Mon-Fri with Alpaca calendar guard
 - [x] Sector Momentum workflow — verified, cron fires days 1-7 with Alpaca calendar guard
 - [x] Weather Bot cache poison — fixed, isolated cache namespaces per bot
+- [x] Weather Bot filters loosened — min_edge 12%→8%, min_no_entry $0.50→$0.35, timeout 15→30s. First run: 6 trades placed.
+- [x] FX Bot: max positions 3→5, take-profit at 3R, max hold 90→30 days. First run: USDJPY closed at 3R TP (+$9.77), 2 new entries (USDJPY long, EURGBP short — first short ever). Realized $20.40.
+- [x] Stock Bot anti-churn overhaul: killed SMA-20 time-based cut, 3% trend strength + positive momentum entry filter, auto profit-taking at +15%/+25%, removed XLI/XLV from universe, 3-day position age protection.
+- [x] .gitignore: added *.db-shm, *.db-wal, trading.db to both repos
 
 ### Still to verify (carry forward):
 - [ ] FX Bot: swap cost tracking — no closed long-held trade yet with swap breakdown
 - [ ] FX Bot: conversion fee — no closed non-USD trade with fee breakdown visible yet
-- [ ] Stock Bot: exit reconciliation — any "ATTEMPTED CUT — FILL FAILED" entries?
-- [ ] Stock Bot: XLF/XLI churn stopped? (looks stable so far)
-- [ ] Stock Bot: realized P&L trend — bleeding or stabilizing?
-- [ ] Weather Bot: first post-fix trades appearing? Kelly sizing correct?
-- [ ] Weather Bot: YES-side win rate improving with min_edge 0.15?
-- [ ] Weather Bot: max_position_usd ($12) capping trade sizes?
+- [ ] FX Bot: EURGBP short — first short trade, monitor performance
+- [ ] Stock Bot: churn actually stopped? Monitor next week's buy/sell ratio
+- [ ] Stock Bot: profit-taking triggering? AAPL is +4.5%, watch for +15% half-take
+- [ ] Stock Bot: realized P&L trend — still -$2,618, should stabilize now
+- [ ] Weather Bot: 6 trades placed — check resolution, WR, P&L
+- [ ] Weather Bot: YES-side win rate with min_edge 0.15?
 - [ ] Asset Class TF: Aug 3 first run — workflow fires, script runs, state committed?
 - [ ] Sector Momentum: Aug 3 first run — rankings computed, orders placed?
 - [ ] Dashboard: accessible and showing correct data?
 
 ### Decision dates:
 - **Aug 3:** Asset Class TF + Sector Momentum — first run (Aug 1 is Saturday). Verify execution only.
-- **Aug 5:** Weather Bot — first few days of post-fix trades. Are trades being placed? Kelly sizes reasonable?
-- **Aug 15:** Stock Bot — realized P&L trend after exit fix.
-- **Aug 15:** FX Bot — 5-10 completed trades. Shorts profitable? Scale-out working? Fees matching?
+- **Aug 5:** Weather Bot — first post-fix trades resolving. WR + P&L trend.
+- **Aug 5:** Stock Bot — has churn stopped? Buy/sell ratio closer to 1:1?
+- **Aug 15:** FX Bot — 5-10 completed trades. 3R TP working? Shorts profitable? Fees matching?
+- **Aug 15:** Stock Bot — realized P&L recovering from -$2,618?
 - **Nov 1:** Asset Class TF + Sector Momentum — 3 rebalances done. Compare vs backtest (target Sharpe ~2.12, MaxDD -6.5%).
 
 ### USER ACTION NEEDED:
