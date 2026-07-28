@@ -34,6 +34,23 @@ log = logging.getLogger(__name__)
 
 PORTFOLIO_VALUE = 100_000  # starting paper portfolio
 
+# FX pair detection — 6-char all-alpha symbols like GBPJPY, EURUSD
+_FX_PAIR_RE = __import__("re").compile(r"^[A-Z]{6}$")
+
+
+def _is_fx_pair(symbol: str) -> bool:
+    return bool(_FX_PAIR_RE.match(symbol))
+
+
+def _calc_pnl(symbol: str, side: str, entry_price: float, exit_price: float, quantity: float) -> float:
+    """Calculate PnL, using FX-aware formula for currency pairs."""
+    if _is_fx_pair(symbol):
+        from pipeline.agents.fx_pipeline import calculate_fx_pnl
+        return calculate_fx_pnl(symbol, side, entry_price, exit_price, quantity)
+    # Stocks / ETFs: simple price diff * quantity
+    diff = (exit_price - entry_price) if side == "long" else (entry_price - exit_price)
+    return diff * quantity
+
 
 def _get_broker():
     """Get Alpaca broker if API keys are set, else None (SQLite-only mode)."""
@@ -86,7 +103,8 @@ def monitor_positions(conn: sqlite3.Connection, dry_run: bool = False) -> list[d
         take_profit = trade["take_profit"]
         quantity = trade["quantity"]
 
-        pnl = (current_price - entry_price) * quantity
+        side = trade.get("side", "long")
+        pnl = _calc_pnl(symbol, side, entry_price, current_price, quantity)
         pnl_pct = (current_price - entry_price) / entry_price * 100
         r_multiple = (current_price - entry_price) / (entry_price - stop_loss) if entry_price != stop_loss else 0
 
@@ -145,7 +163,7 @@ def monitor_positions(conn: sqlite3.Connection, dry_run: bool = False) -> list[d
                 "trade_id": trade["id"],
                 "symbol": symbol,
                 "action": "exit_signal",
-                "pnl": round((current_price - trade["entry_price"]) * trade["quantity"], 2),
+                "pnl": round(_calc_pnl(symbol, trade.get("side", "long"), trade["entry_price"], current_price, trade["quantity"]), 2),
             })
 
     log_agent_action(
@@ -166,8 +184,9 @@ def close_trade(conn: sqlite3.Connection, trade: dict, exit_price: float, reason
     entry_price = trade["entry_price"]
     quantity = trade["quantity"]
     stop_loss = trade["stop_loss"]
+    side = trade.get("side", "long")
 
-    pnl = (exit_price - entry_price) * quantity
+    pnl = _calc_pnl(trade["symbol"], side, entry_price, exit_price, quantity)
     r_multiple = (exit_price - entry_price) / (entry_price - stop_loss) if entry_price != stop_loss else 0
 
     conn.execute(
@@ -206,7 +225,8 @@ def portfolio_status(conn: sqlite3.Connection) -> dict:
     for trade in open_trades:
         current_price = get_latest_price(trade["symbol"])
         if current_price:
-            upnl = (current_price - trade["entry_price"]) * trade["quantity"]
+            side = trade.get("side", "long")
+            upnl = _calc_pnl(trade["symbol"], side, trade["entry_price"], current_price, trade["quantity"])
             unrealized_pnl += upnl
             positions.append({
                 "symbol": trade["symbol"],
