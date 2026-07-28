@@ -11,3 +11,5 @@ pipeline.db
 data/pipeline.db-shm
 data/pipeline.db-wal
 data/pipeline.db
+*.db-shm
+*.db-wal
