@@ -26,7 +26,23 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
     schema = SCHEMA_PATH.read_text()
     conn.executescript(schema)
     _seed_fx_strategies(conn)
+    _apply_pnl_corrections(conn)
     return conn
+
+
+PNL_CORRECTIONS: dict[int, float] = {
+    8: 6.90,  # GBPJPY trade — was 3314.84 (raw JPY, not USD)
+}
+
+
+def _apply_pnl_corrections(conn: sqlite3.Connection) -> None:
+    """One-time PnL corrections for trades with known inflated values."""
+    for trade_id, correct_pnl in PNL_CORRECTIONS.items():
+        conn.execute(
+            "UPDATE paper_trades SET pnl = ? WHERE id = ? AND pnl != ?",
+            (correct_pnl, trade_id, correct_pnl),
+        )
+    conn.commit()
 
 
 
