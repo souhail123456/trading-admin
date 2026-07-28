@@ -1,61 +1,53 @@
 # Trading System — Task List
 
-> **Last updated: 2026-07-26**
+> **Last updated: 2026-07-28**
 > Read this FIRST every session. This is the single source of truth for what's done, what's open, and what happened last.
 
 ---
 
-## Last Session Recap (2026-07-26)
+## Last Session Recap (2026-07-28)
 
 ### What was built/fixed:
-- **FX Bot (10 improvements):** TP broker sync, short entries, 3x daily schedule, scale-out at 1R (50% close + break-even stop), per-pair ADX regime, Telegram perf alerts, fee tracking (swap costs, 0.70% conversion fee, spread-adjusted sizing)
-- **FX Bot PA strategy killed:** Strategy 101 backtested at Sharpe -1.08. Bugs fixed (center=True lookahead, bear_score gate, doji) but still unprofitable. Status set to "killed" in DB.
-- **Weather Bot:** Per-side Kelly sizing (YES: 0.06, NO: 0.12), wired max_position_usd ($12 cap), raised min_edge_yes to 0.15
-- **Stock Bot exit fix:** Fill verification, reconciliation (force-close after 2+ failed cuts), Telegram escalation for manual intervention
-- **Stock Bot new strategies:** Asset Class TF (strategy 18, 5 ETFs, SMA-200) and Sector Momentum (strategy 5, top 3 of 10 SPDR sectors). Both have ownership ledgers to prevent cross-strategy conflicts. GitHub Actions workflows fire 1st trading day of month.
-- **Dashboard:** Summary cards, per-bot P&L, inline SVG equity curve, risk section, dark theme
+- **PA strategy 101 permanently killed** (3-layer fix): hardcoded KILLED_STRATEGIES dict in db.py enforced on every init, code-level block in signal generator, regime detector marks killed strategies. Root cause: no code path ever set status='killed', two divergent DBs (data/ vs shared/), seed function overwrote status on every run.
+- **FX PnL inflation fixed**: paper_executor.py used raw `(exit-entry)*qty` for all pairs — for JPY crosses this gives PnL in JPY (~150x inflated). Added `_calc_pnl()` helper that routes FX pairs through `calculate_fx_pnl`. Trade 8 corrected: $3,314 → $6.90. Total realized: $10.63.
+- **Weather bot bankroll poison fixed**: GitHub Actions cache was restoring old pre-reset trades (-$117) over the clean bankroll, keeping it at -$17 (all Kelly sizes = $0). Isolated cache namespaces per bot (weather-logs-v2-, ev-logs-v2-, etc.).
+- **8 orphaned trades cleaned** from pipeline.db (duplicate qty=1 entries from early runs).
 
-### Current state (Jul 27):
-- FX Bot: 2 open trades — USDJPY long @161.756 (Jul 10), USDCHF long @0.81869 (Jul 27). Realized P&L: $8.61 (2 closed). Trailing stop active on USDJPY @163.05.
-- Stock Bot: holding AAPL, AMZN, GOOGL, QQQ, SPY, XLE. Churn loop fix deployed (May). Exit fix deployed (Jul 26).
-- Weather Bot: running with per-side Kelly fix. Bankroll reset Jul 26.
-- Events Bot: running every 30 min, batched LLM + Gemini search live
-- New strategies: Asset Class TF + Sector Momentum ready, first run Aug 1
+### Current state (Jul 28):
+- FX Bot: 3 open trades — USDJPY long @161.756 (Jul 10), USDCHF long @0.81869 (Jul 27), GBPJPY long @217.779 (Jul 28). Realized P&L: $10.63 (3 closed). Regime: TRENDING (ADX 25.2).
+- Stock Bot: equity $100,284. Holding AAPL (+$1,384), SPY (+$97), XLE (+$1,201), XLF (+$315), XLI (-$71). Unrealized: +$2,926. No churn on XLF/XLI.
+- Weather Bot: was silenced by cache poison since Jul 26. Fix pushed — should start placing trades on next run.
+- Events Bot: paused (intentional, 10% WR)
+- New strategies: Asset Class TF + Sector Momentum ready. Aug 1 is Saturday → first run Mon Aug 3.
 
-### Bugs found & fixed (Jul 27):
-- [x] PA strategy 101 still generating signals — kill was overwritten by pipeline DB commit. Re-killed, pushed.
-- [x] PnL inflated 1000x — morning run used old code (before fix pushed). Trade 8 corrected: $3,314 → $6.74. Trade 10 used correct formula ($1.87).
-- [x] FX_ACCOUNT_BALANCE sizing — live equity fix working ($299.41 used, 1 micro lot sizing). Added $300 fallback in workflow.
-- [x] "SQLITE-ONLY (broker auth failed)" was NOT a broker issue — caused by missing `exit_reason` column in paper_trades table. PRE step sync crashed on it. Column added to DB + schema.
-- [x] Unhandled _get_broker() exception at step 3 — wrapped in try/except.
-- [x] Double broker.disconnect() — execute_decisions now only disconnects if it created the broker.
+### Verified (Jul 28):
+- [x] FX Bot: 3x daily schedule — 07:00, 13:00, 22:00 UTC confirmed in workflow YAML. Runs at 09:36/15:20 are normal GHA delay. 22:00 run should fire tonight.
+- [x] FX Bot: PA strategy 101 — permanently killed with 3-layer defense (code + DB + regime)
+- [x] FX Bot: PnL formula — fixed for all FX pairs (JPY cross conversion)
+- [x] FX Bot: orphaned trades — 8 deleted, 6 clean trades remain
+- [x] Asset Class TF workflow — verified, cron fires days 1-3 Mon-Fri with Alpaca calendar guard
+- [x] Sector Momentum workflow — verified, cron fires days 1-7 with Alpaca calendar guard
+- [x] Weather Bot cache poison — fixed, isolated cache namespaces per bot
 
-### Verified from Jul 27 pipeline logs:
-- [x] FX Bot: scale-out at 1R — YES, USDCHF scaled out 50% at 1R (500k units closed, qty→500)
-- [x] FX Bot: shorts — YES, 3 short entries generated (EURUSD, EURGBP, NZDUSD) — vetoed by max positions
-- [x] FX Bot: strategy 101 PA signals — STILL generating (kill overwritten). Re-killed, will verify next run.
-- [x] FX Bot: live equity sizing — $299.41 equity used, 1 micro lot per trade (correct for $287 account)
-- [x] FX Bot: broker placing real trades — USDCHF + GBPJPY entries have broker_order_ids
-- [ ] FX Bot: 3x daily schedule (07:00, 13:00, 22:00 UTC) — only see 10:41 and 15:41 runs, need to verify 22:00
+### Still to verify (carry forward):
 - [ ] FX Bot: swap cost tracking — no closed long-held trade yet with swap breakdown
 - [ ] FX Bot: conversion fee — no closed non-USD trade with fee breakdown visible yet
-- [ ] Stock Bot: exit reconciliation — any "ATTEMPTED CUT — FILL FAILED" entries in trade log? Did force-close trigger?
-- [ ] Stock Bot: XLF/XLI churn stopped? No more buy-cut-buy-cut cycles?
-- [ ] Stock Bot: realized P&L trend — still bleeding or stabilizing after exit fix?
-- [ ] Weather Bot: bankroll reset to $100 clean slate (Jul 26). First post-fix trades should appear within hours.
-- [ ] Weather Bot: YES-side win rate improving with min_edge 0.15 and Kelly 0.06?
-- [ ] Weather Bot: max_position_usd ($12) actually capping trade sizes?
-- [ ] Weather Bot: compare post-fix P&L vs pre-fix baseline (-$117 on 430 trades, 62% WR)
-- [ ] Asset Class TF: Aug 1 first run — workflow triggers, script runs, state file committed?
-- [ ] Sector Momentum: Aug 1 first run — workflow triggers, rankings computed, orders placed?
-- [ ] Dashboard: accessible and showing correct data for all bots?
+- [ ] Stock Bot: exit reconciliation — any "ATTEMPTED CUT — FILL FAILED" entries?
+- [ ] Stock Bot: XLF/XLI churn stopped? (looks stable so far)
+- [ ] Stock Bot: realized P&L trend — bleeding or stabilizing?
+- [ ] Weather Bot: first post-fix trades appearing? Kelly sizing correct?
+- [ ] Weather Bot: YES-side win rate improving with min_edge 0.15?
+- [ ] Weather Bot: max_position_usd ($12) capping trade sizes?
+- [ ] Asset Class TF: Aug 3 first run — workflow fires, script runs, state committed?
+- [ ] Sector Momentum: Aug 3 first run — rankings computed, orders placed?
+- [ ] Dashboard: accessible and showing correct data?
 
-### Decision dates — judge if changes are positive or negative:
-- **Aug 1:** Weather Bot — compare YES WR + P&L vs pre-fix. If still losing on YES, revert or tighten edge floor further.
-- **Aug 1:** Stock Bot — is realized P&L stabilizing or still bleeding? If still losing, dig deeper into exit logic.
-- **Aug 1:** Asset Class TF + Sector Momentum — first run. Just verify execution, too early to judge performance.
-- **Aug 15:** FX Bot — 5-10 completed trades. Are shorts profitable? Did scale-out improve risk-adjusted returns? Are fee calcs matching Capital.com?
-- **Nov 1:** Asset Class TF + Sector Momentum — 3 monthly rebalances done. Compare actual Sharpe/drawdown vs backtest (target: combined Sharpe ~2.12, MaxDD -6.5%).
+### Decision dates:
+- **Aug 3:** Asset Class TF + Sector Momentum — first run (Aug 1 is Saturday). Verify execution only.
+- **Aug 5:** Weather Bot — first few days of post-fix trades. Are trades being placed? Kelly sizes reasonable?
+- **Aug 15:** Stock Bot — realized P&L trend after exit fix.
+- **Aug 15:** FX Bot — 5-10 completed trades. Shorts profitable? Scale-out working? Fees matching?
+- **Nov 1:** Asset Class TF + Sector Momentum — 3 rebalances done. Compare vs backtest (target Sharpe ~2.12, MaxDD -6.5%).
 
 ### USER ACTION NEEDED:
 - [ ] **Create Telegram channel** for centralized bot logs — name it "Trading Bot Logs", add @TradingAdmin_togo_bot as admin. Give the channel name/ID to Claude so all 3 bots get wired to post there.
@@ -120,6 +112,11 @@
 - [x] Stock Bot: GitHub Actions workflows for both new strategies — 2026-07-26
 - [x] Dashboard: upgraded with summary cards, equity curve, risk section — 2026-07-26
 - [x] Backtests: FX strategies 100/101 results stored in shared/pipeline.db — 2026-07-26
+- [x] PA strategy 101 permanently killed (3-layer: code + DB + regime) — 2026-07-28
+- [x] FX PnL inflation fixed (JPY cross conversion in paper_executor) — 2026-07-28
+- [x] Weather bot cache poison fixed (isolated cache namespaces per bot) — 2026-07-28
+- [x] Orphaned trades cleaned (8 deleted from pipeline.db) — 2026-07-28
+- [x] 3x daily FX schedule + Aug 1 workflows verified — 2026-07-28
 - [x] Events Bot: bankroll floor + max 15 markets per scan — 2026-05-04
 - [x] Events Bot: live crypto prices, market categories, LLM calibration — 2026-05-04
 - [x] Events Bot: batch LLM calls (~80% token savings) — 2026-05-04
