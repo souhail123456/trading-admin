@@ -27,7 +27,7 @@ from datetime import datetime, timedelta, timezone
 import numpy as np
 import requests
 
-from pipeline.db import init_db, log_agent_action
+from pipeline.db import init_db, log_agent_action, KILLED_STRATEGIES
 
 logging.basicConfig(
     level=logging.INFO,
@@ -205,6 +205,15 @@ def run_monitor(strategy_id: int | None = None, db_path: str | None = None) -> l
     print(f"{'='*70}")
 
     for sid in strategy_ids:
+        if sid in KILLED_STRATEGIES:
+            name = BACKTEST_BENCHMARKS.get(sid, {}).get("name", f"Strategy {sid}")
+            print(f"\n  [{sid}] {name} — KILLED ({KILLED_STRATEGIES[sid]})")
+            results.append({
+                "strategy_id": sid, "name": name, "status": "killed",
+                "total_trades": 0, "open_positions": 0, "alerts": [],
+            })
+            continue
+
         r = analyze_strategy(conn, sid)
         results.append(r)
 

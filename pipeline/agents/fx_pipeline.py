@@ -1518,6 +1518,8 @@ def run_daily(dry_run: bool = False, db_path: str | None = None):
                 paused_strategies.add(sid)
             elif action == "REDUCE":
                 reduced_strategies.add(sid)
+            elif action == "KILLED":
+                paused_strategies.add(sid)  # treat killed same as paused
 
         log_agent_action(conn, "regime_detector", "regime_classified", outputs=regime_result)
     except Exception as e:

@@ -17,7 +17,7 @@ from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
 
-from pipeline.db import init_db, log_agent_action, get_strategy_params
+from pipeline.db import init_db, log_agent_action, get_strategy_params, KILLED_STRATEGIES
 from pipeline.agents.data_fetcher import fetch_ohlcv, CURRENCY_PAIRS
 from pipeline.agents.price_action import detect_all_patterns
 
@@ -30,6 +30,10 @@ log = logging.getLogger(__name__)
 # Strategy IDs
 FX_TREND_STRATEGY_ID = 100
 FX_PA_STRATEGY_ID = 101
+
+# Belt-and-suspenders: strategies killed in code, checked BEFORE any DB lookup.
+# This is a secondary check — KILLED_STRATEGIES in db.py is the primary source.
+KILLED_STRATEGY_IDS: set[int] = set(KILLED_STRATEGIES.keys())
 
 # ---------------------------------------------------------------------------
 # Carry trade overlay — central bank policy rates (updated manually)
@@ -307,11 +311,18 @@ def generate_fx_signals(dry_run: bool = False, db_path: str | None = None) -> li
         log.info(f"  [{s['signal_type'].upper()}] {s['symbol']} @ {s['price_at_signal']} "
                  f"(strength: {s['full_state'].get('trend_strength', 'N/A')})")
 
-    pa_status = conn.execute(
-        "SELECT status FROM strategies WHERE id = ?", (FX_PA_STRATEGY_ID,)
-    ).fetchone()
-    if pa_status and pa_status["status"] == "killed":
-        log.info("\n--- FX Price Action Signals --- SKIPPED (strategy killed)")
+    # Check if PA strategy is killed — code-level check first (survives DB resets),
+    # then DB check as fallback for strategies killed at runtime
+    pa_killed = FX_PA_STRATEGY_ID in KILLED_STRATEGY_IDS
+    if not pa_killed:
+        pa_status = conn.execute(
+            "SELECT status FROM strategies WHERE id = ?", (FX_PA_STRATEGY_ID,)
+        ).fetchone()
+        pa_killed = pa_status and pa_status["status"] == "killed"
+
+    if pa_killed:
+        kill_reason = KILLED_STRATEGIES.get(FX_PA_STRATEGY_ID, "killed in DB")
+        log.info(f"\n--- FX Price Action Signals --- SKIPPED (strategy killed: {kill_reason})")
         pa_sigs = []
     else:
         log.info("\n--- FX Price Action Signals ---")

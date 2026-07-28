@@ -25,7 +25,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
-from pipeline.db import init_db, log_agent_action
+from pipeline.db import init_db, log_agent_action, KILLED_STRATEGIES
 
 logging.basicConfig(
     level=logging.INFO,
@@ -221,6 +221,11 @@ def classify_regime(vix: float | None, fx_adx: dict[str, float]) -> dict:
             100: {"action": "ACTIVE", "reason": "Trending market — ideal for trend strategy"},
             101: {"action": "ACTIVE", "reason": "Trending with PA confirmation"},
         }
+
+    # Override recommendations for permanently killed strategies
+    for sid, kill_reason in KILLED_STRATEGIES.items():
+        if sid in recommendations:
+            recommendations[sid] = {"action": "KILLED", "reason": kill_reason}
 
     return {
         "regime": global_regime,

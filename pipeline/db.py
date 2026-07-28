@@ -29,8 +29,24 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
     return conn
 
 
+
+# ---------------------------------------------------------------------------
+# Permanent kill list — strategies killed by backtest or live performance.
+# This is the AUTHORITATIVE source of truth. DB status is enforced from here
+# on every init_db() call, so kills survive cache resets, DB copies, and
+# manual edits. To revive a strategy, remove it from this dict.
+# ---------------------------------------------------------------------------
+KILLED_STRATEGIES: dict[int, str] = {
+    101: "Sharpe -1.08 in backtest — PA strategy permanently killed 2026-07",
+}
+
+
 def _seed_fx_strategies(conn: sqlite3.Connection) -> None:
-    """Ensure FX strategy rows exist (IDs 100, 101) with validated parameters."""
+    """Ensure FX strategy rows exist (IDs 100, 101) with validated parameters.
+
+    Killed strategies (listed in KILLED_STRATEGIES) have their status forced
+    to 'killed' on every call, and their parameters are NOT updated.
+    """
     strategies = [
         {
             "id": 100,
@@ -64,16 +80,59 @@ def _seed_fx_strategies(conn: sqlite3.Connection) -> None:
     ]
 
     for s in strategies:
-        existing = conn.execute("SELECT id FROM strategies WHERE id = ?", (s["id"],)).fetchone()
+        sid = s["id"]
+        is_killed = sid in KILLED_STRATEGIES
+
+        existing = conn.execute(
+            "SELECT id, status FROM strategies WHERE id = ?", (sid,)
+        ).fetchone()
+
         if not existing:
+            status = "killed" if is_killed else "paper_trading"
             conn.execute(
-                """INSERT INTO strategies (id, name, status, entry_rule, exit_rule, asset_universe, parameters)
-                   VALUES (?, ?, 'paper_trading', ?, ?, ?, ?)""",
-                (s["id"], s["name"], s["entry_rule"], s["exit_rule"], s["universe"], s["parameters"]),
+                """INSERT INTO strategies
+                   (id, name, status, entry_rule, exit_rule, asset_universe, parameters,
+                    killed_at, kill_reason)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (sid, s["name"], status, s["entry_rule"], s["exit_rule"],
+                 s["universe"], s["parameters"],
+                 datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if is_killed else None,
+                 KILLED_STRATEGIES.get(sid)),
             )
         else:
-            # Always sync parameters to ensure correct keys
-            conn.execute("UPDATE strategies SET parameters = ? WHERE id = ?", (s["parameters"], s["id"]))
+            current_status = dict(existing)["status"]
+
+            if is_killed and current_status != "killed":
+                # Enforce the kill — strategy is in KILLED_STRATEGIES but DB
+                # doesn't reflect it (cache restored old state, manual edit, etc.)
+                conn.execute(
+                    """UPDATE strategies
+                       SET status = 'killed',
+                           killed_at = ?,
+                           kill_reason = ?
+                       WHERE id = ?""",
+                    (datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                     KILLED_STRATEGIES[sid], sid),
+                )
+                # Record in kill_log (idempotent — only insert if not already there)
+                has_log = conn.execute(
+                    "SELECT 1 FROM kill_log WHERE strategy_id = ? LIMIT 1", (sid,)
+                ).fetchone()
+                if not has_log:
+                    conn.execute(
+                        """INSERT INTO kill_log
+                           (strategy_id, phase, criterion, details)
+                           VALUES (?, 'paper_trading', 'backtest_sharpe', ?)""",
+                        (sid, KILLED_STRATEGIES[sid]),
+                    )
+
+            if not is_killed:
+                # Only sync parameters for LIVE strategies — dead ones are frozen
+                conn.execute(
+                    "UPDATE strategies SET parameters = ? WHERE id = ?",
+                    (s["parameters"], sid),
+                )
+
     conn.commit()
 
 
