@@ -1132,6 +1132,7 @@ def reconcile_broker_vs_db(conn: sqlite3.Connection, broker) -> list[str]:
 
     Returns list of mismatch descriptions (empty = all synced).
     Actions:
+      - Deal ID mismatch (same symbol+side) -> UPDATE broker_order_id in DB
       - Broker position missing from DB -> INSERT into paper_trades, log warning
       - DB position missing from broker -> UPDATE status='orphaned', log warning
     Sends Telegram alert on any mismatch.
@@ -1150,53 +1151,92 @@ def reconcile_broker_vs_db(conn: sqlite3.Connection, broker) -> list[str]:
         "FROM paper_trades WHERE status='open' AND strategy_id IN (100, 101)"
     ).fetchall()
 
-    # Build lookup sets
     db_deal_ids = {}
+    db_by_sym_side: dict[tuple[str, str], dict] = {}
     for row in db_open:
         r = dict(row)
         if r.get("broker_order_id"):
             db_deal_ids[r["broker_order_id"]] = r
+        key = (r["symbol"], r["side"])
+        db_by_sym_side[key] = r
 
     broker_deal_ids = {bp["deal_id"] for bp in broker_positions}
+    broker_by_sym_side: dict[tuple[str, str], dict] = {}
+    for bp in broker_positions:
+        epic = bp["epic"].upper().replace("/", "")
+        side = "long" if bp["direction"] == "BUY" else "short"
+        broker_by_sym_side[(epic, side)] = bp
 
     now_str = datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    # 1) Broker position missing from DB -> INSERT
+    # Phase 0: fix deal ID mismatches — same symbol+side on both sides but
+    # different deal IDs (Capital.com confirm vs position endpoint mismatch)
+    matched_broker_deals: set[str] = set()
+    matched_db_deals: set[str] = set()
+    for (sym, side), db_row in db_by_sym_side.items():
+        bp = broker_by_sym_side.get((sym, side))
+        if not bp:
+            continue
+        db_deal = db_row.get("broker_order_id", "")
+        broker_deal = bp["deal_id"]
+        if db_deal == broker_deal:
+            matched_broker_deals.add(broker_deal)
+            matched_db_deals.add(db_deal)
+            continue
+        # Same position, different deal ID — update DB to match broker
+        conn.execute(
+            "UPDATE paper_trades SET broker_order_id = ? WHERE id = ?",
+            (broker_deal, db_row["id"]),
+        )
+        conn.commit()
+        msg = (f"RECON: Updated deal ID for {sym} {side} "
+               f"(id={db_row['id']}): {db_deal[:12]}… → {broker_deal[:12]}…")
+        log.info(msg)
+        matched_broker_deals.add(broker_deal)
+        matched_db_deals.add(db_deal)
+
+    # 1) Broker position missing from DB (skip already-matched)
     for bp in broker_positions:
-        if bp["deal_id"] not in db_deal_ids:
-            epic = bp["epic"].upper().replace("/", "")
-            side = "long" if bp["direction"] == "BUY" else "short"
-            msg = (f"RECON: Broker position {epic} (deal={bp['deal_id']}) "
-                   f"missing from DB — inserting")
-            log.warning(msg)
-            mismatches.append(msg)
+        if bp["deal_id"] in matched_broker_deals:
+            continue
+        if bp["deal_id"] in db_deal_ids:
+            continue
+        epic = bp["epic"].upper().replace("/", "")
+        side = "long" if bp["direction"] == "BUY" else "short"
+        msg = (f"RECON: Broker position {epic} (deal={bp['deal_id']}) "
+               f"missing from DB — inserting")
+        log.warning(msg)
+        mismatches.append(msg)
 
-            conn.execute(
-                """INSERT INTO paper_trades
-                   (strategy_id, symbol, side, entry_price, quantity, thesis,
-                    risk_pct, risk_approved, status, broker_order_id, opened_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, 1, 'open', ?, ?)""",
-                (TREND_STRATEGY_ID, epic, side, bp["entry_price"], bp["size"],
-                 f"Reconciled from broker: {epic} {side} @ {bp['entry_price']}",
-                 MAX_RISK_PER_TRADE * 100, bp["deal_id"],
-                 bp.get("created_date", now_str)),
-            )
-            conn.commit()
+        conn.execute(
+            """INSERT INTO paper_trades
+               (strategy_id, symbol, side, entry_price, quantity, thesis,
+                risk_pct, risk_approved, status, broker_order_id, opened_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 1, 'open', ?, ?)""",
+            (TREND_STRATEGY_ID, epic, side, bp["entry_price"], bp["size"],
+             f"Reconciled from broker: {epic} {side} @ {bp['entry_price']}",
+             MAX_RISK_PER_TRADE * 100, bp["deal_id"],
+             bp.get("created_date", now_str)),
+        )
+        conn.commit()
 
-    # 2) DB position missing from broker -> mark orphaned
+    # 2) DB position missing from broker (skip already-matched)
     for deal_id, db_row in db_deal_ids.items():
-        if deal_id not in broker_deal_ids:
-            msg = (f"RECON: DB position {db_row['symbol']} "
-                   f"(id={db_row['id']}, deal={deal_id}) "
-                   f"not found on broker — marking orphaned")
-            log.warning(msg)
-            mismatches.append(msg)
+        if deal_id in matched_db_deals:
+            continue
+        if deal_id in broker_deal_ids:
+            continue
+        msg = (f"RECON: DB position {db_row['symbol']} "
+               f"(id={db_row['id']}, deal={deal_id}) "
+               f"not found on broker — marking orphaned")
+        log.warning(msg)
+        mismatches.append(msg)
 
-            conn.execute(
-                "UPDATE paper_trades SET status='orphaned' WHERE id = ?",
-                (db_row["id"],),
-            )
-            conn.commit()
+        conn.execute(
+            "UPDATE paper_trades SET status='orphaned' WHERE id = ?",
+            (db_row["id"],),
+        )
+        conn.commit()
 
     # Send Telegram alert on any mismatch
     if mismatches:

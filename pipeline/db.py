@@ -27,6 +27,7 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
     conn.executescript(schema)
     _seed_fx_strategies(conn)
     _apply_pnl_corrections(conn)
+    _fix_deal_id_orphans(conn)
     return conn
 
 
@@ -42,6 +43,39 @@ def _apply_pnl_corrections(conn: sqlite3.Connection) -> None:
             "UPDATE paper_trades SET pnl = ? WHERE id = ? AND pnl != ?",
             (correct_pnl, trade_id, correct_pnl),
         )
+    conn.commit()
+
+
+# Capital.com returns different deal IDs from the confirm endpoint vs the
+# positions endpoint. This caused reconciliation to orphan the original
+# trade and insert a duplicate with the "correct" deal ID. Fix: restore
+# the original (has proper thesis/signal_id), give it the correct deal ID,
+# delete the reconciled duplicate.
+_DEAL_ID_ORPHAN_FIXES: list[tuple[int, int]] = [
+    # (orphaned_id_to_restore, reconciled_duplicate_id_to_delete)
+    (9, 12),    # USDCHF
+    (13, 14),   # GBPJPY
+    (15, 17),   # USDJPY
+    (16, 18),   # EURGBP
+    (19, 20),   # AUDUSD
+]
+
+
+def _fix_deal_id_orphans(conn: sqlite3.Connection) -> None:
+    """One-time fix for deal ID mismatch orphans."""
+    for orphan_id, dup_id in _DEAL_ID_ORPHAN_FIXES:
+        dup = conn.execute(
+            "SELECT broker_order_id FROM paper_trades WHERE id = ? AND status = 'open'",
+            (dup_id,),
+        ).fetchone()
+        if not dup:
+            continue
+        correct_deal_id = dict(dup)["broker_order_id"]
+        conn.execute(
+            "UPDATE paper_trades SET status = 'open', broker_order_id = ? WHERE id = ?",
+            (correct_deal_id, orphan_id),
+        )
+        conn.execute("DELETE FROM paper_trades WHERE id = ?", (dup_id,))
     conn.commit()
 
 
