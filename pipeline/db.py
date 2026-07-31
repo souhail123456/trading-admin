@@ -25,10 +25,28 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
     conn = get_connection(db_path)
     schema = SCHEMA_PATH.read_text()
     conn.executescript(schema)
+    _migrate_schema(conn)
     _seed_fx_strategies(conn)
     _apply_pnl_corrections(conn)
     _fix_deal_id_orphans(conn)
     return conn
+
+
+def _migrate_schema(conn: sqlite3.Connection) -> None:
+    """Add columns that CREATE TABLE IF NOT EXISTS won't add to existing tables."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(paper_trades)").fetchall()}
+    if "exit_reason" not in cols:
+        conn.execute("ALTER TABLE paper_trades ADD COLUMN exit_reason TEXT")
+        # Clean up orphaned trades caused by the missing column bug:
+        # qty=1 test entries from early runs
+        conn.execute("DELETE FROM paper_trades WHERE status = 'orphaned' AND quantity <= 1")
+        # Real positions stopped out on broker but never synced — close them
+        conn.execute(
+            """UPDATE paper_trades SET status = 'closed', exit_reason = 'broker_stop_orphan_cleanup',
+               pnl = 0.0, closed_at = datetime('now')
+               WHERE status = 'orphaned'"""
+        )
+        conn.commit()
 
 
 PNL_CORRECTIONS: dict[int, float] = {
