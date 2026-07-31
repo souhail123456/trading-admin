@@ -351,20 +351,16 @@ def _try_update_broker_stop(broker, deal_id: str, new_stop: float, symbol: str, 
 def _ensure_broker_tp(broker, open_trades: list, conn: sqlite3.Connection):
     """Set take-profit on broker for any open position that is missing one.
 
-    Reads tp_pips from DB strategy params and computes limit level from entry price.
+    Uses 3R ATR-based TP per position (adapts to each pair's volatility).
     Only fires the API call when the broker position has no limitLevel set.
     """
     if not broker:
         return
 
-    # Pre-fetch broker positions to check existing TP levels
     try:
         broker_positions = {bp["deal_id"]: bp for bp in broker.get_positions()}
     except Exception:
         return
-
-    trend_params = get_strategy_params(conn, TREND_STRATEGY_ID) or _DEFAULT_TREND_PARAMS
-    pa_params = get_strategy_params(conn, PA_STRATEGY_ID) or _DEFAULT_PA_PARAMS
 
     for row in open_trades:
         t = dict(row)
@@ -374,28 +370,27 @@ def _ensure_broker_tp(broker, open_trades: list, conn: sqlite3.Connection):
 
         bp = broker_positions[deal_id]
         if bp.get("profit_level") is not None:
-            continue  # already has TP set
+            continue
 
-        params = trend_params if t["strategy_id"] == TREND_STRATEGY_ID else pa_params
-        tp_pips = params.get("take_profit_pips")
-        if not tp_pips:
+        atr = get_atr(t["symbol"])
+        if not atr or atr <= 0:
             continue
 
         entry = float(t["entry_price"])
-        is_jpy = "JPY" in t["symbol"]
-        pip_size = 0.01 if is_jpy else 0.0001
         side = t.get("side", "long")
+        tp_distance = TAKE_PROFIT_ATR_MULT * atr
 
         if side == "long":
-            limit_level = entry + tp_pips * pip_size
+            limit_level = entry + tp_distance
         else:
-            limit_level = entry - tp_pips * pip_size
+            limit_level = entry - tp_distance
 
         try:
             from pipeline.agents.broker_capital import CapitalBroker
             if isinstance(broker, CapitalBroker):
                 broker.update_tp(deal_id, limit_level)
-                log.info(f"  [TP] {t['symbol']}: set broker TP to {limit_level:.5f} ({tp_pips} pips from entry {entry})")
+                log.info(f"  [TP] {t['symbol']}: set broker TP to {limit_level:.5f} "
+                         f"({TAKE_PROFIT_ATR_MULT:.0f}R, ATR={atr:.5f}, entry={entry})")
         except Exception as e:
             log.warning(f"  [TP] {t['symbol']}: failed to set broker TP: {e}")
 
