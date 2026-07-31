@@ -29,9 +29,9 @@
   "regime": "TRENDING",
   "alerts": [],
   "service_status": {
-    "timestamp": "2026-07-30T23:13:23Z"
+    "timestamp": "2026-07-31T09:44:12Z"
   },
-  "vix": 17.09000015258789,
+  "vix": 16.729999542236328,
   "recommendations": {
     "100": {
       "action": "ACTIVE",
@@ -42,24 +42,24 @@
       "reason": "Sharpe -1.08 in backtest \u2014 PA strategy permanently killed 2026-07"
     }
   },
-  "updated": "2026-07-30T23:13:47Z",
+  "updated": "2026-07-31T09:44:23Z",
   "cross_bot_risk": {
     "total_positions": 10,
-    "total_exposure": 448609.29,
+    "total_exposure": 460118.75,
     "by_bot": {
       "fx": {
-        "count": 5,
-        "total_value": 375145.885
+        "count": 4,
+        "total_value": 374792.30999999994
       },
       "stock": {
-        "count": 5,
-        "total_value": 73463.400056
+        "count": 6,
+        "total_value": 85326.440056
       }
     },
     "overlaps": {},
     "flags": [
       "HIGH_TOTAL_EXPOSURE"
     ],
-    "computed_at": "2026-07-30T23:14:07Z"
+    "computed_at": "2026-07-31T09:44:43Z"
   }
 }
