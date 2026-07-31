@@ -108,7 +108,7 @@ def _seed_fx_strategies(conn: sqlite3.Connection) -> None:
                 "sma_period": 200,
                 "top_n": 3,
                 "stop_loss_pips": 80,
-                "take_profit_pips": None,
+                "take_profit_pips": 240,
                 "max_hold_days": None,
                 "stop_loss_pct": None,
             }),
