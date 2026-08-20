@@ -44,6 +44,13 @@
 - [x] Weather Bot post-fix trades resolving — 169 resolved, 59.8% WR
 - [x] FX EURGBP short — first short closed +$1.60
 
+### FX TA entry filters — MACD added, RSI rejected (trading-admin `747b761`, 2026-08-20):
+- Added two configurable entry filters to `fx_trend_signals()` (entry candidates only; exit + risk layer untouched): **MACD histogram agreement** and **RSI-14 exhaustion guard**. Toggles/thresholds via params (`macd_filter`, `rsi_filter`, `rsi_overbought`=70, `rsi_oversold`=30).
+- **Backtest gate** (2006–2026, 10 pairs, long-only monthly approx, net 3bps): Baseline SMA-200 Sharpe 2.28 → **+MACD 2.96** (win 80.6%, DD -3.2%, 536 trades) → +RSI 1.69 (worse) → +both 2.36.
+- **Decision:** `MACD_FILTER_DEFAULT=True` (clear Sharpe lift), `RSI_FILTER_DEFAULT=False` (hurt Sharpe + doubled DD standalone; kept in code, re-enable via `rsi_filter=True`).
+- **⚠️ Effectively live next run** — MACD is on main by default; next scheduled FX pipeline uses it.
+- **Caveat / to verify:** backtester is long-only monthly; the SHORT-side filter is logic-verified only, not backtested. Watch the first few MACD-gated short entries.
+
 ### Still open / carry forward:
 - **FX true-fill labeling** — read Capital.com activity/history endpoint so broker-side TP/SL exits record the real fill price instead of `broker_sync_missing` at current price.
 - **Align cache keys across workflows** — `weekly_research.yml` caches `data/pipeline.db` under a non-`v62` key but its `restore-keys: pipeline-db-` prefix can pull `daily_pipeline`'s `v62` cache; asymmetric lineage could reintroduce drift if weekly ever writes back.
