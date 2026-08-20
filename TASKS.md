@@ -7,13 +7,16 @@
 
 ## Last Session Recap (2026-08-20)
 
-### ✅ Both live issues FIXED and verified on GitHub Actions:
+### ✅ Three fixes shipped + verified on GitHub Actions:
 
 **LLM router fixed** (trading-bot `92bf67a`) — root cause: Groq retired `llama-3.1-8b-instant` Aug 16 (scans died Aug 17), Gemini retired `gemini-2.0-flash` June 1. New IDs: Gemini `gemini-2.5-flash`/`-lite`, Groq `openai/gpt-oss-20b`/`-120b`, Cerebras `llama-3.3-70b`/`llama3.1-8b`, OpenRouter `gpt-oss-20b:free`/`qwen3-coder:free`. Also fixed the 404→fallback bug (dead primary now falls through instead of killing the provider) and updated `news_sentiment.py`. Live Midday Scan passed: `LLM OK — gemini/gemini-2.5-flash`.
 
 **FX reconciliation fixed** (trading-admin `2a8d0be`) — root cause: reverse-sync in `fx_pipeline.py` closed any DB position absent from a SINGLE `get_positions()` call; Capital.com returns transient partial/empty lists, so healthy 3R runners got false-closed at noise prices then re-imported as fresh trades (resetting the clock). Fix: require **N=2 consecutive misses** before closing (counter resets on reappear), transient-empty guard (never mass-close when broker returns zero), defensive SYNC logging (broker epics vs DB symbols), and 429 exponential-backoff retry on session auth (`broker_capital.py`). Live pipeline run green, broker/DB matched 2/2, no false closes.
 - **Correction:** the broker truly holds only **2 open FX positions (GBPJPY, USDJPY)**, not 5. The committed `shared/pipeline.db` (5 open) is stale vs the accurate CI `data/pipeline.db` (2 open) — the known "two divergent DBs" issue. The `broker_stop_orphan_cleanup` rows were a one-time Jul-31 migration event, not ongoing.
 - **Remaining confirmation item:** positions closed by the broker's own server-side TP/SL are still labeled `broker_sync_missing` at a wrong current-price P&L. Proper fix = read Capital.com activity/history endpoint for the true fill (not done — needs live API testing).
+
+**Divergent-DBs bug fixed** (trading-admin `5cd75b5`) — root cause: pipeline DB runs in WAL journal mode but `run_daily()` never closes/checkpoints, so committed rows sat in the `-wal` sidecar. The workflow did an early `cp data/pipeline.db shared/` that copied only the pre-checkpoint main file, while the later cache-save captured the post-checkpoint file → `shared/` (git) froze ≥1 transaction behind the accurate CI cache. Fix: removed the early cp; added one WAL-safe export step running **last + `if: always()`** that does `PRAGMA wal_checkpoint(TRUNCATE)` then copies to `shared/` and clears sidecars. Now `data/pipeline.db` is the single source of truth and `shared/` is always a faithful export. Live run (32324819510) green: broker == data == shared, all 3 agree.
+- **Corrected position count:** broker now genuinely holds **4 open FX** — GBPJPY, USDJPY, plus **USDCHF + EURGBP opened today (Aug 20)**. My earlier "2 vs 5" was the divergence itself; the truth moved to 4 and all sources now match. No rows hand-edited (no trade-history risk).
 
 ### Original status review (2 live issues found):
 
@@ -43,9 +46,10 @@
 
 ### Still open / carry forward:
 - **FX true-fill labeling** — read Capital.com activity/history endpoint so broker-side TP/SL exits record the real fill price instead of `broker_sync_missing` at current price.
-- **Divergent DBs cleanup** — reconcile committed `shared/pipeline.db` (5 open, stale) vs CI `data/pipeline.db` (2 open, accurate). Broker holds only GBPJPY + USDJPY.
-- **Weather Bot monetization** — 60% WR but flat. Either it's fine as low-variance ballast, or needs edge/size rethink to actually profit.
-- **Monitor first LLM-router run in a live scan window** — Midday Scan passed via Gemini; confirm the daily scans resume producing research/summaries.
+- **Align cache keys across workflows** — `weekly_research.yml` caches `data/pipeline.db` under a non-`v62` key but its `restore-keys: pipeline-db-` prefix can pull `daily_pipeline`'s `v62` cache; asymmetric lineage could reintroduce drift if weekly ever writes back.
+- **`v62` cache-miss re-seed vector** — a cache miss still seeds a fresh DB (historical strategy-101 re-seed cause); currently guarded by `KILLED_STRATEGIES` enforcement in `db.py`, but the seed-on-miss path remains.
+- **Monitor first LLM-router run in a live scan window** — Midday Scan passed via Gemini; confirm daily scans resume producing research/summaries.
+- **Weather Bot** — dropped this session (flat $100 paper balance, not worth the effort per user).
 
 ---
 
