@@ -7,7 +7,15 @@
 
 ## Last Session Recap (2026-08-20)
 
-### Status review (no code changes yet — 2 live issues found):
+### ✅ Both live issues FIXED and verified on GitHub Actions:
+
+**LLM router fixed** (trading-bot `92bf67a`) — root cause: Groq retired `llama-3.1-8b-instant` Aug 16 (scans died Aug 17), Gemini retired `gemini-2.0-flash` June 1. New IDs: Gemini `gemini-2.5-flash`/`-lite`, Groq `openai/gpt-oss-20b`/`-120b`, Cerebras `llama-3.3-70b`/`llama3.1-8b`, OpenRouter `gpt-oss-20b:free`/`qwen3-coder:free`. Also fixed the 404→fallback bug (dead primary now falls through instead of killing the provider) and updated `news_sentiment.py`. Live Midday Scan passed: `LLM OK — gemini/gemini-2.5-flash`.
+
+**FX reconciliation fixed** (trading-admin `2a8d0be`) — root cause: reverse-sync in `fx_pipeline.py` closed any DB position absent from a SINGLE `get_positions()` call; Capital.com returns transient partial/empty lists, so healthy 3R runners got false-closed at noise prices then re-imported as fresh trades (resetting the clock). Fix: require **N=2 consecutive misses** before closing (counter resets on reappear), transient-empty guard (never mass-close when broker returns zero), defensive SYNC logging (broker epics vs DB symbols), and 429 exponential-backoff retry on session auth (`broker_capital.py`). Live pipeline run green, broker/DB matched 2/2, no false closes.
+- **Correction:** the broker truly holds only **2 open FX positions (GBPJPY, USDJPY)**, not 5. The committed `shared/pipeline.db` (5 open) is stale vs the accurate CI `data/pipeline.db` (2 open) — the known "two divergent DBs" issue. The `broker_stop_orphan_cleanup` rows were a one-time Jul-31 migration event, not ongoing.
+- **Remaining confirmation item:** positions closed by the broker's own server-side TP/SL are still labeled `broker_sync_missing` at a wrong current-price P&L. Proper fix = read Capital.com activity/history endpoint for the true fill (not done — needs live API testing).
+
+### Original status review (2 live issues found):
 
 **🔴 Stock Bot discretionary scans DOWN since Aug 17** — all 3 LLM providers 404:
 - `gemini-2.0-flash`, `groq/llama-3.1-8b-instant`, `cerebras/llama3.1-70b` all return HTTP 404 (deprecated free-tier model IDs got rotated). Router in `scripts/llm_router.py`.
@@ -33,10 +41,11 @@
 - [x] Weather Bot post-fix trades resolving — 169 resolved, 59.8% WR
 - [x] FX EURGBP short — first short closed +$1.60
 
-### Open decisions from this review:
-- **Fix LLM router model IDs** (stock scans) — needs current Aug-2026 free model IDs (research + swap).
-- **FX broker reconciliation** — investigate why Capital.com positions vanish; add 429 retry/backoff on session auth.
+### Still open / carry forward:
+- **FX true-fill labeling** — read Capital.com activity/history endpoint so broker-side TP/SL exits record the real fill price instead of `broker_sync_missing` at current price.
+- **Divergent DBs cleanup** — reconcile committed `shared/pipeline.db` (5 open, stale) vs CI `data/pipeline.db` (2 open, accurate). Broker holds only GBPJPY + USDJPY.
 - **Weather Bot monetization** — 60% WR but flat. Either it's fine as low-variance ballast, or needs edge/size rethink to actually profit.
+- **Monitor first LLM-router run in a live scan window** — Midday Scan passed via Gemini; confirm the daily scans resume producing research/summaries.
 
 ---
 
