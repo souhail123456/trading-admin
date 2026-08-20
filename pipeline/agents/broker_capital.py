@@ -75,27 +75,61 @@ class CapitalBroker:
         log.info(f"Capital.com broker initialized ({self.env})")
 
     def _create_session(self):
-        """Create a new session (or refresh expired one)."""
-        resp = requests.post(
-            f"{self.base_url}/api/v1/session",
-            headers={
-                "X-CAP-API-KEY": self.api_key,
-                "Content-Type": "application/json",
-            },
-            json={
-                "identifier": self.email,
-                "password": self.password,
-            },
-            timeout=10,
-        )
-        if resp.status_code >= 400:
-            log.error(f"Capital.com session error {resp.status_code}: {resp.text[:300]}")
-        resp.raise_for_status()
+        """Create a new session (or refresh expired one).
 
-        self.security_token = resp.headers.get("X-SECURITY-TOKEN", "")
-        self.cst = resp.headers.get("CST", "")
-        self._session_time = time.time()
-        log.info("Capital.com session created")
+        Retries with exponential backoff on transient failures (429 rate-limit,
+        5xx, or connection errors). Session auth has no other retry layer — a
+        single transient 429 on POST /session used to fail the whole pipeline
+        run (observed 2026-08-19 22:31 UTC).
+        """
+        max_attempts = 3
+        last_exc: Exception | None = None
+        for attempt in range(max_attempts):
+            try:
+                resp = requests.post(
+                    f"{self.base_url}/api/v1/session",
+                    headers={
+                        "X-CAP-API-KEY": self.api_key,
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "identifier": self.email,
+                        "password": self.password,
+                    },
+                    timeout=10,
+                )
+                # Retry on rate-limit (429) or transient server errors (5xx)
+                if resp.status_code == 429 or 500 <= resp.status_code < 600:
+                    if attempt < max_attempts - 1:
+                        wait = 2 ** attempt  # 1s, 2s, 4s
+                        log.warning(
+                            f"Capital.com session {resp.status_code} — "
+                            f"retry {attempt + 1}/{max_attempts} in {wait}s"
+                        )
+                        time.sleep(wait)
+                        continue
+                if resp.status_code >= 400:
+                    log.error(f"Capital.com session error {resp.status_code}: {resp.text[:300]}")
+                resp.raise_for_status()
+
+                self.security_token = resp.headers.get("X-SECURITY-TOKEN", "")
+                self.cst = resp.headers.get("CST", "")
+                self._session_time = time.time()
+                log.info("Capital.com session created")
+                return
+            except requests.exceptions.RequestException as e:
+                last_exc = e
+                if attempt < max_attempts - 1:
+                    wait = 2 ** attempt  # 1s, 2s, 4s
+                    log.warning(
+                        f"Capital.com session request error ({e}) — "
+                        f"retry {attempt + 1}/{max_attempts} in {wait}s"
+                    )
+                    time.sleep(wait)
+                else:
+                    raise
+        if last_exc:  # exhausted retries on repeated 429/5xx that raised
+            raise last_exc
 
     def _ensure_session(self):
         """Refresh session if older than 8 minutes (expires at 10)."""

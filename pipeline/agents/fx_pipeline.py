@@ -51,6 +51,15 @@ _DEFAULT_PA_PARAMS = {"stop_loss_pips": 40, "max_hold_days": 15, "stop_loss_pct"
 TREND_SAFETY_MAX_HOLD = 30
 TAKE_PROFIT_ATR_MULT = 3.0  # close at 3R profit (3x ATR from entry)
 
+# Broker-sync reconciliation: a DB position must be observed missing from the
+# broker for this many CONSECUTIVE pipeline runs before we believe it is really
+# gone and close it. A single missing observation is almost always a transient
+# get_positions() hiccup (rate-limit/partial response/session race). Closing on
+# the first miss was booking healthy runners at a bogus current-price P&L and
+# re-importing them as fresh trades, resetting the 3R runner — the churn that
+# was killing the strategy's edge.
+SYNC_MISSING_THRESHOLD = 2
+
 # Regime-aware limits
 RANGING_MAX_TREND_POSITIONS = 3  # capped in ranging regime
 VOLATILE_ATR_MULTIPLIER = 1.5   # tighter stops in volatile (vs 2.0 normal)
@@ -1142,8 +1151,8 @@ def reconcile_broker_vs_db(conn: sqlite3.Connection, broker) -> list[str]:
         return [msg]
 
     db_open = conn.execute(
-        "SELECT id, symbol, broker_order_id, side, entry_price, quantity, strategy_id "
-        "FROM paper_trades WHERE status='open' AND strategy_id IN (100, 101)"
+        "SELECT id, symbol, broker_order_id, side, entry_price, quantity, strategy_id, "
+        "sync_missing_count FROM paper_trades WHERE status='open' AND strategy_id IN (100, 101)"
     ).fetchall()
 
     db_deal_ids = {}
@@ -1215,11 +1224,22 @@ def reconcile_broker_vs_db(conn: sqlite3.Connection, broker) -> list[str]:
         )
         conn.commit()
 
-    # 2) DB position missing from broker (skip already-matched)
+    # 2) DB position missing from broker (skip already-matched).
+    # Confirmation-gated: only orphan a position that the reverse-sync has
+    # already observed missing for >= SYNC_MISSING_THRESHOLD consecutive runs.
+    # The reverse-sync (which runs first and owns the counter) closes genuinely
+    # gone positions before this point, so a still-open one here is either
+    # transient or still being confirmed — never orphan it on a single miss.
     for deal_id, db_row in db_deal_ids.items():
         if deal_id in matched_db_deals:
             continue
         if deal_id in broker_deal_ids:
+            continue
+        missing_count = db_row.get("sync_missing_count") or 0
+        if missing_count < SYNC_MISSING_THRESHOLD:
+            log.info(f"RECON: DB position {db_row['symbol']} (id={db_row['id']}, "
+                     f"deal={deal_id}) not found on broker — only "
+                     f"{missing_count}/{SYNC_MISSING_THRESHOLD} misses, deferring (transient-safe)")
             continue
         msg = (f"RECON: DB position {db_row['symbol']} "
                f"(id={db_row['id']}, deal={deal_id}) "
@@ -1427,7 +1447,7 @@ def run_daily(dry_run: bool = False, db_path: str | None = None):
                 # Sync: detect broker positions missing from DB
                 broker_positions = broker_test.get_positions()
                 db_open = conn.execute(
-                    "SELECT id, symbol, broker_order_id, side, entry_price, quantity FROM paper_trades WHERE status = 'open' AND strategy_id IN (100, 101)"
+                    "SELECT id, symbol, broker_order_id, side, entry_price, quantity, sync_missing_count FROM paper_trades WHERE status = 'open' AND strategy_id IN (100, 101)"
                 ).fetchall()
                 db_deal_ids = {dict(r).get("broker_order_id") for r in db_open}
                 db_symbols = {dict(r)["symbol"] for r in db_open}
@@ -1454,6 +1474,26 @@ def run_daily(dry_run: bool = False, db_path: str | None = None):
                 broker_deal_ids = {bp["deal_id"] for bp in broker_positions}
                 broker_epics = {bp["epic"].upper().replace("/", "") for bp in broker_positions}
                 now_str = datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+                # Defensive logging: record exactly what the broker returned vs
+                # what the DB expects, so real vs phantom "missing" is auditable.
+                print(f"  SYNC: broker returned {len(broker_positions)} position(s): "
+                      f"epics={sorted(broker_epics)} "
+                      f"deals={sorted(d[:12] for d in broker_deal_ids if d)}")
+                print(f"  SYNC: DB has {len(db_open)} open FX position(s): "
+                      f"symbols={sorted({dict(r)['symbol'] for r in db_open})}")
+
+                # Transient-empty guard: if the broker reports ZERO positions
+                # while the DB expects one or more, that is almost certainly an
+                # API hiccup (rate-limit, partial/empty response, session race),
+                # not every position closing simultaneously. Never mass-close on
+                # an empty read — leave everything open and re-confirm next run.
+                broker_list_suspect = (len(broker_positions) == 0 and len(db_open) > 0)
+                if broker_list_suspect:
+                    print("  SYNC: broker returned EMPTY position list but DB has "
+                          "open positions — treating as transient, NOT closing "
+                          "(will re-confirm next run)")
+
                 for row in db_open:
                     r = dict(row)
                     db_deal_id = r.get("broker_order_id")
@@ -1462,9 +1502,38 @@ def run_daily(dry_run: bool = False, db_path: str | None = None):
                     deal_id_match = db_deal_id and db_deal_id in broker_deal_ids
                     symbol_match = db_symbol in broker_epics
                     if deal_id_match or symbol_match:
+                        # Present on broker — clear any accumulated missing count.
+                        if (r.get("sync_missing_count") or 0) > 0:
+                            conn.execute(
+                                "UPDATE paper_trades SET sync_missing_count = 0 WHERE id = ?",
+                                (r["id"],),
+                            )
+                            conn.commit()
                         continue
-                    # Position is gone from broker — mark it closed with best-effort P&L
-                    print(f"  SYNC: DB position {db_symbol} (id={r['id']}, deal={db_deal_id}) not found on broker — closing in DB")
+
+                    # Not found on broker this run. Require N consecutive misses
+                    # before believing it is really gone. On a suspect (empty)
+                    # read, don't even increment — a full outage must not slowly
+                    # accumulate every position toward the threshold.
+                    if broker_list_suspect:
+                        continue
+
+                    prev_missing = r.get("sync_missing_count") or 0
+                    new_missing = prev_missing + 1
+                    if new_missing < SYNC_MISSING_THRESHOLD:
+                        conn.execute(
+                            "UPDATE paper_trades SET sync_missing_count = ? WHERE id = ?",
+                            (new_missing, r["id"]),
+                        )
+                        conn.commit()
+                        print(f"  SYNC: DB position {db_symbol} (id={r['id']}, deal={db_deal_id}) "
+                              f"not on broker — missing {new_missing}/{SYNC_MISSING_THRESHOLD}, "
+                              f"deferring close (transient-safe)")
+                        continue
+
+                    # Confirmed gone across >= threshold consecutive runs.
+                    print(f"  SYNC: DB position {db_symbol} (id={r['id']}, deal={db_deal_id}) "
+                          f"confirmed gone from broker ({new_missing} consecutive misses) — closing in DB")
                     try:
                         price_data = broker_test.get_price(db_symbol)
                         exit_price = price_data.get("bid") if r["side"] == "long" else price_data.get("ask")

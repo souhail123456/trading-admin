@@ -48,6 +48,15 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
         )
         conn.commit()
 
+    # Confirmation counter for broker-sync reconciliation. A position is only
+    # marked closed via broker sync after it has been observed missing from the
+    # broker for N *consecutive* pipeline runs — a single missing observation is
+    # usually a transient API hiccup (rate-limit, partial response, session
+    # race), not a real close. Reset to 0 whenever the position reappears.
+    if "sync_missing_count" not in cols:
+        conn.execute("ALTER TABLE paper_trades ADD COLUMN sync_missing_count INTEGER DEFAULT 0")
+        conn.commit()
+
 
 PNL_CORRECTIONS: dict[int, float] = {
     8: 6.90,  # GBPJPY trade — was 3314.84 (raw JPY, not USD)
