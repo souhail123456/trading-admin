@@ -22,6 +22,7 @@ from pipeline.db import init_db, log_agent_action
 from pipeline.agents.data_fetcher import fetch_ohlcv, CURRENCY_PAIRS
 from pipeline.agents.price_action import detect_all_patterns
 from pipeline.agents.backtester import compute_metrics
+from pipeline.agents.fx_signal_generator import macd_histogram, rsi
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,10 +40,17 @@ def fx_trend_following(
     sma_period: int = 200,
     top_n: int = 3,
     cost_bps: float = 3,  # FX spreads are tight
+    macd_filter: bool = False,
+    rsi_filter: bool = False,
+    rsi_overbought: float = 70,
 ) -> pd.DataFrame:
     """
     FX trend-following: go long pairs above SMA-200, rank by trend strength.
     Monthly rebalance. No shorting (simpler for $100 account).
+
+    Entry-confirmation filters (long-only mirror of fx_trend_signals):
+      - macd_filter: require MACD histogram > 0 at month-end (momentum agrees)
+      - rsi_filter:  skip pairs with RSI-14 >= rsi_overbought (exhaustion guard)
     """
     tickers = list(data.keys())
 
@@ -55,7 +63,9 @@ def fx_trend_following(
         df["sma"] = df["close"].rolling(sma_period).mean()
         df["above_sma"] = (df["close"] > df["sma"]).astype(int)
         df["trend_strength"] = (df["close"] - df["sma"]) / df["sma"]
-        signals[t] = df[["close", "above_sma", "trend_strength"]].resample("ME").last()
+        df["macd_hist"] = macd_histogram(df["close"])
+        df["rsi"] = rsi(df["close"])
+        signals[t] = df[["close", "above_sma", "trend_strength", "macd_hist", "rsi"]].resample("ME").last()
 
     # Monthly returns
     monthly_prices = {}
@@ -75,8 +85,14 @@ def fx_trend_following(
         for t in signals:
             if date in signals[t].index:
                 row = signals[t].loc[date]
-                if row["above_sma"] > 0:
-                    candidates.append((t, row["trend_strength"]))
+                if row["above_sma"] <= 0:
+                    continue
+                # Entry-confirmation filters (long side)
+                if macd_filter and not (row["macd_hist"] > 0):
+                    continue
+                if rsi_filter and row["rsi"] >= rsi_overbought:
+                    continue
+                candidates.append((t, row["trend_strength"]))
 
         if not candidates:
             portfolio_returns.append({"date": date, "return": 0.0, "benchmark": 0.0, "trades_opened": 0})
@@ -475,8 +491,67 @@ def compare_all(db_path: str | None = None) -> dict:
     return results
 
 
+def compare_entry_filters(db_path: str | None = None, start: str = "2005-01-01") -> dict:
+    """Backtest gate for the MACD + RSI entry-confirmation filters on the
+    FX trend strategy. Compares:
+        baseline  = SMA-200 only (filters OFF)
+        variant_A = + MACD histogram agreement
+        variant_B = + RSI exhaustion guard
+        variant_C = + MACD + RSI (both)
+    Prints a comparison table (total return, Sharpe, win rate, max DD, #trades)
+    and returns the raw metrics dict per config.
+    """
+    init_db(db_path)
+    log.info("Loading FX data for entry-filter comparison...")
+    tickers = list(CURRENCY_PAIRS.keys())
+    data = fetch_ohlcv(tickers, start=start)
+    log.info(f"Loaded {len(data)} FX pairs")
+
+    base = dict(FX_TREND_PARAMS)  # sma_period, top_n, cost_bps
+    configs = {
+        "baseline (SMA-200)": {**base, "macd_filter": False, "rsi_filter": False},
+        "A: + MACD":          {**base, "macd_filter": True,  "rsi_filter": False},
+        "B: + RSI":           {**base, "macd_filter": False, "rsi_filter": True},
+        "C: + MACD + RSI":    {**base, "macd_filter": True,  "rsi_filter": True},
+    }
+
+    out = {}
+    for name, cfg in configs.items():
+        r = fx_trend_following(data, **cfg)
+        if r.empty:
+            log.warning(f"  {name}: no results")
+            continue
+        m = compute_metrics(r)
+        n_trades = int(r["trades_opened"].sum()) if "trades_opened" in r.columns else None
+        out[name] = {"metrics": m, "trades": n_trades,
+                     "start": r.index[0].strftime("%Y-%m-%d"),
+                     "end": r.index[-1].strftime("%Y-%m-%d")}
+
+    print(f"\n{'='*92}")
+    print("FX TREND ENTRY-FILTER BACKTEST (full sample, 10 pairs, monthly rebalance, long-only)")
+    if out:
+        any_row = next(iter(out.values()))
+        print(f"Period: {any_row['start']} to {any_row['end']}")
+    print(f"{'='*92}")
+    print(f"{'Config':<22} {'TotRet%':>10} {'Sharpe':>8} {'WinRate%':>10} "
+          f"{'MaxDD%':>9} {'#Trades':>9} {'Months':>8}")
+    print("-" * 92)
+    for name, r in out.items():
+        m = r["metrics"]
+        print(f"{name:<22} {m.get('total_return', 'N/A'):>10} {m.get('sharpe', 'N/A'):>8} "
+              f"{m.get('win_rate', 'N/A'):>10} {m.get('max_drawdown', 'N/A'):>9} "
+              f"{str(r['trades']):>9} {m.get('total_months', 'N/A'):>8}")
+    print(f"{'='*92}\n")
+
+    return out
+
+
 def main():
-    compare_all()
+    import sys
+    if "--filters" in sys.argv:
+        compare_entry_filters()
+    else:
+        compare_all()
 
 
 if __name__ == "__main__":

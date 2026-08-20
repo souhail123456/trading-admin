@@ -31,6 +31,17 @@ log = logging.getLogger(__name__)
 FX_TREND_STRATEGY_ID = 100
 FX_PA_STRATEGY_ID = 101
 
+# Entry-confirmation filter defaults for fx_trend_signals(), set from the
+# backtest gate (fx_backtester.compare_entry_filters, full sample 2006-2026):
+#   baseline SMA-200:  Sharpe 2.279, MaxDD -3.11%, 720 trades
+#   + MACD:            Sharpe 2.960, MaxDD -3.15%, 536 trades  <-- best
+#   + RSI:             Sharpe 1.685, MaxDD -6.53%, 701 trades  (hurts)
+#   + MACD + RSI:      Sharpe 2.355, MaxDD -4.19%, 476 trades  (RSI drags MACD down)
+# => MACD ON (clear Sharpe lift, trade count still healthy); RSI OFF (degrades
+#    Sharpe standalone and in combination). Overridable per-run via strategy params.
+MACD_FILTER_DEFAULT = True
+RSI_FILTER_DEFAULT = False
+
 # Belt-and-suspenders: strategies killed in code, checked BEFORE any DB lookup.
 # This is a secondary check — KILLED_STRATEGIES in db.py is the primary source.
 KILLED_STRATEGY_IDS: set[int] = set(KILLED_STRATEGIES.keys())
@@ -60,6 +71,31 @@ def _clean_symbol(ticker: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Entry-confirmation indicators (vectorized) — MACD histogram + RSI
+# ---------------------------------------------------------------------------
+
+def macd_histogram(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> pd.Series:
+    """MACD histogram = (EMA_fast - EMA_slow) - EMA_signal(MACD).
+    Positive = bullish momentum, negative = bearish momentum."""
+    ema_fast = close.ewm(span=fast, adjust=False).mean()
+    ema_slow = close.ewm(span=slow, adjust=False).mean()
+    macd = ema_fast - ema_slow
+    signal_line = macd.ewm(span=signal, adjust=False).mean()
+    return macd - signal_line
+
+
+def rsi(close: pd.Series, period: int = 14) -> pd.Series:
+    """Wilder's RSI-14 using EMA smoothing (alpha=1/period)."""
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+# ---------------------------------------------------------------------------
 # FX Trend-following signals
 # ---------------------------------------------------------------------------
 
@@ -85,6 +121,12 @@ def fx_trend_signals(
     params = params or {}
     sma_period = params.get("sma_period", 200)
     top_n = params.get("top_n", 3)
+    # Entry-confirmation filters (defaults set from backtest — see fx_backtester
+    # compare_entry_filters). Applied to ENTRY candidates only, never to exits.
+    macd_filter = params.get("macd_filter", MACD_FILTER_DEFAULT)
+    rsi_filter = params.get("rsi_filter", RSI_FILTER_DEFAULT)
+    rsi_overbought = params.get("rsi_overbought", 70)
+    rsi_oversold = params.get("rsi_oversold", 30)
     signals = []
 
     # Build lookup of currently held positions: symbol -> side
@@ -105,6 +147,10 @@ def fx_trend_signals(
         above = latest["close"] > latest_sma
         strength = (latest["close"] - latest_sma) / latest_sma if latest_sma > 0 else 0
 
+        # Entry-confirmation indicators (latest bar)
+        latest_hist = float(macd_histogram(df["close"]).iloc[-1])
+        latest_rsi = float(rsi(df["close"]).iloc[-1])
+
         pair = _clean_symbol(ticker)
         carry = calculate_carry(pair)
         carry_normalized = carry / 10.0
@@ -122,6 +168,8 @@ def fx_trend_signals(
             "carry_pct": round(carry, 2),
             "carry_normalized": round(carry_normalized, 4),
             "composite_score": round(long_composite, 4),
+            "macd_histogram": round(latest_hist, 6),
+            "rsi_14": round(latest_rsi, 2),
             "date": str(df.index[-1].date()),
             "pair": pair,
         }
@@ -143,8 +191,15 @@ def fx_trend_signals(
                     "full_state": {**state, "reason": "above_sma_short_exit"},
                 })
             elif current_side is None:
-                # Not holding this pair → long entry candidate
-                long_candidates.append((ticker, long_composite, state))
+                # Not holding this pair → long entry candidate, subject to filters.
+                # MACD: require momentum to agree (histogram > 0).
+                # RSI: skip buying into overbought exhaustion.
+                if macd_filter and not (latest_hist > 0):
+                    log.info(f"  SKIP LONG {pair}: MACD hist {latest_hist:.6f} <= 0")
+                elif rsi_filter and latest_rsi >= rsi_overbought:
+                    log.info(f"  SKIP LONG {pair}: RSI {latest_rsi:.1f} >= {rsi_overbought} (overbought)")
+                else:
+                    long_candidates.append((ticker, long_composite, state))
             # If already holding long: stay in trade, no signal
 
         else:
@@ -162,9 +217,16 @@ def fx_trend_signals(
                     "full_state": {**state, "reason": "below_sma_long_exit"},
                 })
             elif current_side is None:
-                # Not holding this pair → short entry candidate
-                short_state = {**state, "composite_score": round(short_composite, 4)}
-                short_candidates.append((ticker, short_composite, short_state))
+                # Not holding this pair → short entry candidate, subject to filters.
+                # MACD: require momentum to agree (histogram < 0).
+                # RSI: skip selling into oversold exhaustion.
+                if macd_filter and not (latest_hist < 0):
+                    log.info(f"  SKIP SHORT {pair}: MACD hist {latest_hist:.6f} >= 0")
+                elif rsi_filter and latest_rsi <= rsi_oversold:
+                    log.info(f"  SKIP SHORT {pair}: RSI {latest_rsi:.1f} <= {rsi_oversold} (oversold)")
+                else:
+                    short_state = {**state, "composite_score": round(short_composite, 4)}
+                    short_candidates.append((ticker, short_composite, short_state))
             # If already holding short: stay in trade, no signal
 
     # Top N long entries by composite score (trend_strength * 0.7 + carry * 0.3)
