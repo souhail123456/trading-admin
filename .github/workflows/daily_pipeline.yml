@@ -109,12 +109,6 @@ jobs:
               conn.close()
           "
 
-      - name: Persist pipeline DB to shared/
-        if: always()
-        run: |
-          mkdir -p shared
-          cp data/pipeline.db shared/pipeline.db 2>/dev/null && echo "Copied pipeline.db to shared/" || echo "No pipeline.db to copy"
-
       - name: Update bot status
         if: always()
         run: |
@@ -163,6 +157,32 @@ jobs:
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
           POLYMARKET_REPO: ${{ vars.POLYMARKET_REPO || 'souhail123456/polymarket-bot' }}
         run: python3 src/unified_history.py
+
+      - name: Export authoritative DB to shared/ (WAL-safe)
+        # Runs LAST (after every writer: fx_pipeline, ghost-clean, performance_monitor,
+        # cross_bot_risk) and unconditionally, so shared/pipeline.db is always a faithful
+        # export of the authoritative data/pipeline.db — never a copy that can drift.
+        #
+        # The DB uses WAL journal mode, so freshly-committed transactions live in the
+        # data/pipeline.db-wal sidecar until a checkpoint folds them into the main file.
+        # The old `cp data/pipeline.db shared/pipeline.db` copied ONLY the main file and
+        # ran before later steps triggered that checkpoint, so shared/ lagged behind the
+        # cache (which captured the checkpointed state). Here we checkpoint the source
+        # first, so both the cache save AND the shared copy see the complete, current DB.
+        if: always()
+        run: |
+          mkdir -p shared
+          if [ -f data/pipeline.db ]; then
+            # Fold the WAL into the main file so the on-disk data/pipeline.db is complete.
+            sqlite3 data/pipeline.db "PRAGMA wal_checkpoint(TRUNCATE);"
+            cp data/pipeline.db shared/pipeline.db
+            # Drop any stale sidecars so the committed file is self-contained.
+            rm -f shared/pipeline.db-wal shared/pipeline.db-shm
+            OPEN=$(sqlite3 shared/pipeline.db "SELECT count(*) FROM paper_trades WHERE status='open';")
+            echo "Exported checkpointed pipeline.db to shared/ (open positions: $OPEN)"
+          else
+            echo "No data/pipeline.db to export — keeping existing shared/pipeline.db"
+          fi
 
       - name: Commit shared state
         run: |
