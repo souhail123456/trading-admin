@@ -1,11 +1,46 @@
 # Trading System — Task List
 
-> **Last updated: 2026-07-28**
+> **Last updated: 2026-08-20**
 > Read this FIRST every session. This is the single source of truth for what's done, what's open, and what happened last.
 
 ---
 
-## Last Session Recap (2026-07-28)
+## Last Session Recap (2026-08-20)
+
+### Status review (no code changes yet — 2 live issues found):
+
+**🔴 Stock Bot discretionary scans DOWN since Aug 17** — all 3 LLM providers 404:
+- `gemini-2.0-flash`, `groq/llama-3.1-8b-instant`, `cerebras/llama3.1-70b` all return HTTP 404 (deprecated free-tier model IDs got rotated). Router in `scripts/llm_router.py`.
+- Impact: Pre-market Research, Market Open, Midday/Afternoon Scan, Daily Summary all fail. Last success Aug 14.
+- **NOT impacted:** mechanical Strategy 18 (Asset Class TF) doesn't call the LLM → still runs, positions safe.
+- Secondary bug: `call_llm` only falls back to `fallback_model` on rate-limit/payload errors, NOT on 404 (llm_router.py ~line 313). A dead primary model kills the provider instead of trying the fallback.
+
+**🟠 FX Bot broker reconciliation churn** — 17 of 23 closed trades exited via broker sync, not strategy:
+- 10× `broker_sync_missing`, 7× `broker_stop_orphan_cleanup`, only 6 clean TP/SL exits.
+- Positions keep vanishing/orphaning on Capital.com → trades close early instead of running to 3R TP. This is likely why realized PnL is flat/negative.
+- One transient failure Aug 19 22:31: Capital.com `429 too-many-requests` on /session (no retry/backoff on auth). Isolated — other runs that day succeeded.
+
+### Current state (Aug 20):
+- **FX Bot:** 5 open longs — USDCHF (Jul 31), USDCAD (Aug 7), GBPUSD (Aug 10), GBPJPY (Aug 11), USDJPY (Aug 12). 23 closed, realized **-$6.30**. Regime TRENDING, VIX 15.2. Running 3x/day (1 transient 429 fail).
+- **Stock Bot:** equity **$100,159** (Aug 16), unrealized +$2,761. Holding 6 ETFs steady (DBC, EFA, SPY, VNQ, XLF, XLK) — **churn confirmed stopped**. Recovered above $100k start. Discretionary scans down (see above); ETF strategy fine.
+- **Weather Bot:** active (last trade today). 183 trades, 169 resolved, **59.8% WR but realized -$0.75** (balance $100.4→$101.04). High hit rate not converting — NO bets at 0.42-0.58 entry yield tiny wins. Almost all NO (179/4).
+- **Events (EV) Bot:** still paused. Commit c26e3ad tightened params / blocked YES / added skepticism penalty but no trades placed.
+
+### Carry-forward items now RESOLVED:
+- [x] Stock Bot churn stopped — 6 ETFs held steady weeks, no buy/sell thrash
+- [x] Stock Bot realized P&L recovered — equity above $100k start
+- [x] Asset Class TF + Sector Momentum first runs — both executed, state files committed
+- [x] Weather Bot post-fix trades resolving — 169 resolved, 59.8% WR
+- [x] FX EURGBP short — first short closed +$1.60
+
+### Open decisions from this review:
+- **Fix LLM router model IDs** (stock scans) — needs current Aug-2026 free model IDs (research + swap).
+- **FX broker reconciliation** — investigate why Capital.com positions vanish; add 429 retry/backoff on session auth.
+- **Weather Bot monetization** — 60% WR but flat. Either it's fine as low-variance ballast, or needs edge/size rethink to actually profit.
+
+---
+
+## Prior Session Recap (2026-07-28)
 
 ### What was built/fixed:
 - **PA strategy 101 permanently killed** (3-layer fix): hardcoded KILLED_STRATEGIES dict in db.py enforced on every init, code-level block in signal generator, regime detector marks killed strategies. Root cause: no code path ever set status='killed', two divergent DBs (data/ vs shared/), seed function overwrote status on every run.
@@ -122,6 +157,7 @@
 - [x] Weather bot cache poison fixed (isolated cache namespaces per bot) — 2026-07-28
 - [x] Orphaned trades cleaned (8 deleted from pipeline.db) — 2026-07-28
 - [x] 3x daily FX schedule + Aug 1 workflows verified — 2026-07-28
+- [x] FX deal ID orphan bug fixed (Capital.com confirm vs position endpoint mismatch) — 2026-07-29
 - [x] Events Bot: bankroll floor + max 15 markets per scan — 2026-05-04
 - [x] Events Bot: live crypto prices, market categories, LLM calibration — 2026-05-04
 - [x] Events Bot: batch LLM calls (~80% token savings) — 2026-05-04
