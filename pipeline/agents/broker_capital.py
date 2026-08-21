@@ -417,21 +417,34 @@ class CapitalBroker:
         if not deal_id:
             return None
         now = datetime.now(timezone.utc)
-        frm = (now - timedelta(hours=since_hours)).strftime("%Y-%m-%dT%H:%M:%S")
-        to = now.strftime("%Y-%m-%dT%H:%M:%S")
         epic = self._epic(symbol) if symbol else None
 
+        # Capital.com caps the history date range per request (~24h; a wider
+        # span returns error.invalid.daterange). Walk the lookback in <=24h
+        # windows, newest-first, and stop as soon as we have a match.
+        WINDOW_H = 24
+        n_windows = max(1, (since_hours + WINDOW_H - 1) // WINDOW_H)
+
+        def _fetch(path: str, key: str, extra: dict) -> list:
+            rows: list = []
+            for i in range(n_windows):
+                w_to = now - timedelta(hours=i * WINDOW_H)
+                w_from = now - timedelta(hours=min((i + 1) * WINDOW_H, since_hours))
+                params = {
+                    "from": w_from.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "to": w_to.strftime("%Y-%m-%dT%H:%M:%S"),
+                }
+                params.update(extra)
+                try:
+                    data = self._request("GET", path, params=params)
+                    if isinstance(data, dict):
+                        rows.extend(data.get(key) or [])
+                except Exception as e:
+                    log.warning(f"get_deal_history: {path} window {i} fetch failed: {e}")
+            return rows
+
         # --- 1) Activity: locate the closing activity for this deal ---
-        activities: list = []
-        try:
-            adata = self._request(
-                "GET", "/api/v1/history/activity",
-                params={"from": frm, "to": to, "detailed": "true"},
-            )
-            if isinstance(adata, dict):
-                activities = adata.get("activities") or []
-        except Exception as e:
-            log.warning(f"get_deal_history: activity fetch failed: {e}")
+        activities: list = _fetch("/api/v1/history/activity", "activities", {"detailed": "true"})
 
         def _refs_deal(act: dict) -> bool:
             if act.get("dealId") == deal_id:
@@ -486,16 +499,7 @@ class CapitalBroker:
 
         # --- 2) Transactions: realized P&L (and close price / reason fallback) ---
         pnl = None
-        txns: list = []
-        try:
-            tdata = self._request(
-                "GET", "/api/v1/history/transactions",
-                params={"from": frm, "to": to, "type": "TRADE"},
-            )
-            if isinstance(tdata, dict):
-                txns = tdata.get("transactions") or []
-        except Exception as e:
-            log.warning(f"get_deal_history: transactions fetch failed: {e}")
+        txns: list = _fetch("/api/v1/history/transactions", "transactions", {"type": "TRADE"})
 
         # Candidate trade rows: right instrument (if known) with a parseable P&L.
         candidates = []
@@ -672,16 +676,28 @@ if __name__ == "__main__":
         if args.deal_history:
             if args.raw:
                 now = datetime.now(timezone.utc)
-                frm = (now - timedelta(hours=args.hours)).strftime("%Y-%m-%dT%H:%M:%S")
-                to = now.strftime("%Y-%m-%dT%H:%M:%S")
-                print("=== RAW activity (detailed) ===")
-                act = broker._request("GET", "/api/v1/history/activity",
-                                      params={"from": frm, "to": to, "detailed": "true"})
-                print(_json.dumps(act, indent=2)[:6000])
+                WIN = 24
+                n = max(1, (args.hours + WIN - 1) // WIN)
+                all_act, all_txn = [], []
+                for i in range(n):
+                    w_to = (now - timedelta(hours=i * WIN)).strftime("%Y-%m-%dT%H:%M:%S")
+                    w_from = (now - timedelta(hours=min((i + 1) * WIN, args.hours))).strftime("%Y-%m-%dT%H:%M:%S")
+                    try:
+                        a = broker._request("GET", "/api/v1/history/activity",
+                                            params={"from": w_from, "to": w_to, "detailed": "true"})
+                        all_act.extend(a.get("activities") or [])
+                    except Exception as e:
+                        print(f"  activity window {i} err: {e}")
+                    try:
+                        t = broker._request("GET", "/api/v1/history/transactions",
+                                            params={"from": w_from, "to": w_to, "type": "TRADE"})
+                        all_txn.extend(t.get("transactions") or [])
+                    except Exception as e:
+                        print(f"  txn window {i} err: {e}")
+                print("=== RAW activities (detailed) ===")
+                print(_json.dumps(all_act, indent=2)[:8000])
                 print("=== RAW transactions (TRADE) ===")
-                txn = broker._request("GET", "/api/v1/history/transactions",
-                                      params={"from": frm, "to": to, "type": "TRADE"})
-                print(_json.dumps(txn, indent=2)[:6000])
+                print(_json.dumps(all_txn, indent=2)[:8000])
             print("=== PARSED get_deal_history ===")
             result = broker.get_deal_history(args.deal_history, symbol=args.symbol, since_hours=args.hours)
             print(_json.dumps(result, indent=2))
