@@ -1534,34 +1534,76 @@ def run_daily(dry_run: bool = False, db_path: str | None = None):
                     # Confirmed gone across >= threshold consecutive runs.
                     print(f"  SYNC: DB position {db_symbol} (id={r['id']}, deal={db_deal_id}) "
                           f"confirmed gone from broker ({new_missing} consecutive misses) — closing in DB")
+
+                    # Preferred: read the broker's REAL fill from history. The
+                    # position closed EARLIER at a server-side TP/SL/stop, so the
+                    # current market price is NOT the fill price (observed 230-260
+                    # pip "losses" past an 80-pip stop = current-price estimates,
+                    # not real fills). Record the truthful exit + reason instead.
+                    real_close = None
                     try:
-                        price_data = broker_test.get_price(db_symbol)
-                        exit_price = price_data.get("bid") if r["side"] == "long" else price_data.get("ask")
-                        exit_price = float(exit_price) if exit_price else float(r["entry_price"])
-                    except Exception as price_err:
-                        print(f"    WARNING: Could not fetch price for {db_symbol}: {price_err} — using entry_price as exit")
-                        exit_price = float(r["entry_price"])
-                    try:
-                        pnl = calculate_fx_pnl(
-                            db_symbol,
-                            r["side"],
-                            float(r["entry_price"]),
-                            exit_price,
-                            float(r["quantity"]),
-                            broker_test,
+                        real_close = broker_test.get_deal_history(db_deal_id, db_symbol)
+                    except Exception as hist_err:
+                        print(f"    WARNING: deal-history lookup failed for {db_symbol}: {hist_err}")
+
+                    if real_close and real_close.get("close_price"):
+                        exit_price = float(real_close["close_price"])
+                        exit_reason = real_close.get("reason") or "broker_closed"
+                        closed_at = real_close.get("close_time") or now_str
+                        pnl = real_close.get("pnl")
+                        if pnl is None:
+                            try:
+                                pnl = calculate_fx_pnl(
+                                    db_symbol, r["side"], float(r["entry_price"]),
+                                    exit_price, float(r["quantity"]), broker_test,
+                                )
+                            except Exception as pnl_err:
+                                print(f"    WARNING: P&L calc failed for {db_symbol}: {pnl_err} — recording $0 P&L")
+                                pnl = 0.0
+                        else:
+                            pnl = float(pnl)
+                        conn.execute(
+                            """UPDATE paper_trades
+                               SET status = 'closed', exit_price = ?, pnl = ?, closed_at = ?,
+                                   exit_reason = ?
+                               WHERE id = ?""",
+                            (exit_price, pnl, closed_at, exit_reason, r["id"]),
                         )
-                    except Exception as pnl_err:
-                        print(f"    WARNING: P&L calculation failed for {db_symbol}: {pnl_err} — recording $0 P&L")
-                        pnl = 0.0
-                    conn.execute(
-                        """UPDATE paper_trades
-                           SET status = 'closed', exit_price = ?, pnl = ?, closed_at = ?,
-                               exit_reason = 'broker_sync_missing'
-                           WHERE id = ?""",
-                        (exit_price, pnl, now_str, r["id"]),
-                    )
-                    conn.commit()
-                    print(f"    Closed: {db_symbol} {r['side']} @ {exit_price} (entry={r['entry_price']}), P&L=${pnl:.2f}")
+                        conn.commit()
+                        print(f"    Closed (REAL fill): {db_symbol} {r['side']} @ {exit_price} "
+                              f"(entry={r['entry_price']}), reason={exit_reason}, P&L=${pnl:.2f}")
+                    else:
+                        # Fallback: no broker history match — estimate at current price
+                        # and label it truthfully as an unconfirmed sync close.
+                        try:
+                            price_data = broker_test.get_price(db_symbol)
+                            exit_price = price_data.get("bid") if r["side"] == "long" else price_data.get("ask")
+                            exit_price = float(exit_price) if exit_price else float(r["entry_price"])
+                        except Exception as price_err:
+                            print(f"    WARNING: Could not fetch price for {db_symbol}: {price_err} — using entry_price as exit")
+                            exit_price = float(r["entry_price"])
+                        try:
+                            pnl = calculate_fx_pnl(
+                                db_symbol,
+                                r["side"],
+                                float(r["entry_price"]),
+                                exit_price,
+                                float(r["quantity"]),
+                                broker_test,
+                            )
+                        except Exception as pnl_err:
+                            print(f"    WARNING: P&L calculation failed for {db_symbol}: {pnl_err} — recording $0 P&L")
+                            pnl = 0.0
+                        conn.execute(
+                            """UPDATE paper_trades
+                               SET status = 'closed', exit_price = ?, pnl = ?, closed_at = ?,
+                                   exit_reason = 'broker_sync_missing'
+                               WHERE id = ?""",
+                            (exit_price, pnl, now_str, r["id"]),
+                        )
+                        conn.commit()
+                        print(f"    Closed (current-price est.): {db_symbol} {r['side']} @ {exit_price} "
+                              f"(entry={r['entry_price']}), P&L=${pnl:.2f}")
 
                 if not broker_positions:
                     print(f"  No open positions on broker")

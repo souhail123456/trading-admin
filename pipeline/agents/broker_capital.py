@@ -364,6 +364,205 @@ class CapitalBroker:
             })
         return positions
 
+    # ----- History / real-fill reconciliation -----
+
+    @staticmethod
+    def _parse_money(val) -> float | None:
+        """Parse a Capital.com money string like 'USD-2.50', '-2.50', or a number."""
+        if val is None:
+            return None
+        if isinstance(val, (int, float)):
+            return float(val)
+        import re
+        m = re.search(r"-?\d+(?:\.\d+)?", str(val).replace(",", ""))
+        return float(m.group()) if m else None
+
+    @staticmethod
+    def _norm_name(name: str | None) -> str:
+        """Strip an instrument name to bare letters for epic matching (EUR/USD -> EURUSD)."""
+        import re
+        return re.sub(r"[^A-Z]", "", (name or "").upper())
+
+    def get_deal_history(self, deal_id: str, symbol: str | None = None, since_hours: int = 72) -> dict | None:
+        """Find the REAL broker-side close of a deal via the history endpoints.
+
+        A position closed by the broker's own server-side TP/SL/stop (or a
+        margin/system close) leaves the local DB unaware of the true fill.
+        The current-market price at *detection* time is NOT the fill price and
+        can wildly overstate a loss (observed 230-260 pip "losses" past an
+        80-pip stop). This reads the broker's own record of what actually
+        happened.
+
+        Data sources (both reuse `_request()` session/retry machinery):
+          - GET /api/v1/history/activity?from&to&detailed=true
+              -> position-lifecycle activities. A close carries a `source`
+                 (TP / SL / CLOSE_OUT / DEALER / USER / SYSTEM), a `dateUTC`,
+                 and (with detailed=true) a `details` object holding the fill
+                 `level` and an `actions[]` list whose `actionType` marks
+                 POSITION_CLOSED and whose `affectedDealId`/`dealId` ties back
+                 to the original position deal id.
+          - GET /api/v1/history/transactions?from&to&type=TRADE
+              -> realized ledger rows with `closeLevel` and `profitAndLoss`
+                 (a money string, account currency). Matched to the deal by
+                 instrument + close-price/time proximity.
+
+        Returns {"close_price": float, "close_time": iso|None,
+                 "reason": str, "pnl": float|None} where reason is one of
+        broker_tp / broker_stop / broker_closed, or None if no close is found
+        (endpoints missing, empty window, or deal not matched) -> caller keeps
+        its current-price fallback.
+        """
+        from datetime import datetime, timedelta, timezone
+
+        if not deal_id:
+            return None
+        now = datetime.now(timezone.utc)
+        frm = (now - timedelta(hours=since_hours)).strftime("%Y-%m-%dT%H:%M:%S")
+        to = now.strftime("%Y-%m-%dT%H:%M:%S")
+        epic = self._epic(symbol) if symbol else None
+
+        # --- 1) Activity: locate the closing activity for this deal ---
+        activities: list = []
+        try:
+            adata = self._request(
+                "GET", "/api/v1/history/activity",
+                params={"from": frm, "to": to, "detailed": "true"},
+            )
+            if isinstance(adata, dict):
+                activities = adata.get("activities") or []
+        except Exception as e:
+            log.warning(f"get_deal_history: activity fetch failed: {e}")
+
+        def _refs_deal(act: dict) -> bool:
+            if act.get("dealId") == deal_id:
+                return True
+            det = act.get("details") or {}
+            if det.get("dealReference") == deal_id:
+                return True
+            for a in (det.get("actions") or []):
+                if a.get("affectedDealId") == deal_id or a.get("dealId") == deal_id:
+                    return True
+            return False
+
+        def _close_action(act: dict) -> bool:
+            det = act.get("details") or {}
+            for a in (det.get("actions") or []):
+                if "CLOS" in (a.get("actionType") or "").upper():
+                    return True
+            return "CLOS" in (act.get("actionType") or "").upper()
+
+        close_act = None
+        for act in activities:
+            if _refs_deal(act) and _close_action(act):
+                close_act = act
+                break
+        if close_act is None:  # fallback: reference + a close-y source
+            for act in activities:
+                src = (act.get("source") or "").upper()
+                if _refs_deal(act) and src in ("TP", "SL", "CLOSE_OUT", "DEALER", "SYSTEM"):
+                    close_act = act
+                    break
+
+        close_price = None
+        close_time = None
+        reason = None
+        if close_act is not None:
+            det = close_act.get("details") or {}
+            lvl = det.get("level")
+            if lvl is None:
+                for a in (det.get("actions") or []):
+                    if a.get("level") is not None:
+                        lvl = a.get("level")
+                        break
+            close_price = float(lvl) if lvl is not None else None
+            close_time = close_act.get("dateUTC") or close_act.get("dateUtc") or close_act.get("date")
+            src = (close_act.get("source") or "").upper()
+            if src == "TP":
+                reason = "broker_tp"
+            elif src == "SL":
+                reason = "broker_stop"
+            else:
+                reason = "broker_closed"
+
+        # --- 2) Transactions: realized P&L (and close price / reason fallback) ---
+        pnl = None
+        txns: list = []
+        try:
+            tdata = self._request(
+                "GET", "/api/v1/history/transactions",
+                params={"from": frm, "to": to, "type": "TRADE"},
+            )
+            if isinstance(tdata, dict):
+                txns = tdata.get("transactions") or []
+        except Exception as e:
+            log.warning(f"get_deal_history: transactions fetch failed: {e}")
+
+        # Candidate trade rows: right instrument (if known) with a parseable P&L.
+        candidates = []
+        for t in txns:
+            if (t.get("transactionType") or "").upper() not in ("TRADE", ""):
+                continue
+            if epic and self._norm_name(t.get("instrumentName")) and epic not in self._norm_name(t.get("instrumentName")):
+                continue
+            p = self._parse_money(t.get("profitAndLoss"))
+            if p is None:
+                p = self._parse_money(t.get("size")) if t.get("closeLevel") is not None else None
+            candidates.append((t, p))
+
+        best = None
+        if candidates:
+            if close_price is not None:
+                def _dist(t):
+                    cl = self._parse_money(t.get("closeLevel"))
+                    return abs(cl - close_price) if cl is not None else float("inf")
+                best = min(candidates, key=lambda c: _dist(c[0]))
+            elif close_time is not None:
+                # match by nearest timestamp
+                def _parse_dt(s):
+                    try:
+                        return datetime.fromisoformat(str(s).replace("Z", "").split(".")[0])
+                    except Exception:
+                        return None
+                ct = _parse_dt(close_time)
+                if ct is not None:
+                    def _real_tdist(c):
+                        d = _parse_dt(c[0].get("dateUtc") or c[0].get("dateUTC") or c[0].get("date"))
+                        return abs((d - ct).total_seconds()) if d else float("inf")
+                    best = min(candidates, key=_real_tdist)
+                else:
+                    best = candidates[0]
+            else:
+                best = candidates[0]
+
+        if best is not None:
+            trow, tp = best
+            pnl = tp
+            # Fill in close price / time / reason from the ledger row if activity lacked them.
+            if close_price is None:
+                close_price = self._parse_money(trow.get("closeLevel"))
+            if close_time is None:
+                close_time = trow.get("dateUtc") or trow.get("dateUTC") or trow.get("date")
+            if reason is None:
+                note = (trow.get("note") or "").lower()
+                if "stop" in note:
+                    reason = "broker_stop"
+                elif "profit" in note or "take" in note or "limit" in note:
+                    reason = "broker_tp"
+                else:
+                    reason = "broker_closed"
+
+        if close_price is None and pnl is None:
+            return None
+        if close_price is None:
+            # No usable exit price -> let caller fall back to current-price estimate.
+            return None
+        return {
+            "close_price": float(close_price),
+            "close_time": close_time,
+            "reason": reason or "broker_closed",
+            "pnl": pnl,
+        }
+
     # ----- Market Data -----
 
     def get_price(self, symbol: str) -> dict | None:
@@ -447,3 +646,46 @@ class CapitalBroker:
             )
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Diagnostic CLI: verify get_deal_history against a real recently-closed deal.
+#   python3 -m pipeline.agents.broker_capital --deal-history <dealId> [--symbol EURUSD] [--hours 168] [--raw]
+# Kept as a clean, harmless read-only flag for future re-verification.
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    import argparse
+    import json as _json
+    from datetime import datetime, timedelta, timezone
+
+    parser = argparse.ArgumentParser(description="Capital.com broker diagnostics")
+    parser.add_argument("--deal-history", metavar="DEAL_ID",
+                        help="Look up the real close of a deal via history endpoints")
+    parser.add_argument("--symbol", help="Symbol hint for the deal (e.g. EURUSD)")
+    parser.add_argument("--hours", type=int, default=72, help="Lookback window in hours")
+    parser.add_argument("--raw", action="store_true",
+                        help="Also dump raw activity/transactions JSON for field verification")
+    args = parser.parse_args()
+
+    broker = CapitalBroker()
+    try:
+        if args.deal_history:
+            if args.raw:
+                now = datetime.now(timezone.utc)
+                frm = (now - timedelta(hours=args.hours)).strftime("%Y-%m-%dT%H:%M:%S")
+                to = now.strftime("%Y-%m-%dT%H:%M:%S")
+                print("=== RAW activity (detailed) ===")
+                act = broker._request("GET", "/api/v1/history/activity",
+                                      params={"from": frm, "to": to, "detailed": "true"})
+                print(_json.dumps(act, indent=2)[:6000])
+                print("=== RAW transactions (TRADE) ===")
+                txn = broker._request("GET", "/api/v1/history/transactions",
+                                      params={"from": frm, "to": to, "type": "TRADE"})
+                print(_json.dumps(txn, indent=2)[:6000])
+            print("=== PARSED get_deal_history ===")
+            result = broker.get_deal_history(args.deal_history, symbol=args.symbol, since_hours=args.hours)
+            print(_json.dumps(result, indent=2))
+        else:
+            parser.print_help()
+    finally:
+        broker.disconnect()

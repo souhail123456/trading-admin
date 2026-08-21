@@ -1,0 +1,43 @@
+name: DEBUG Deal History
+
+# TEMPORARY diagnostic workflow — verifies broker_capital.get_deal_history()
+# against a real recently-closed deal using live Capital.com credentials
+# (which live only in GH secrets). Remove after verification.
+
+on:
+  workflow_dispatch:
+    inputs:
+      deal_id:
+        description: "Capital.com deal ID to look up"
+        required: true
+      symbol:
+        description: "Symbol hint (e.g. USDCHF)"
+        required: false
+        default: ""
+      hours:
+        description: "Lookback window in hours"
+        required: false
+        default: "168"
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements-pipeline.txt
+      - name: Run deal-history diagnostic
+        env:
+          CAPITAL_API_KEY: ${{ secrets.CAPITAL_API_KEY }}
+          CAPITAL_EMAIL: ${{ secrets.CAPITAL_EMAIL }}
+          CAPITAL_PASSWORD: ${{ secrets.CAPITAL_PASSWORD }}
+          CAPITAL_ENV: "demo"
+        run: |
+          python3 -m pipeline.agents.broker_capital \
+            --deal-history "${{ github.event.inputs.deal_id }}" \
+            --symbol "${{ github.event.inputs.symbol }}" \
+            --hours "${{ github.event.inputs.hours }}" \
+            --raw
