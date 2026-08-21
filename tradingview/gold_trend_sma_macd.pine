@@ -1,0 +1,87 @@
+// =============================================================================
+// Gold Trend — SMA-200 + MACD  (Pine Script v5, strategy)
+// Port of the live fx_trend strategy, single-instrument.
+//   Entry:  price vs SMA-200 (direction) AND MACD histogram agreement (momentum)
+//   Risk:   2x ATR stop, 3R take-profit, 2% equity risked per trade (ATR-sized)
+//   Costs:  spread modeled as commission + slippage  (TV paper ignores these!)
+// Apply to XAUUSD (Gold) on the Daily timeframe. Works on Nasdaq/S&P too.
+// =============================================================================
+//@version=5
+strategy(
+     title            = "Gold Trend SMA200+MACD",
+     overlay          = true,
+     currency         = currency.USD,          // report P&L in USD (handles cross-ccy)
+     initial_capital  = 1000,
+     default_qty_type = strategy.fixed,        // we set qty explicitly (ATR-sized)
+     commission_type  = strategy.commission.percent,
+     // Spread cost applied per side. Gold on Capital.com ~0.02-0.05%. TUNE this.
+     commission_value = input.float(0.03, "Spread cost % (per side)", group = "Costs"),
+     slippage         = 2,                     // ticks; live fills aren't perfect
+     pyramiding       = 0,
+     calc_on_every_tick = false,
+     process_orders_on_close = true)
+
+// ---- Inputs -----------------------------------------------------------------
+smaLen      = input.int(200,  "SMA length",              group = "Trend")
+useMacd     = input.bool(true,"MACD histogram filter",   group = "Momentum")
+macdFast    = input.int(12,   "MACD fast",               group = "Momentum")
+macdSlow    = input.int(26,   "MACD slow",               group = "Momentum")
+macdSig     = input.int(9,    "MACD signal",             group = "Momentum")
+allowLong   = input.bool(true,  "Allow longs",           group = "Direction")
+allowShort  = input.bool(true,  "Allow shorts",          group = "Direction")
+
+atrLen      = input.int(14,   "ATR length",              group = "Risk")
+atrStopMult = input.float(2.0,"Stop = ATR x",            group = "Risk", step = 0.5)
+tpR         = input.float(3.0,"Take-profit (R multiple)",group = "Risk", step = 0.5)
+riskPct     = input.float(2.0,"Risk % of equity/trade",  group = "Risk", step = 0.5)
+
+// Cost model — spread is wired into commission_value in the strategy() header.
+// WARNING: SWAP / overnight financing is NOT modeled by Pine at all. A multi-day
+// trend holder pays swap nightly in real life -> these results are slightly
+// OPTIMISTIC. Prove on a broker-demo integration (e.g. OANDA) for true costs.
+
+// ---- Indicators -------------------------------------------------------------
+sma  = ta.sma(close, smaLen)
+atr  = ta.atr(atrLen)
+[macdLine, sigLine, hist] = ta.macd(close, macdFast, macdSlow, macdSig)
+
+// enough history?
+ready = not na(sma) and not na(atr) and bar_index > smaLen + 10
+
+// ---- Entry conditions -------------------------------------------------------
+longMomOK  = not useMacd or hist > 0
+shortMomOK = not useMacd or hist < 0
+
+longSignal  = ready and allowLong  and close > sma and longMomOK
+shortSignal = ready and allowShort and close < sma and shortMomOK
+
+// ---- Position sizing: risk 2% of equity across the 2xATR stop distance ------
+stopDist = atr * atrStopMult
+riskCash = strategy.equity * (riskPct / 100.0)
+qty      = stopDist > 0 ? riskCash / stopDist : na          // units (oz for gold)
+
+// ---- Execution --------------------------------------------------------------
+// Longs
+if longSignal and strategy.position_size <= 0 and not na(qty)
+    strategy.entry("Long", strategy.long, qty = qty)
+    stopL = close - stopDist
+    tpL   = close + tpR * stopDist
+    strategy.exit("L-exit", from_entry = "Long", stop = stopL, limit = tpL)
+
+// Shorts
+if shortSignal and strategy.position_size >= 0 and not na(qty)
+    strategy.entry("Short", strategy.short, qty = qty)
+    stopS = close + stopDist
+    tpS   = close - tpR * stopDist
+    strategy.exit("S-exit", from_entry = "Short", stop = stopS, limit = tpS)
+
+// Trend-flip exits (mirror the live SMA-recross exit)
+if strategy.position_size > 0 and close < sma
+    strategy.close("Long", comment = "SMA flip")
+if strategy.position_size < 0 and close > sma
+    strategy.close("Short", comment = "SMA flip")
+
+// ---- Plots ------------------------------------------------------------------
+plot(sma, "SMA-200", color = color.orange, linewidth = 2)
+plotshape(longSignal  and strategy.position_size <= 0, title = "Long",  style = shape.triangleup,   location = location.belowbar, color = color.green, size = size.tiny)
+plotshape(shortSignal and strategy.position_size >= 0, title = "Short", style = shape.triangledown, location = location.abovebar, color = color.red,   size = size.tiny)
