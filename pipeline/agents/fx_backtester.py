@@ -491,6 +491,142 @@ def compare_all(db_path: str | None = None) -> dict:
     return results
 
 
+# ---------------------------------------------------------------------------
+# BACKTEST-ONLY broader universe (analysis only — NOT part of the live traded set)
+# ---------------------------------------------------------------------------
+# Used ONLY by compare_universe() to test the thesis that the SMA-200 trend
+# strategy trends more cleanly on metals / equity indices / energy than on spot
+# FX majors. These tickers are deliberately kept OUT of
+# data_fetcher.CURRENCY_PAIRS, so they can NEVER leak into live signal
+# generation — fx_signal_generator only ever iterates CURRENCY_PAIRS.
+#
+# CARRY NOTE: fx_trend_following() ranks candidates purely by `trend_strength`
+# (the FX carry term lives only in the LIVE fx_trend_signals composite, not in
+# the backtester). So for these non-FX instruments there is literally nothing
+# to zero out — they carry no FX interest-rate differential and the backtest
+# ranking here is already pure trend_strength. Verified: no carry is fed in.
+#
+# (label, asset_class). Futures/cash-index tickers chosen over ETF proxies for
+# clean 2006-2026 history with no roll/tracking-error distortion.
+BACKTEST_EXTRA_UNIVERSE: dict[str, tuple[str, str]] = {
+    "GC=F":  ("Gold (fut)",     "metals"),
+    "SI=F":  ("Silver (fut)",   "metals"),
+    "^GSPC": ("S&P 500",        "indices"),
+    "^NDX":  ("Nasdaq 100",     "indices"),
+    "CL=F":  ("WTI Crude (fut)", "energy"),
+}
+FX_CLASS = "fx"
+
+
+def compare_universe(db_path: str | None = None, start: str = "2006-01-01") -> dict:
+    """Backtest the CURRENT LIVE fx-trend config (SMA-200, MACD ON, RSI OFF)
+    across the existing FX pairs AND a broader backtest-only universe of
+    gold / silver / equity indices / oil.
+
+    Each instrument is run in ISOLATION so we get a clean per-instrument trend
+    Sharpe (the strategy holds that instrument in any month it is above its own
+    SMA-200 with MACD histogram > 0, else sits flat). Metrics are then averaged
+    by asset class. Same strategy, same cost assumption (3 bps) everywhere so
+    the ONLY thing that varies is the instrument — an apples-to-apples test of
+    'are we trend-following the wrong universe?'.
+
+    ANALYSIS ONLY — this touches nothing in the live traded universe.
+    """
+    init_db(db_path)
+
+    fx_tickers = list(CURRENCY_PAIRS.keys())
+    extra_tickers = list(BACKTEST_EXTRA_UNIVERSE.keys())
+
+    log.info("Loading FX + broader universe for universe comparison...")
+    data = fetch_ohlcv(fx_tickers + extra_tickers, start=start)
+    log.info(f"Loaded {len(data)} instruments")
+
+    # Current live config: MACD ON, RSI OFF, SMA-200. cost_bps held equal across
+    # all instruments (3 bps) so the strategy is identical and only the
+    # instrument changes. NB: real costs differ (FX tightest; index/oil futures
+    # slightly wider) — see caveats in the report.
+    live_cfg = {"sma_period": 200, "top_n": 3, "cost_bps": 3,
+                "macd_filter": True, "rsi_filter": False}
+
+    labels: dict[str, str] = {}
+    classes: dict[str, str] = {}
+    for t in fx_tickers:
+        labels[t], classes[t] = CURRENCY_PAIRS[t], FX_CLASS
+    for t in extra_tickers:
+        labels[t], classes[t] = BACKTEST_EXTRA_UNIVERSE[t]
+
+    rows = []
+    for t in fx_tickers + extra_tickers:
+        if t not in data:
+            log.warning(f"  {t}: not loaded, skipping")
+            continue
+        # Run the strategy on this ONE instrument (no carry term involved).
+        r = fx_trend_following({t: data[t]}, **live_cfg)
+        if r.empty:
+            continue
+        m = compute_metrics(r)
+        if "error" in m:
+            log.warning(f"  {t}: {m['error']}")
+            continue
+        rows.append({
+            "ticker": t, "label": labels[t], "class": classes[t],
+            "total_return": m["total_return"], "sharpe": m["sharpe"],
+            "win_rate": m["win_rate"], "max_dd": m["max_drawdown"],
+            "cagr": m["cagr"], "months": m["total_months"],
+            "trades": int(r["trades_opened"].sum()),
+        })
+
+    rows.sort(key=lambda x: x["sharpe"], reverse=True)
+
+    # ---- Per-instrument table (ranked by Sharpe) ----
+    print(f"\n{'='*104}")
+    print("FX-TREND STRATEGY ACROSS A BROADER UNIVERSE — LIVE CONFIG (SMA-200, MACD ON, RSI OFF)")
+    print("Each instrument backtested in isolation, monthly rebalance, long-only, 3 bps cost. ANALYSIS ONLY.")
+    if rows:
+        print(f"Period: {start} to {data[fx_tickers[0]].index[-1].date()}  (ranked by Sharpe)")
+    print(f"{'='*104}")
+    print(f"{'Instrument':<16} {'Class':<9} {'TotRet%':>10} {'CAGR%':>8} {'Sharpe':>8} "
+          f"{'WinRate%':>9} {'MaxDD%':>9} {'#Trades':>8} {'Months':>7}")
+    print("-" * 104)
+    for r in rows:
+        print(f"{r['label']:<16} {r['class']:<9} {r['total_return']:>10} {r['cagr']:>8} "
+              f"{r['sharpe']:>8} {r['win_rate']:>9} {r['max_dd']:>9} {r['trades']:>8} {r['months']:>7}")
+
+    # ---- Per-class summary (mean of per-instrument metrics) ----
+    by_class: dict[str, list] = {}
+    for r in rows:
+        by_class.setdefault(r["class"], []).append(r)
+
+    def _mean(items, key):
+        return round(sum(i[key] for i in items) / len(items), 3)
+
+    class_summary = {}
+    print(f"\n{'='*104}")
+    print("PER-CLASS SUMMARY (mean of single-instrument backtests)")
+    print(f"{'='*104}")
+    print(f"{'Class':<10} {'#Instr':>7} {'Mean TotRet%':>13} {'Mean Sharpe':>12} "
+          f"{'Mean WinRate%':>14} {'Mean MaxDD%':>12} {'Sum Trades':>11}")
+    print("-" * 104)
+    # order classes by mean Sharpe
+    ordered = sorted(by_class.items(), key=lambda kv: _mean(kv[1], "sharpe"), reverse=True)
+    for cls, items in ordered:
+        summ = {
+            "n": len(items),
+            "mean_total_return": _mean(items, "total_return"),
+            "mean_sharpe": _mean(items, "sharpe"),
+            "mean_win_rate": _mean(items, "win_rate"),
+            "mean_max_dd": _mean(items, "max_dd"),
+            "sum_trades": sum(i["trades"] for i in items),
+        }
+        class_summary[cls] = summ
+        print(f"{cls:<10} {summ['n']:>7} {summ['mean_total_return']:>13} "
+              f"{summ['mean_sharpe']:>12} {summ['mean_win_rate']:>14} "
+              f"{summ['mean_max_dd']:>12} {summ['sum_trades']:>11}")
+    print(f"{'='*104}\n")
+
+    return {"per_instrument": rows, "per_class": class_summary}
+
+
 def compare_entry_filters(db_path: str | None = None, start: str = "2005-01-01") -> dict:
     """Backtest gate for the MACD + RSI entry-confirmation filters on the
     FX trend strategy. Compares:
@@ -548,7 +684,9 @@ def compare_entry_filters(db_path: str | None = None, start: str = "2005-01-01")
 
 def main():
     import sys
-    if "--filters" in sys.argv:
+    if "--universe" in sys.argv:
+        compare_universe()
+    elif "--filters" in sys.argv:
         compare_entry_filters()
     else:
         compare_all()
