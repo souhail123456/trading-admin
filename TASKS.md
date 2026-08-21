@@ -51,8 +51,14 @@
 - **⚠️ Effectively live next run** — MACD is on main by default; next scheduled FX pipeline uses it.
 - **Caveat / to verify:** backtester is long-only monthly; the SHORT-side filter is logic-verified only, not backtested. Watch the first few MACD-gated short entries.
 
+### FX true-fill labeling — DONE + live-verified (trading-admin `71cec53`→`a5a2722`, 2026-08-21):
+- Confirmed-gone closes now read the broker's REAL fill history first (exit price, close time, realized P&L, truthful reason `broker_stop`/`broker_tp`/`broker_closed`). Old current-price `broker_sync_missing` estimate is now only a fallback when history returns None.
+- New `broker_capital.py: get_deal_history(deal_id, symbol, since_hours)` + read-only `--deal-history <id>` CLI flag.
+- **Real schema (verified live — Capital.com docs were WRONG):** close = `type:"POSITION"` activity keyed by `source` (SL/TP/CLOSE_OUT), fill in `details.level`, time `dateUTC`; realized cash P&L from `history/transactions` `size` field by `dealId` (no `profitAndLoss`/`closeLevel` fields exist live). Both endpoints cap spans at ~24h → queries chunked. `_implied_exit_price()` derives exit when only P&L is available.
+- **Proof of the old bug:** GBPUSD real +$10.69 vs recorded +$4.89; USDCHF real -$13.19 vs -$14.29.
+- Pipeline green (32507779399); AUDUSD already mid-flight on the fixed path. Orphan path (`reconcile_broker_vs_db`) books no price/pnl so left unchanged.
+
 ### Still open / carry forward:
-- **FX true-fill labeling** — read Capital.com activity/history endpoint so broker-side TP/SL exits record the real fill price instead of `broker_sync_missing` at current price.
 - **Align cache keys across workflows** — `weekly_research.yml` caches `data/pipeline.db` under a non-`v62` key but its `restore-keys: pipeline-db-` prefix can pull `daily_pipeline`'s `v62` cache; asymmetric lineage could reintroduce drift if weekly ever writes back.
 - **`v62` cache-miss re-seed vector** — a cache miss still seeds a fresh DB (historical strategy-101 re-seed cause); currently guarded by `KILLED_STRATEGIES` enforcement in `db.py`, but the seed-on-miss path remains.
 - **Monitor first LLM-router run in a live scan window** — Midday Scan passed via Gemini; confirm daily scans resume producing research/summaries.
