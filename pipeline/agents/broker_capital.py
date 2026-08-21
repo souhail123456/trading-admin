@@ -406,10 +406,14 @@ class CapitalBroker:
                  (a money string, account currency). Matched to the deal by
                  instrument + close-price/time proximity.
 
-        Returns {"close_price": float, "close_time": iso|None,
+        Returns {"close_price": float|None, "close_time": iso|None,
                  "reason": str, "pnl": float|None} where reason is one of
-        broker_tp / broker_stop / broker_closed, or None if no close is found
-        (endpoints missing, empty window, or deal not matched) -> caller keeps
+        broker_tp / broker_stop / broker_closed. close_price is the exact fill
+        level when the activity feed has it; it can be None while pnl is set
+        (transactions retain the realized P&L by dealId even when the activity
+        feed lacks that deal's close) — the caller then derives a consistent
+        exit price from pnl. Returns None only when neither a price nor a P&L is
+        found (endpoints missing, empty window, deal unmatched) -> caller keeps
         its current-price fallback.
         """
         from datetime import datetime, timedelta, timezone
@@ -579,13 +583,16 @@ class CapitalBroker:
                 else:
                     reason = "broker_closed"
 
+        # Return whenever the broker gave us a real close signal: the exact fill
+        # level (from activity) and/or the realized P&L (from transactions).
+        # The activity feed occasionally lacks a given deal's close while the
+        # transaction ledger still has the realized P&L by dealId — in that case
+        # close_price comes back None and the caller derives a consistent exit
+        # price from the real pnl. Only a total miss (no price AND no pnl) -> None.
         if close_price is None and pnl is None:
             return None
-        if close_price is None:
-            # No usable exit price -> let caller fall back to current-price estimate.
-            return None
         return {
-            "close_price": float(close_price),
+            "close_price": float(close_price) if close_price is not None else None,
             "close_time": close_time,
             "reason": reason or "broker_closed",
             "pnl": pnl,

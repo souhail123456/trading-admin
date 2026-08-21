@@ -227,6 +227,34 @@ def calculate_fx_pnl(
     return pnl
 
 
+def _implied_exit_price(symbol: str, side: str, entry_price: float, pnl: float,
+                        qty_micro_lots: float, broker=None) -> float:
+    """Back out the exit price consistent with a known realized P&L.
+
+    Fee-free inverse of calculate_fx_pnl's core formula. Used ONLY when the
+    broker reports a deal's realized P&L (history/transactions) but not the
+    fill level (the activity feed lacked that deal's close). The stored P&L is
+    still the broker's real value; this derived price just keeps the recorded
+    (exit_price, pnl) pair internally consistent for display.
+    """
+    try:
+        qty = float(qty_micro_lots)
+        entry = float(entry_price)
+        if qty == 0:
+            return entry
+        sgn = 1.0 if side == "long" else -1.0
+        if symbol in _JPY_CROSS_PAIRS:
+            usdjpy = _get_usdjpy_rate(broker)
+            return entry + sgn * pnl * usdjpy / qty
+        if symbol in _USD_BASE_PAIRS:
+            denom = sgn * qty - pnl
+            return (sgn * qty * entry / denom) if denom != 0 else entry
+        # USD-quote pairs and other crosses (EURGBP etc.)
+        return entry + sgn * pnl / qty
+    except Exception:
+        return float(entry_price)
+
+
 def get_current_regime(conn: sqlite3.Connection) -> dict | None:
     """Load the latest regime classification from global_state.json or agent_log.
 
@@ -1546,22 +1574,37 @@ def run_daily(dry_run: bool = False, db_path: str | None = None):
                     except Exception as hist_err:
                         print(f"    WARNING: deal-history lookup failed for {db_symbol}: {hist_err}")
 
-                    if real_close and real_close.get("close_price"):
-                        exit_price = float(real_close["close_price"])
+                    has_real = real_close and (
+                        real_close.get("close_price") is not None
+                        or real_close.get("pnl") is not None
+                    )
+                    if has_real:
                         exit_reason = real_close.get("reason") or "broker_closed"
                         closed_at = real_close.get("close_time") or now_str
                         pnl = real_close.get("pnl")
-                        if pnl is None:
-                            try:
-                                pnl = calculate_fx_pnl(
-                                    db_symbol, r["side"], float(r["entry_price"]),
-                                    exit_price, float(r["quantity"]), broker_test,
-                                )
-                            except Exception as pnl_err:
-                                print(f"    WARNING: P&L calc failed for {db_symbol}: {pnl_err} — recording $0 P&L")
-                                pnl = 0.0
+                        cp = real_close.get("close_price")
+                        if cp is not None:
+                            # Exact broker fill level (from history/activity).
+                            exit_price = float(cp)
+                            if pnl is None:
+                                try:
+                                    pnl = calculate_fx_pnl(
+                                        db_symbol, r["side"], float(r["entry_price"]),
+                                        exit_price, float(r["quantity"]), broker_test,
+                                    )
+                                except Exception as pnl_err:
+                                    print(f"    WARNING: P&L calc failed for {db_symbol}: {pnl_err} — recording $0 P&L")
+                                    pnl = 0.0
+                            else:
+                                pnl = float(pnl)
                         else:
+                            # Broker reported realized P&L (history/transactions) but
+                            # not the fill level — derive a consistent exit price.
                             pnl = float(pnl)
+                            exit_price = _implied_exit_price(
+                                db_symbol, r["side"], float(r["entry_price"]),
+                                pnl, float(r["quantity"]), broker_test,
+                            )
                         conn.execute(
                             """UPDATE paper_trades
                                SET status = 'closed', exit_price = ?, pnl = ?, closed_at = ?,
