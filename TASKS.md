@@ -5,9 +5,17 @@
 
 ---
 
-## Last Session Recap (2026-08-20)
+## Last Session Recap (2026-08-20 / 21)
 
-### ✅ Three fixes shipped + verified on GitHub Actions:
+### 🧭 STRATEGIC PIVOT under consideration — trading the wrong universe (2026-08-21):
+Backtested the live SMA-200 + MACD trend engine on gold/indices/oil vs the 10 FX pairs (`fx_backtester.py --universe`, backtest-only, live universe untouched, `91159b4`). Result: **non-FX beats FX by ~+55% risk-adjusted.**
+- Gold **1.49 Sharpe / -3.6% DD / 18.7% CAGR** (best return-per-drawdown), Nasdaq 1.49 (/-7.4%), S&P 1.32 (/-4.0%). FX average **0.90 Sharpe**; 9 of 10 pairs below every metal/index. Best FX = NZD/USD 1.17. Oil/silver high return but -17%/-21% DD.
+- **Why it matters:** the trend engine is fine — it was pointed at the most efficient (hardest-to-trend) markets. FX majors are range-bound by design.
+- **Convergence insight:** gold/indices are SINGLE instruments → they sidestep the cross-sectional top-3 ranking that tied FX to the custom stack → map cleanly to ONE TradingView Pine script. Available on Capital.com and every TV-integrated broker.
+- **Proposed direction (discussed, not yet built):** rebuild as a gold (or gold+Nasdaq) SMA-200+MACD trend strategy as one Pine script on TradingView, on a broker demo, left to prove itself — kills the entire custom pipeline + reconciliation bug class. Watch fees/swap: TV built-in paper ignores spread & swap (overstates FX-style results); prefer a broker-demo integration (e.g. OANDA demo) for realistic costs. Alpaca IS a native TV broker (stock/ETF side); Capital.com is NOT a TV execution broker (it only embeds TV charts).
+- **Bigger frustration acknowledged:** ~4 months, flat P&L. Root causes: (1) most effort went to infrastructure/bug-fixing, and P&L was mislabeled/untrustworthy until the true-fill fix landed 08-21 — the honest evaluation clock effectively starts now; (2) breadth over depth across 6 bots on conventional/efficient-market strategies. Recommendation: stop building, park losers, let the two defensible things (ETF strategy + now-accurate FX/gold) run 2-3 weeks and DECIDE on real numbers.
+
+### ✅ Four fixes shipped + verified on GitHub Actions:
 
 **LLM router fixed** (trading-bot `92bf67a`) — root cause: Groq retired `llama-3.1-8b-instant` Aug 16 (scans died Aug 17), Gemini retired `gemini-2.0-flash` June 1. New IDs: Gemini `gemini-2.5-flash`/`-lite`, Groq `openai/gpt-oss-20b`/`-120b`, Cerebras `llama-3.3-70b`/`llama3.1-8b`, OpenRouter `gpt-oss-20b:free`/`qwen3-coder:free`. Also fixed the 404→fallback bug (dead primary now falls through instead of killing the provider) and updated `news_sentiment.py`. Live Midday Scan passed: `LLM OK — gemini/gemini-2.5-flash`.
 
