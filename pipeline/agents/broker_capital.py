@@ -450,7 +450,9 @@ class CapitalBroker:
             if act.get("dealId") == deal_id:
                 return True
             det = act.get("details") or {}
-            if det.get("dealReference") == deal_id:
+            # Positions reference the deal as dealReference "p_<dealId>".
+            ref = det.get("dealReference") or ""
+            if ref == deal_id or ref == f"p_{deal_id}":
                 return True
             for a in (det.get("actions") or []):
                 if a.get("affectedDealId") == deal_id or a.get("dealId") == deal_id:
@@ -458,21 +460,29 @@ class CapitalBroker:
             return False
 
         def _close_action(act: dict) -> bool:
+            # Newer schemas may expose an explicit close actionType; the live
+            # demo API does not (closes are identified by source instead).
             det = act.get("details") or {}
             for a in (det.get("actions") or []):
                 if "CLOS" in (a.get("actionType") or "").upper():
                     return True
             return "CLOS" in (act.get("actionType") or "").upper()
 
+        # A close is a POSITION-lifecycle activity whose source marks a
+        # server-side/dealer close (SL / TP / CLOSE_OUT / DEALER / SYSTEM);
+        # opens and stop/limit edits carry source USER and are skipped.
+        _CLOSE_SOURCES = ("TP", "SL", "CLOSE_OUT", "DEALER", "SYSTEM")
         close_act = None
         for act in activities:
             if _refs_deal(act) and _close_action(act):
                 close_act = act
                 break
-        if close_act is None:  # fallback: reference + a close-y source
+        if close_act is None:  # live-API path: reference + close source on a POSITION
             for act in activities:
+                if act.get("type") not in (None, "POSITION"):
+                    continue
                 src = (act.get("source") or "").upper()
-                if _refs_deal(act) and src in ("TP", "SL", "CLOSE_OUT", "DEALER", "SYSTEM"):
+                if _refs_deal(act) and src in _CLOSE_SOURCES:
                     close_act = act
                     break
 
@@ -497,50 +507,64 @@ class CapitalBroker:
             else:
                 reason = "broker_closed"
 
-        # --- 2) Transactions: realized P&L (and close price / reason fallback) ---
+        # --- 2) Transactions: realized P&L (and close time / reason fallback) ---
+        # Confirmed live schema (Capital.com demo, 2026-08-21): a closing TRADE
+        # ledger row carries a direct `dealId` matching the position, a `note`
+        # of "Trade closed", and the realized cash P&L (account currency) in the
+        # `size` field — e.g. {"dealId": "...595f-8526...", "instrumentName":
+        # "USDCHF", "transactionType": "TRADE", "note": "Trade closed",
+        # "size": "-13.19", "currency": "USD"}. There is NO profitAndLoss or
+        # closeLevel field despite the public docs; those are kept only as
+        # defensive fallbacks in case another account/instrument returns them.
         pnl = None
         txns: list = _fetch("/api/v1/history/transactions", "transactions", {"type": "TRADE"})
 
-        # Candidate trade rows: right instrument (if known) with a parseable P&L.
-        candidates = []
-        for t in txns:
-            if (t.get("transactionType") or "").upper() not in ("TRADE", ""):
-                continue
-            if epic and self._norm_name(t.get("instrumentName")) and epic not in self._norm_name(t.get("instrumentName")):
-                continue
-            p = self._parse_money(t.get("profitAndLoss"))
-            if p is None:
-                p = self._parse_money(t.get("size")) if t.get("closeLevel") is not None else None
-            candidates.append((t, p))
+        def _row_pnl(t: dict) -> float | None:
+            for k in ("profitAndLoss", "size"):
+                v = self._parse_money(t.get(k))
+                if v is not None:
+                    return v
+            return None
 
-        best = None
-        if candidates:
-            if close_price is not None:
-                def _dist(t):
-                    cl = self._parse_money(t.get("closeLevel"))
-                    return abs(cl - close_price) if cl is not None else float("inf")
-                best = min(candidates, key=lambda c: _dist(c[0]))
-            elif close_time is not None:
-                # match by nearest timestamp
-                def _parse_dt(s):
-                    try:
-                        return datetime.fromisoformat(str(s).replace("Z", "").split(".")[0])
-                    except Exception:
-                        return None
-                ct = _parse_dt(close_time)
-                if ct is not None:
-                    def _real_tdist(c):
-                        d = _parse_dt(c[0].get("dateUtc") or c[0].get("dateUTC") or c[0].get("date"))
-                        return abs((d - ct).total_seconds()) if d else float("inf")
-                    best = min(candidates, key=_real_tdist)
+        # Primary: exact deal-id match, preferring the "closed" ledger row.
+        deal_txns = [t for t in txns if t.get("dealId") == deal_id]
+        trow = None
+        if deal_txns:
+            closed_rows = [t for t in deal_txns if "clos" in (t.get("note") or "").lower()]
+            trow = (closed_rows or deal_txns)[-1]
+        else:
+            # Fallback: instrument match + close-price / close-time proximity.
+            cands = [
+                t for t in txns
+                if (t.get("transactionType") or "").upper() in ("TRADE", "")
+                and not (epic and self._norm_name(t.get("instrumentName"))
+                         and epic not in self._norm_name(t.get("instrumentName")))
+            ]
+            if cands:
+                if close_price is not None:
+                    def _pdist(t):
+                        cl = self._parse_money(t.get("closeLevel"))
+                        return abs(cl - close_price) if cl is not None else float("inf")
+                    trow = min(cands, key=_pdist)
+                elif close_time is not None:
+                    def _parse_dt(s):
+                        try:
+                            return datetime.fromisoformat(str(s).replace("Z", "").split(".")[0])
+                        except Exception:
+                            return None
+                    ct = _parse_dt(close_time)
+                    if ct is not None:
+                        def _tdist(t):
+                            d = _parse_dt(t.get("dateUtc") or t.get("dateUTC") or t.get("date"))
+                            return abs((d - ct).total_seconds()) if d else float("inf")
+                        trow = min(cands, key=_tdist)
+                    else:
+                        trow = cands[0]
                 else:
-                    best = candidates[0]
-            else:
-                best = candidates[0]
+                    trow = cands[0]
 
-        if best is not None:
-            trow, tp = best
-            pnl = tp
+        if trow is not None:
+            pnl = _row_pnl(trow)
             # Fill in close price / time / reason from the ledger row if activity lacked them.
             if close_price is None:
                 close_price = self._parse_money(trow.get("closeLevel"))
