@@ -95,6 +95,15 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python3 -m pipeline.agents.fx_pipeline --daily
 
+      - name: Run S&P index-trend DRY-RUN (logs signal only — no orders)
+        # Milestone 1: compute the daily S&P 500 (strategy_id 200) trend signal and log
+        # it to data/pipeline.db so signals accumulate for review. Placed BEFORE the
+        # WAL-safe export so the logged signal is committed to shared/ automatically.
+        # Runs fully offline (public yfinance data, no broker) — no CAPITAL_* secrets.
+        # continue-on-error so a data hiccup never blocks the FX commit.
+        continue-on-error: true
+        run: python3 -m pipeline.agents.index_pipeline --dry-run --db data/pipeline.db
+
       - name: Clean ghost trades (no broker_order_id, post-reconciliation)
         run: |
           python3 -c "
