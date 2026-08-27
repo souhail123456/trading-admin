@@ -9,8 +9,10 @@ reuses the existing engine pieces:
   - DB:     pipeline.db (signals + paper_trades tables)
 
 Instruments (each invocation processes ALL of them in sequence):
-  - S&P 500:   yfinance ^GSPC, Capital.com epic US500, strategy_id 200
+  - S&P 500:    yfinance ^GSPC, Capital.com epic US500, strategy_id 200
   - Nasdaq 100: yfinance ^NDX,  Capital.com epic US100, strategy_id 201
+  - Gold:       yfinance GC=F,  Capital.com epic GOLD,  strategy_id 202
+                (+ ADX(14)>25 regime gate — gold only; validated PF ~4)
 
 Strategy (identical for every instrument — matches the winning TradingView
 backtest, PF ~3.3, +136%, ~7% maxDD):
@@ -68,7 +70,25 @@ INSTRUMENTS = [
         "epic": "US100",        # Capital.com epic (used in Milestone 2, not here)
         "symbol": "US100",      # symbol stored in DB (broker-facing name)
     },
+    {
+        "strategy_id": 202,
+        "name": "Index Trend (Gold)",
+        "yf_ticker": "GC=F",    # COMEX gold futures daily OHLC on yfinance
+        "epic": "GOLD",         # Capital.com epic (used in Milestone 2, not here)
+        "symbol": "GOLD",       # symbol stored in DB (broker-facing name)
+        # Gold-only regime gate: validated on TradingView to take PF 1.03 -> ~4
+        # (ADX 20/25/30 => PF 3.92/3.99/4.38). Requires ADX(14) > adx_min in
+        # ADDITION to the shared entry conditions. S&P/Nasdaq leave use_adx off.
+        "use_adx": True,
+        "adx_min": 25.0,
+    },
 ]
+
+# Regime-filter defaults — applied when an instrument omits these keys, so
+# US500/US100 (which don't set them) behave exactly as before.
+DEFAULT_USE_ADX = False
+DEFAULT_ADX_MIN = 25.0
+ADX_PERIOD = 14
 
 # Strategy parameters (locked to the winning backtest)
 SMA_PERIOD = 200
@@ -95,6 +115,44 @@ def atr(df: pd.DataFrame, period: int = ATR_PERIOD) -> pd.Series:
     return tr.ewm(alpha=1 / period, adjust=False).mean()
 
 
+def adx(df: pd.DataFrame, period: int = ADX_PERIOD) -> pd.Series:
+    """Wilder's ADX(period) — trend-strength gauge (matches Pine ta.dmi(14,14)).
+
+    Steps (all Wilder-smoothed via ewm alpha=1/period, adjust=False):
+      +DM = up move if it dominates the down move, else 0
+      -DM = down move if it dominates the up move, else 0
+      +DI = 100 * smooth(+DM) / smooth(TR)
+      -DI = 100 * smooth(-DM) / smooth(TR)
+      DX  = 100 * |+DI - -DI| / (+DI + -DI)
+      ADX = smooth(DX)
+    Returns the ADX series (0-100); higher = stronger trend, either direction.
+    """
+    high, low, close = df["high"], df["low"], df["close"]
+    prev_close = close.shift(1)
+
+    up_move = high.diff()
+    down_move = -low.diff()
+    plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+    minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+
+    alpha = 1 / period
+    atr_s = tr.ewm(alpha=alpha, adjust=False).mean()
+    plus_di = 100 * plus_dm.ewm(alpha=alpha, adjust=False).mean() / atr_s
+    minus_di = 100 * minus_dm.ewm(alpha=alpha, adjust=False).mean() / atr_s
+
+    di_sum = plus_di + minus_di
+    dx = 100 * (plus_di - minus_di).abs() / di_sum
+    # Guard the flat-market 0/0 (NaN) and x/0 (inf) cases before smoothing.
+    dx = dx.replace([float("inf"), float("-inf")], float("nan")).fillna(0.0)
+    return dx.ewm(alpha=alpha, adjust=False).mean()
+
+
 def compute_index_signal(df: pd.DataFrame, held_long: bool, instrument: dict) -> dict:
     """Compute today's long-only trend signal + intended action for one index.
 
@@ -119,12 +177,25 @@ def compute_index_signal(df: pd.DataFrame, held_long: bool, instrument: dict) ->
     above_sma = close > latest_sma
     macd_bull = latest_hist > 0
 
-    # Long-only decision, position-aware
+    # Optional regime gate — gold only. When use_adx is True, require ADX(14)
+    # above adx_min IN ADDITION to the shared entry conditions. When False
+    # (US500/US100), adx_pass is forced True so behaviour is unchanged.
+    use_adx = bool(instrument.get("use_adx", DEFAULT_USE_ADX))
+    adx_min = float(instrument.get("adx_min", DEFAULT_ADX_MIN))
+    latest_adx = None
+    if use_adx:
+        latest_adx = float(adx(df).iloc[-1])
+        adx_pass = latest_adx > adx_min
+    else:
+        adx_pass = True
+
+    # Long-only decision, position-aware. The ADX gate is an ENTRY filter only —
+    # it never forces an exit (exit stays pure SMA re-cross, "let it run").
     if held_long:
         # Exit only on SMA re-cross ("let it run", no fixed TP)
         action = "exit_long" if not above_sma else "hold_long"
     else:
-        action = "enter_long" if (above_sma and macd_bull) else "flat"
+        action = "enter_long" if (above_sma and macd_bull and adx_pass) else "flat"
 
     # Sizing (only meaningful for an entry): risk 2% across 2xATR stop, in points
     stop_distance = ATR_STOP_MULT * latest_atr
@@ -144,6 +215,10 @@ def compute_index_signal(df: pd.DataFrame, held_long: bool, instrument: dict) ->
         "dist_to_sma_pct": round((close - latest_sma) / latest_sma * 100, 2) if latest_sma else None,
         "macd_histogram": round(latest_hist, 4),
         "macd_bullish": bool(macd_bull),
+        "use_adx": use_adx,
+        "adx_min": adx_min if use_adx else None,
+        "adx_14": round(latest_adx, 2) if latest_adx is not None else None,
+        "adx_pass": bool(adx_pass) if use_adx else None,
         "atr_14": round(latest_atr, 2),
         "stop_mult": ATR_STOP_MULT,
         "stop_distance_pts": round(stop_distance, 2),
@@ -302,6 +377,9 @@ def run_instrument(conn, instrument: dict) -> dict:
           f"({'ABOVE' if state['above_sma'] else 'BELOW'}, {state['dist_to_sma_pct']:+}%)")
     print(f"  MACD histogram  : {state['macd_histogram']}  "
           f"({'BULLISH >0' if state['macd_bullish'] else 'bearish <=0'})")
+    if state.get("use_adx"):
+        print(f"  ADX-14 (gate)   : {state['adx_14']}  "
+              f"({'PASS' if state['adx_pass'] else 'BLOCK'} vs adx_min {state['adx_min']})")
     print(f"  ATR-14          : {state['atr_14']}  "
           f"(2xATR stop dist = {state['stop_distance_pts']} pts)")
     print(f"  Current position: {'LONG (held)' if held_long else 'FLAT'}")
