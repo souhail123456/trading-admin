@@ -663,6 +663,144 @@ def get_index_data() -> dict | None:
 
 
 # ---------------------------------------------------------------------------
+# Combined Total Balance (hero) — stock equity + FX balance + poly balance,
+# plus a combined daily series for the day-over-day change.
+#
+# Balance sources (robust for the static/offline build):
+#   Stock : latest portfolio equity (get_stock_data; already stale-filtered).
+#   FX    : live broker equity if reachable & non-zero, else FX_ACCOUNT_BALANCE
+#           (default 300) + realized P&L of closed strategy-100/101 paper_trades.
+#   Poly  : each strategy book starts at POLY_BANKROLL (default 100 — the value
+#           found in work/polymarket-bot/{weather,econ,crypto}_bot.py as
+#           starting_bankroll=100.0). Per-book balance = max(0, base + that
+#           book's net realized P&L) — floored because a paper bankroll cannot go
+#           negative — summed across the live strategy books (econ/ev/weather).
+# ---------------------------------------------------------------------------
+
+FX_ACCOUNT_BASE = float(os.environ.get("FX_ACCOUNT_BALANCE", "300"))
+POLY_BANKROLL_PER_BOOK = float(os.environ.get("POLY_BANKROLL", "100"))
+
+
+def _poly_realized_by_strategy(poly_trades: list[dict]) -> dict[str, float]:
+    """Net realized P&L per poly strategy from daily_history poly trade events."""
+    out: dict[str, float] = {}
+    for t in poly_trades:
+        strat = t.get("strategy") or "poly"
+        out.setdefault(strat, 0.0)
+        if t.get("status") in ("resolved", "closed"):
+            out[strat] += float(t.get("pnl", 0) or 0)
+    return out
+
+
+def _poly_balance_from_realized(realized_by_strat: dict[str, float]) -> float:
+    """Sum of per-book balances, each floored at 0 (can't lose past the bankroll)."""
+    if not realized_by_strat:
+        return POLY_BANKROLL_PER_BOOK
+    return sum(max(0.0, POLY_BANKROLL_PER_BOOK + pnl) for pnl in realized_by_strat.values())
+
+
+def get_total_balance(fx: dict, stock: dict | None) -> dict:
+    """Combined balance across all three bots + day-over-day change.
+
+    Returns per-bot balances (never 0/None-poisoned), the grand total, a combined
+    daily series (one point per date, each bot carried forward on gap days), and
+    the absolute/percent change vs the previous day."""
+    dh = load_daily_history()
+
+    # ---- Stock balance (latest equity) ----
+    stock_bal = None
+    if stock and isinstance(stock.get("portfolio_value"), (int, float)):
+        stock_bal = float(stock["portfolio_value"])
+    if stock_bal is None:
+        # last resort: newest non-stale stock snapshot equity
+        for s in reversed(dh["stock_snapshots"]):
+            if not _is_stale_stock_snap(s) and isinstance(s.get("equity"), (int, float)):
+                stock_bal = float(s["equity"])
+                break
+    if stock_bal is None:
+        stock_bal = 0.0
+
+    # ---- FX balance (prefer live equity; else base + realized) ----
+    live_equity = (fx.get("account") or {}).get("equity")
+    if isinstance(live_equity, (int, float)) and live_equity:
+        fx_bal = float(live_equity)
+    else:
+        fx_bal = FX_ACCOUNT_BASE + float(fx.get("realized_pnl", 0) or 0)
+
+    # ---- Poly balance (per-book floored, from daily_history) ----
+    poly_realized = _poly_realized_by_strategy(dh["poly_trades"])
+    poly_bal = _poly_balance_from_realized(poly_realized)
+
+    total = stock_bal + fx_bal + poly_bal
+
+    # ---- Combined daily series (carry-forward each bot per date) ----
+    # Per-day stock equity (skip stale/degenerate snapshots).
+    stock_by_day: dict[str, float] = {}
+    for s in dh["stock_snapshots"]:
+        if _is_stale_stock_snap(s):
+            continue
+        ts = s.get("timestamp", "")
+        if ts and isinstance(s.get("equity"), (int, float)):
+            stock_by_day[ts[:10]] = float(s["equity"])
+
+    # Per-day FX balance = base + that day's total realized P&L.
+    fx_by_day: dict[str, float] = {}
+    for s in dh["fx_snapshots"]:
+        ts = s.get("timestamp", "")
+        if ts:
+            rp = s.get("total_realized_pnl")
+            fx_by_day[ts[:10]] = FX_ACCOUNT_BASE + float(rp or 0)
+
+    # Per-day poly balance = floored per-book sum using cumulative realized to date.
+    poly_by_day: dict[str, float] = {}
+    poly_cum: dict[str, float] = {k: 0.0 for k in poly_realized}
+    for t in sorted(dh["poly_trades"], key=lambda x: x.get("timestamp", "")):
+        strat = t.get("strategy") or "poly"
+        poly_cum.setdefault(strat, 0.0)
+        if t.get("status") in ("resolved", "closed"):
+            poly_cum[strat] += float(t.get("pnl", 0) or 0)
+        ts = t.get("timestamp", "")
+        if ts:
+            poly_by_day[ts[:10]] = _poly_balance_from_realized(poly_cum)
+
+    all_days = sorted(set(stock_by_day) | set(fx_by_day) | set(poly_by_day))
+    n_books = max(len(poly_realized), 1)
+    series: list[dict] = []
+    ls = lf = lp = None
+    for d in all_days:
+        if d in stock_by_day:
+            ls = stock_by_day[d]
+        if d in fx_by_day:
+            lf = fx_by_day[d]
+        if d in poly_by_day:
+            lp = poly_by_day[d]
+        # Defaults before a bot's first snapshot: FX/poly at their bankroll bases,
+        # stock at 0 (it has the earliest, densest history so this rarely bites).
+        sv = ls if ls is not None else 0.0
+        fv = lf if lf is not None else FX_ACCOUNT_BASE
+        pv = lp if lp is not None else POLY_BANKROLL_PER_BOOK * n_books
+        series.append({"time": d, "value": round(sv + fv + pv, 2)})
+
+    delta_abs = delta_pct = None
+    if len(series) >= 2:
+        prev, cur = series[-2]["value"], series[-1]["value"]
+        delta_abs = round(cur - prev, 2)
+        delta_pct = round((delta_abs / prev * 100), 2) if prev else None
+
+    return {
+        "total": round(total, 2),
+        "stock": round(stock_bal, 2),
+        "fx": round(fx_bal, 2),
+        "poly": round(poly_bal, 2),
+        "fx_live": bool(isinstance(live_equity, (int, float)) and live_equity),
+        "poly_books": n_books,
+        "series": series,
+        "delta_abs": delta_abs,
+        "delta_pct": delta_pct,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Inline SVG / CSS chart builders (no external JS libraries)
 # ---------------------------------------------------------------------------
 
@@ -1075,6 +1213,7 @@ def build_dashboard(fx: dict, stock: dict | None, poly: dict | None,
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     state = get_global_state()
     index = get_index_data()
+    balance = get_total_balance(fx, stock)
 
     # Aggregate totals
     bots_online = 1 if (fx.get("account") or fx.get("open_trades")) else 0
@@ -1280,6 +1419,31 @@ def build_dashboard(fx: dict, stock: dict | None, poly: dict | None,
 
     index_html = _build_index_html(index)
 
+    # ---- Total Balance hero (headline number of the whole page) ----
+    if balance["delta_abs"] is not None:
+        d_abs, d_pct = balance["delta_abs"], balance["delta_pct"]
+        d_css = "pos" if d_abs >= 0 else "neg"
+        d_arrow = "&#9650;" if d_abs >= 0 else "&#9660;"
+        pct_txt = f" ({d_pct:+.2f}%)" if d_pct is not None else ""
+        delta_html = f'<div class="hero-delta {d_css}">{d_arrow} ${abs(d_abs):,.2f}{pct_txt} <span class="hero-delta-sub">vs prev day</span></div>'
+    else:
+        delta_html = '<div class="hero-delta dim">single day of history &middot; no change yet</div>'
+
+    fx_note = "live" if balance["fx_live"] else "base + realized"
+    hero_html = f"""
+    <div class="hero">
+        <div class="hero-main">
+            <div class="hero-label">Total Balance <span>&middot; all bots combined</span></div>
+            <div class="hero-value num">${balance['total']:,.2f}</div>
+            {delta_html}
+        </div>
+        <div class="hero-breakdown">
+            <div class="hb"><span class="hb-dot" style="background:var(--pos)"></span><span class="hb-k">Stock</span><span class="hb-v num">${balance['stock']:,.2f}</span></div>
+            <div class="hb"><span class="hb-dot" style="background:var(--accent)"></span><span class="hb-k">FX <span class="hb-note">{fx_note}</span></span><span class="hb-v num">${balance['fx']:,.2f}</span></div>
+            <div class="hb"><span class="hb-dot" style="background:var(--violet)"></span><span class="hb-k">Poly <span class="hb-note">{balance['poly_books']} books</span></span><span class="hb-v num">${balance['poly']:,.2f}</span></div>
+        </div>
+    </div>"""
+
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1345,6 +1509,36 @@ body {{
     padding: 6px 11px; border-radius: 999px; font-size: 12px; color: var(--ink-2);
 }}
 .chip b {{ color: var(--ink); font-weight: 700; }}
+
+/* Total Balance hero */
+.hero {{
+    display: flex; justify-content: space-between; align-items: center;
+    flex-wrap: wrap; gap: 22px;
+    background:
+        linear-gradient(180deg, rgba(57,135,229,0.10), rgba(57,135,229,0.02)),
+        var(--panel);
+    border: 1px solid var(--border-2);
+    border-radius: 18px;
+    box-shadow: var(--shadow);
+    padding: 22px 26px;
+    margin-bottom: 20px;
+}}
+.hero-main {{ min-width: 240px; }}
+.hero-label {{ font-size: 12px; text-transform: uppercase; letter-spacing: 1.2px; color: var(--ink-2); font-weight: 700; }}
+.hero-label span {{ color: var(--muted); font-weight: 500; letter-spacing: 0.4px; }}
+.hero-value {{ font-size: 46px; font-weight: 800; letter-spacing: -0.03em; line-height: 1.05; margin: 6px 0 8px; }}
+.hero-delta {{ font-size: 14px; font-weight: 700; }}
+.hero-delta-sub {{ color: var(--muted); font-weight: 500; font-size: 12px; margin-left: 4px; }}
+.hero-breakdown {{ display: flex; flex-wrap: wrap; gap: 10px; }}
+.hb {{
+    display: flex; align-items: center; gap: 8px;
+    background: var(--tile); border: 1px solid var(--border);
+    border-radius: 11px; padding: 10px 14px; min-width: 150px;
+}}
+.hb-dot {{ width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }}
+.hb-k {{ font-size: 12px; color: var(--ink-2); font-weight: 600; }}
+.hb-note {{ font-size: 10px; color: var(--muted); font-weight: 500; }}
+.hb-v {{ font-size: 16px; font-weight: 800; margin-left: auto; padding-left: 10px; }}
 
 /* Overview KPI tiles */
 .overview {{
@@ -1567,6 +1761,10 @@ tr:hover td {{ background: rgba(255,255,255,0.03); }}
     .overview {{ grid-template-columns: 1fr 1fr; }}
     .overview-card .value {{ font-size: 24px; }}
     .header h1 {{ font-size: 19px; }}
+    .hero {{ padding: 18px; gap: 16px; }}
+    .hero-value {{ font-size: 34px; }}
+    .hero-breakdown {{ width: 100%; }}
+    .hb {{ flex: 1 1 100%; }}
 }}
 </style>
 </head>
@@ -1584,6 +1782,8 @@ tr:hover td {{ background: rgba(255,255,255,0.03); }}
         <span class="chip">VIX <b class="yellow">{vix_label}</b></span>
     </div>
 </div>
+
+{hero_html}
 
 <div class="overview">
     <div class="overview-card {'k-pnl' if total_pnl >= 0 else 'k-neg'}">
