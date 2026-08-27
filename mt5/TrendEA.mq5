@@ -145,35 +145,36 @@ bool CopyClosed(const int handle, const int buffer, double &value)
   }
 
 //+------------------------------------------------------------------+
-//| Compute lot size for the given stop distance (price units)       |
+//| Compute lot size for the given stop distance (price units).      |
+//| Uses the terminal's own P&L engine (OrderCalcProfit) so the money|
+//| -> lots conversion is EXACT for XAUUSD (100oz), indices and FX    |
+//| alike -- no manual tickValue/tickSize math (which mis-sized gold).|
 //+------------------------------------------------------------------+
-double ComputeLots(const double stopDistPrice)
+double ComputeLots(const double stopDistPrice, const double entryPrice)
   {
    double volMin  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
    double volMax  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
    double volStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
 
-   if(stopDistPrice <= 0.0 || volStep <= 0.0)
+   if(stopDistPrice <= 0.0 || volStep <= 0.0 || entryPrice <= 0.0)
       return(0.0);
 
-   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-   double tickSize  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-   if(tickValue <= 0.0 || tickSize <= 0.0)
+   // Money lost per 1.0 lot going from entryPrice down to the stop price.
+   double stopPrice = entryPrice - stopDistPrice;
+   double lossPer1Lot;
+   if(!OrderCalcProfit(ORDER_TYPE_BUY, _Symbol, 1.0, entryPrice, stopPrice, lossPer1Lot))
      {
-      Print("ComputeLots: invalid tick value/size, cannot size trade.");
+      Print("ComputeLots: OrderCalcProfit failed, cannot size trade.");
       return(0.0);
      }
-
-   // Money lost per 1.0 lot if price moves the full stop distance:
-   //   (stopDistPrice / tickSize) ticks  *  tickValue per tick per lot
-   double lossPerLot = (stopDistPrice / tickSize) * tickValue;
-   if(lossPerLot <= 0.0)
+   lossPer1Lot = MathAbs(lossPer1Lot);   // loss for a losing buy is negative
+   if(lossPer1Lot <= 0.0)
       return(0.0);
 
    double equity    = AccountInfoDouble(ACCOUNT_EQUITY);
    double riskMoney = equity * (RiskPct / 100.0);
 
-   double lots = riskMoney / lossPerLot;
+   double lots = riskMoney / lossPer1Lot;
 
    // Normalize down to the volume step.
    lots = MathFloor(lots / volStep) * volStep;
@@ -282,12 +283,22 @@ void OnTick()
    double stopDist  = AtrStopMult * atr;
    double stopPrice = NormalizeDouble(ask - stopDist, _Digits);
 
-   double lots = ComputeLots(stopDist);
+   double lots = ComputeLots(stopDist, ask);
    if(lots <= 0.0)
      {
       Print("Computed lots <= 0, skipping entry.");
       return;
      }
+
+   // Verification log: recompute the REAL expected loss at the stop for the
+   // chosen lot size so the tester Journal shows actual risk % per trade.
+   double riskMoney = AccountInfoDouble(ACCOUNT_EQUITY) * (RiskPct / 100.0);
+   double actualLoss;
+   if(OrderCalcProfit(ORDER_TYPE_BUY, _Symbol, lots, ask, stopPrice, actualLoss))
+      PrintFormat("SIZING: lots=%.2f  stopDist=%.*f  riskTarget=%.2f (%.2f%%)  actualRisk=$%.2f (%.2f%% of equity)",
+                  lots, _Digits, stopDist, riskMoney, RiskPct,
+                  MathAbs(actualLoss),
+                  100.0 * MathAbs(actualLoss) / AccountInfoDouble(ACCOUNT_EQUITY));
 
    // trade.Buy(volume, symbol, price=0 -> market, sl, tp=0 -> none, comment)
    if(!trade.Buy(lots, _Symbol, 0.0, stopPrice, 0.0, TradeComment))
