@@ -91,6 +91,10 @@ jobs:
           CAPITAL_PASSWORD: ${{ secrets.CAPITAL_PASSWORD }}
           CAPITAL_ENV: "demo"
           FX_ACCOUNT_BALANCE: "300"
+          # PAUSE new FX entries (strategies 100/101). Monitoring, exits, broker
+          # reconciliation, DB export and the dashboard all still run. Reversible:
+          # remove this line (or set to "0") to resume opening FX positions.
+          FX_PAUSE_ENTRIES: "1"
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python3 -m pipeline.agents.fx_pipeline --daily

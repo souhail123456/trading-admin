@@ -1740,6 +1740,18 @@ def run_daily(dry_run: bool = False, db_path: str | None = None):
     except Exception as e:
         log.warning(f"Failed to write regime to global_state.json: {e}")
 
+    # --- Manual, reversible entry pause (env flag) ------------------------
+    # When FX_PAUSE_ENTRIES is truthy the pipeline SKIPS all new FX entries
+    # (strategies 100 = Trend, 101 = Price Action) by adding them to
+    # paused_strategies, which the signal filter below already honors.
+    # Everything else still runs: position monitoring, exits, broker
+    # reconciliation, DB export and the dashboard. Fully reversible — remove
+    # (or set to 0) FX_PAUSE_ENTRIES in daily_pipeline.yml to resume entries.
+    if os.environ.get("FX_PAUSE_ENTRIES", "").strip().lower() in ("1", "true", "yes", "on"):
+        paused_strategies.update({100, 101})
+        print("  FX_PAUSE_ENTRIES set — pausing ALL new FX entries "
+              "(strategies 100, 101). Exits/monitoring/reconciliation still run.")
+
     # Step 2: Generate signals
     from pipeline.agents.fx_signal_generator import generate_fx_signals
     print("\n[2/6] Generating FX signals...")
@@ -1845,15 +1857,98 @@ def run_daily(dry_run: bool = False, db_path: str | None = None):
     )
 
 
+def flatten_fx(db_path: str | None = None):
+    """Manual, reversible FLATTEN: close ALL open Capital.com FX positions and
+    mark the matching open paper_trades (strategies 100/101) closed in the DB
+    with exit_reason='manual_flatten'. Nothing is deleted; other strategies are
+    untouched. Triggered via `python3 -m pipeline.agents.fx_pipeline --flatten`
+    (see .github/workflows/flatten_fx.yml). To STAY flat afterward, the daily
+    pipeline is paused via the FX_PAUSE_ENTRIES env flag; removing that flag
+    resumes normal FX trading.
+    """
+    import time
+
+    conn = init_db(db_path)
+    broker = _get_broker()
+    if broker is None:
+        print("FLATTEN ABORTED: no broker configured (need CAPITAL_API_KEY/EMAIL/PASSWORD)")
+        conn.close()
+        return
+
+    try:
+        before = broker.get_positions()
+        print(f"Broker positions BEFORE flatten: {len(before)}")
+        for p in before:
+            print(f"  OPEN {p['epic']} {p['direction']} size={p['size']} "
+                  f"deal={p['deal_id']} upl={p['unrealized_pnl']}")
+
+        # 1) Close every open position at the broker.
+        results = broker.close_all()
+        print(f"close_all() issued {len(results)} close request(s)")
+
+        # Give the broker a moment to settle, then confirm we are flat.
+        time.sleep(3)
+        after = broker.get_positions()
+        print(f"Broker positions AFTER flatten: {len(after)}")
+        for p in after:
+            print(f"  STILL OPEN: {p['epic']} {p['direction']} deal={p['deal_id']}")
+
+        # 2) Mark matching open DB trades closed so the DB matches the broker.
+        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        open_rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM paper_trades WHERE status='open' AND strategy_id IN (100, 101)"
+        ).fetchall()]
+        print(f"DB open FX trades to close: {len(open_rows)}")
+        for r in open_rows:
+            symbol = r["symbol"]
+            entry = float(r["entry_price"]) if r.get("entry_price") else None
+            qty = float(r.get("quantity") or 1)
+            exit_price = entry
+            pnl = 0.0
+            try:
+                price = broker.get_price(symbol)
+                if price:
+                    exit_price = price.get("bid") if r["side"] == "long" else price.get("ask")
+                    exit_price = float(exit_price) if exit_price else entry
+                if entry is not None and exit_price is not None:
+                    pnl = calculate_fx_pnl(symbol, r["side"], entry, exit_price, qty, broker)
+            except Exception as e:
+                print(f"  price/pnl estimate failed for {symbol}: {e} — recording $0 P&L")
+            conn.execute(
+                """UPDATE paper_trades
+                   SET status='closed', exit_price=?, pnl=?, closed_at=?,
+                       exit_reason='manual_flatten'
+                   WHERE id=?""",
+                (exit_price, pnl, now_str, r["id"]),
+            )
+            print(f"  DB closed: {symbol} {r['side']} id={r['id']} @ {exit_price} pnl=${pnl:.2f}")
+        conn.commit()
+
+        remaining = conn.execute(
+            "SELECT count(*) FROM paper_trades WHERE status='open' AND strategy_id IN (100, 101)"
+        ).fetchone()[0]
+        print(f"FLATTEN COMPLETE — broker open now: {len(after)}, DB open FX now: {remaining}")
+    finally:
+        try:
+            broker.disconnect()
+        except Exception:
+            pass
+        conn.close()
+
+
 def main():
     parser = argparse.ArgumentParser(description="FX Pipeline — daily forex trading")
     parser.add_argument("--daily", action="store_true")
     parser.add_argument("--status", action="store_true")
+    parser.add_argument("--flatten", action="store_true",
+                        help="Close ALL open FX positions and mark DB rows closed (manual_flatten)")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--db", type=str, default=None)
     args = parser.parse_args()
 
-    if args.daily:
+    if args.flatten:
+        flatten_fx(db_path=args.db)
+    elif args.daily:
         run_daily(dry_run=args.dry_run, db_path=args.db)
     elif args.status:
         conn = init_db(args.db)

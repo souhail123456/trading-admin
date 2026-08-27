@@ -1,0 +1,78 @@
+name: Flatten FX (manual)
+
+# Manual, reversible one-shot: close ALL open Capital.com FX positions and mark
+# the matching open paper_trades (strategies 100/101) closed in the DB with
+# exit_reason='manual_flatten'. Nothing is deleted. After running this, the
+# daily pipeline keeps NEW FX entries paused via FX_PAUSE_ENTRIES in
+# daily_pipeline.yml — remove that flag to resume FX trading.
+#
+# workflow_dispatch ONLY — never runs on a schedule.
+on:
+  workflow_dispatch:
+
+jobs:
+  flatten:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.BOT_GITHUB_TOKEN }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements-pipeline.txt
+
+      - name: Restore pipeline DB
+        # Same cache key family as daily_pipeline.yml so we operate on the
+        # authoritative, up-to-date DB (finds the real open FX trades).
+        uses: actions/cache@v4
+        with:
+          path: data/pipeline.db
+          key: pipeline-db-v62-${{ github.run_number }}
+          restore-keys: |
+            pipeline-db-v62-
+
+      - name: Flatten FX (close all positions + mark DB closed)
+        env:
+          CAPITAL_API_KEY: ${{ secrets.CAPITAL_API_KEY }}
+          CAPITAL_EMAIL: ${{ secrets.CAPITAL_EMAIL }}
+          CAPITAL_PASSWORD: ${{ secrets.CAPITAL_PASSWORD }}
+          CAPITAL_ENV: "demo"
+        run: python3 -m pipeline.agents.fx_pipeline --flatten --db data/pipeline.db
+
+      - name: Export authoritative DB to shared/ (WAL-safe)
+        # Same checkpoint pattern as daily_pipeline.yml: fold the WAL into the
+        # main file before copying so shared/pipeline.db is complete and current.
+        if: always()
+        run: |
+          mkdir -p shared
+          if [ -f data/pipeline.db ]; then
+            sqlite3 data/pipeline.db "PRAGMA wal_checkpoint(TRUNCATE);"
+            cp data/pipeline.db shared/pipeline.db
+            rm -f shared/pipeline.db-wal shared/pipeline.db-shm
+            OPEN=$(sqlite3 shared/pipeline.db "SELECT count(*) FROM paper_trades WHERE status='open' AND strategy_id IN (100,101);")
+            echo "Exported checkpointed pipeline.db to shared/ (open FX positions: $OPEN)"
+          else
+            echo "No data/pipeline.db to export — keeping existing shared/pipeline.db"
+          fi
+
+      - name: Commit shared state
+        run: |
+          git config user.name "trading-admin[bot]"
+          git config user.email "bot@trading-admin"
+          git add -f shared/pipeline.db
+          git diff --cached --quiet && echo "No shared state changes" && exit 0
+          git commit -m "Flatten FX: close all positions + mark DB closed $(date -u +%Y-%m-%d)"
+          git push
+
+      - name: Save pipeline DB
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: data/pipeline.db
+          key: pipeline-db-v62-${{ github.run_number }}
