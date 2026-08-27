@@ -1,0 +1,92 @@
+// =============================================================================
+// Intraday Opening-Range Breakout (ORB)  (Pine Script v5, strategy)
+//   INTRADAY. First N minutes of the session define a range; trade the break.
+//   Flat by session end -> no overnight risk.
+//   Entry: after the opening range, break ABOVE range high (long) / BELOW low (short)
+//   Exit : stop at the opposite side of the range, target = R multiple, else EOD flat
+// APPLY TO: SPX/NDX/SPY/QQQ on an INTRADAY timeframe (5m or 15m).
+// WARNING: intraday backtests are LESS reliable — free-plan history is short and
+//   TV underestimates intraday spread/slippage. Our prior intraday test lost
+//   (VWAP scalp PF 0.587). Treat results as INDICATIVE, and mind the costs.
+// =============================================================================
+//@version=5
+strategy(
+     title            = "Intraday ORB",
+     overlay          = true,
+     currency         = currency.USD,
+     initial_capital  = 1000,
+     default_qty_type = strategy.fixed,
+     commission_type  = strategy.commission.percent,
+     commission_value = 0.03,          // spread cost % per side — EDIT to your broker
+     slippage         = 3,             // intraday fills are worse than daily
+     pyramiding       = 0,
+     process_orders_on_close = true)
+
+// ---- Inputs -----------------------------------------------------------------
+orSess      = input.session("0930-1000", "Opening-range window", group = "Session")
+tradeSess   = input.session("1000-1550", "Breakout trading window", group = "Session")
+tz          = input.string("America/New_York", "Session timezone", group = "Session")
+
+allowLong   = input.bool(true, "Allow longs",  group = "Direction")
+allowShort  = input.bool(true, "Allow shorts", group = "Direction")
+
+rMult       = input.float(1.5, "Target (R multiple)", group = "Risk", step = 0.25)
+riskPct     = input.float(0.5, "Risk % of equity/trade", group = "Risk", step = 0.25)
+maxTrades   = input.int(1,     "Max entries per day", group = "Guardrails")
+useAtrStop  = input.bool(false,"Use ATR stop instead of range-low", group = "Risk")
+atrLen      = input.int(14,    "ATR length", group = "Risk")
+atrStopMult = input.float(1.0, "ATR stop x", group = "Risk", step = 0.25)
+
+// ---- Session detection ------------------------------------------------------
+inOR      = not na(time(timeframe.period, orSess,    tz))
+inTrade   = not na(time(timeframe.period, tradeSess, tz))
+newDay    = ta.change(time("D")) != 0
+atr       = ta.atr(atrLen)
+
+// ---- Build the opening range each day ---------------------------------------
+var float orHigh = na
+var float orLow  = na
+var int   trades = 0
+if newDay
+    orHigh := na
+    orLow  := na
+    trades := 0
+if inOR
+    orHigh := na(orHigh) ? high : math.max(orHigh, high)
+    orLow  := na(orLow)  ? low  : math.min(orLow,  low)
+
+rangeReady = not na(orHigh) and not na(orLow) and not inOR and inTrade
+
+// ---- Entry signals: break of the opening range ------------------------------
+longSig  = allowLong  and rangeReady and trades < maxTrades and ta.crossover(close, orHigh)
+shortSig = allowShort and rangeReady and trades < maxTrades and ta.crossunder(close, orLow)
+
+// ---- Sizing: risk % across the stop distance --------------------------------
+longStopDist  = useAtrStop ? atr * atrStopMult : math.max(close - orLow,  syminfo.mintick)
+shortStopDist = useAtrStop ? atr * atrStopMult : math.max(orHigh - close, syminfo.mintick)
+
+f_qty(stopDist) => stopDist > 0 ? (strategy.equity * riskPct / 100.0) / stopDist : na
+
+// ---- Execution --------------------------------------------------------------
+if longSig and strategy.position_size == 0
+    q = f_qty(longStopDist)
+    if not na(q)
+        strategy.entry("ORB-L", strategy.long, qty = q)
+        strategy.exit("Lx", from_entry = "ORB-L", stop = close - longStopDist, limit = close + rMult * longStopDist)
+        trades += 1
+
+if shortSig and strategy.position_size == 0
+    q = f_qty(shortStopDist)
+    if not na(q)
+        strategy.entry("ORB-S", strategy.short, qty = q)
+        strategy.exit("Sx", from_entry = "ORB-S", stop = close + shortStopDist, limit = close - rMult * shortStopDist)
+        trades += 1
+
+// Force flat at session end -> no overnight
+if not inTrade and not inOR and strategy.position_size != 0
+    strategy.close_all(comment = "EOD flat")
+
+// ---- Plots ------------------------------------------------------------------
+plot(orHigh, "OR High", color = color.new(color.green, 30), style = plot.style_linebr)
+plot(orLow,  "OR Low",  color = color.new(color.red,   30), style = plot.style_linebr)
+bgcolor(inOR ? color.new(color.blue, 90) : na, title = "Opening range")

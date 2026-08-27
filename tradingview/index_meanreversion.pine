@@ -1,0 +1,78 @@
+// =============================================================================
+// Index Mean-Reversion — RSI(2) dip-buy  (Pine Script v5, strategy)
+//   SHORT-TERM swing (holds ~2-5 days). Buy an oversold DIP inside an uptrend,
+//   exit into the bounce. The classic Connors RSI-2 edge — works on equity
+//   INDICES (they mean-revert over days); does NOT work on FX/gold.
+//   Entry:  close > SMA-200 (uptrend) AND RSI(2) < oversold  ->  buy the dip
+//   Exit :  close > SMA-5 (bounce)  OR  RSI(2) > exit level  OR  max-hold days
+//           OR  catastrophic ATR stop (safety only)
+//   Long-only — shorting index dips loses (indices drift up).
+// Apply to SPX / NDX / SPY / QQQ on the DAILY timeframe.
+// Cost model: spread via commission + slippage (TV paper ignores these!).
+// =============================================================================
+//@version=5
+strategy(
+     title            = "Index Mean-Reversion RSI2",
+     overlay          = true,
+     currency         = currency.USD,
+     initial_capital  = 1000,
+     default_qty_type = strategy.fixed,
+     commission_type  = strategy.commission.percent,
+     commission_value = 0.03,          // spread cost % per side — EDIT to your broker
+     slippage         = 2,
+     pyramiding       = 0,
+     calc_on_every_tick = false,
+     process_orders_on_close = true)
+
+// ---- Inputs -----------------------------------------------------------------
+trendLen    = input.int(200,  "Trend SMA (only buy dips above it)", group = "Trend")
+rsiLen      = input.int(2,    "RSI length",              group = "Entry")
+rsiBuy      = input.float(10, "Buy when RSI below",      group = "Entry", step = 1)
+rsiExit     = input.float(70, "Exit when RSI above",     group = "Exit")
+exitMaLen   = input.int(5,    "Exit when close > SMA",   group = "Exit")
+maxHold     = input.int(10,   "Max hold (bars) time-stop",group = "Exit")
+
+useStop     = input.bool(true,"Catastrophic ATR stop",  group = "Risk")
+atrLen      = input.int(14,   "ATR length",              group = "Risk")
+atrStopMult = input.float(2.5,"Stop = ATR x (wide!)",    group = "Risk", step = 0.5)
+riskPct     = input.float(2.0,"Risk % of equity/trade",  group = "Risk", step = 0.5)
+
+// Backtest date window — set the SAME start/end across instruments for fair tests.
+useDateWin  = input.bool(false, "Limit backtest date range", group = "Backtest window")
+startDate   = input.time(timestamp("01 Jan 1990 00:00"), "Start", group = "Backtest window")
+endDate     = input.time(timestamp("01 Jan 2100 00:00"), "End",   group = "Backtest window")
+inDateWin   = not useDateWin or (time >= startDate and time <= endDate)
+
+// ---- Indicators -------------------------------------------------------------
+sma200 = ta.sma(close, trendLen)
+sma5   = ta.sma(close, exitMaLen)
+rsi    = ta.rsi(close, rsiLen)
+atr    = ta.atr(atrLen)
+ready  = not na(sma200) and not na(atr) and bar_index > trendLen + 10
+
+// ---- Entry: oversold dip inside an uptrend ----------------------------------
+longSignal = ready and close > sma200 and rsi < rsiBuy and inDateWin
+
+// ---- Sizing: risk 2% across a WIDE stop (mean-reversion needs room) ----------
+stopDist = atr * atrStopMult
+riskCash = strategy.equity * (riskPct / 100.0)
+qty      = stopDist > 0 ? riskCash / stopDist : na
+
+// ---- Execution --------------------------------------------------------------
+var int entryBar = na
+if longSignal and strategy.position_size == 0 and not na(qty)
+    strategy.entry("MR-Long", strategy.long, qty = qty)
+    entryBar := bar_index
+    if useStop
+        strategy.exit("stop", from_entry = "MR-Long", stop = close - stopDist)
+
+// Mean-reversion exits (the real edge): bounce back up, or oversold clears, or time
+barsHeld  = na(entryBar) ? 0 : bar_index - entryBar
+if strategy.position_size > 0
+    if close > sma5 or rsi > rsiExit or barsHeld >= maxHold
+        strategy.close("MR-Long", comment = "revert")
+
+// ---- Plots ------------------------------------------------------------------
+plot(sma200, "SMA-200", color = color.orange, linewidth = 2)
+plot(sma5,   "SMA-5",   color = color.new(color.aqua, 40))
+plotshape(longSignal and strategy.position_size == 0, title = "Dip buy", style = shape.triangleup, location = location.belowbar, color = color.green, size = size.tiny)
