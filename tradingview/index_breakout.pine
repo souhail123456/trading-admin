@@ -1,0 +1,81 @@
+// =============================================================================
+// Support/Resistance Breakout — Donchian channel  (Pine Script v5, strategy)
+//   Price-structure TA. The N-day high is resistance, the N-day low is support.
+//   Trade the BREAK of the level (Turtle-style).
+//   Entry:  close breaks ABOVE the prior N-day high (resistance) -> long
+//           close breaks BELOW the prior N-day low  (support)    -> short
+//   Exit :  opposite M-day channel  OR  trend flip  OR  ATR stop
+//   Optional trend filter: only break out in the SMA-200 direction.
+// Apply to gold / SPX / NDX (gold's "long base then breakout" character fits this).
+// Cost model: spread via commission + slippage (TV paper ignores these!).
+// =============================================================================
+//@version=5
+strategy(
+     title            = "S/R Breakout (Donchian)",
+     overlay          = true,
+     currency         = currency.USD,
+     initial_capital  = 1000,
+     default_qty_type = strategy.fixed,
+     commission_type  = strategy.commission.percent,
+     commission_value = 0.03,
+     slippage         = 2,
+     pyramiding       = 0,
+     calc_on_every_tick = false,
+     process_orders_on_close = true)
+
+// ---- Inputs -----------------------------------------------------------------
+entryLen    = input.int(20,  "Breakout lookback (N-day high/low = the level)", group = "Levels")
+exitLen     = input.int(10,  "Exit channel (opposite M-day)",  group = "Levels")
+useTrend    = input.bool(true,"Only break out in SMA-200 direction", group = "Trend")
+trendLen    = input.int(200, "Trend SMA",                       group = "Trend")
+allowLong   = input.bool(true, "Allow longs",  group = "Direction")
+allowShort  = input.bool(false,"Allow shorts", group = "Direction")
+
+atrLen      = input.int(14,  "ATR length",            group = "Risk")
+atrStopMult = input.float(2.0,"Stop = ATR x",         group = "Risk", step = 0.5)
+riskPct     = input.float(2.0,"Risk % of equity/trade",group = "Risk", step = 0.5)
+
+useDateWin  = input.bool(false, "Limit backtest date range", group = "Backtest window")
+startDate   = input.time(timestamp("01 Jan 1990 00:00"), "Start", group = "Backtest window")
+endDate     = input.time(timestamp("01 Jan 2100 00:00"), "End",   group = "Backtest window")
+inDateWin   = not useDateWin or (time >= startDate and time <= endDate)
+
+// ---- Levels (use [1] so today's bar can't move its own level) ---------------
+resistance = ta.highest(high, entryLen)[1]     // N-day high = resistance
+support    = ta.lowest(low,  entryLen)[1]      // N-day low  = support
+exitHigh   = ta.highest(high, exitLen)[1]
+exitLow    = ta.lowest(low,  exitLen)[1]
+sma        = ta.sma(close, trendLen)
+atr        = ta.atr(atrLen)
+ready      = not na(resistance) and not na(atr) and bar_index > math.max(entryLen, trendLen) + 5
+
+trendUp    = not useTrend or close > sma
+trendDn    = not useTrend or close < sma
+
+// ---- Entry: break of the level ----------------------------------------------
+longSignal  = ready and allowLong  and trendUp and inDateWin and ta.crossover(close,  resistance)
+shortSignal = ready and allowShort and trendDn and inDateWin and ta.crossunder(close, support)
+
+// ---- Sizing: risk 2% across the ATR stop ------------------------------------
+stopDist = atr * atrStopMult
+riskCash = strategy.equity * (riskPct / 100.0)
+qty      = stopDist > 0 ? riskCash / stopDist : na
+
+// ---- Execution --------------------------------------------------------------
+if longSignal and strategy.position_size <= 0 and not na(qty)
+    strategy.entry("BO-Long", strategy.long, qty = qty)
+    strategy.exit("Lx", from_entry = "BO-Long", stop = close - stopDist)
+if shortSignal and strategy.position_size >= 0 and not na(qty)
+    strategy.entry("BO-Short", strategy.short, qty = qty)
+    strategy.exit("Sx", from_entry = "BO-Short", stop = close + stopDist)
+
+// Channel exits: long closes on break of opposite (support) channel, vice versa
+if strategy.position_size > 0 and close < exitLow
+    strategy.close("BO-Long", comment = "exit chan")
+if strategy.position_size < 0 and close > exitHigh
+    strategy.close("BO-Short", comment = "exit chan")
+
+// ---- Plots ------------------------------------------------------------------
+plot(resistance, "Resistance (N-hi)", color = color.new(color.red,   20), style = plot.style_stepline)
+plot(support,    "Support (N-lo)",    color = color.new(color.green, 20), style = plot.style_stepline)
+plot(useTrend ? sma : na, "SMA", color = color.orange)

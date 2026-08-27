@@ -1,0 +1,87 @@
+// =============================================================================
+// Candlestick Reversals at Support  (Pine Script v5, strategy)
+//   Codable candlestick TA. A bullish reversal candle (engulfing / hammer) is
+//   only taken when it prints AT SUPPORT (near a recent low / oversold) — the
+//   context is what gives the pattern any edge.
+//   Entry:  (bullish engulfing OR hammer) AND at support AND (optional uptrend)
+//   Exit :  target = R multiple of the stop, stop = below the signal candle low,
+//           plus a bounce/time exit.
+//   HONEST CAVEAT: candlestick edges are weak/mixed on their own — the support
+//   context + trend filter are doing most of the work. Prove it on full history.
+// Apply to gold / SPX / NDX / SPY, Daily.
+// =============================================================================
+//@version=5
+strategy(
+     title            = "Candles at Support",
+     overlay          = true,
+     currency         = currency.USD,
+     initial_capital  = 1000,
+     default_qty_type = strategy.fixed,
+     commission_type  = strategy.commission.percent,
+     commission_value = 0.03,
+     slippage         = 2,
+     pyramiding       = 0,
+     process_orders_on_close = true)
+
+// ---- Inputs -----------------------------------------------------------------
+useEngulf   = input.bool(true, "Bullish engulfing", group = "Patterns")
+useHammer   = input.bool(true, "Hammer",            group = "Patterns")
+supLen      = input.int(20,  "Support lookback (near N-day low)", group = "Context")
+supTolPct   = input.float(1.5,"Within % of the low = 'at support'", group = "Context", step = 0.5)
+useRsi      = input.bool(true,"Also require RSI oversold", group = "Context")
+rsiMax      = input.float(40, "RSI below",          group = "Context")
+useTrend    = input.bool(true,"Only long above SMA-200 (buy dips in uptrend)", group = "Trend")
+trendLen    = input.int(200, "Trend SMA",           group = "Trend")
+
+rMult       = input.float(2.0,"Target (R multiple)",group = "Risk", step = 0.5)
+maxHold     = input.int(10,  "Max hold (bars)",     group = "Risk")
+riskPct     = input.float(2.0,"Risk % of equity/trade",group = "Risk", step = 0.5)
+
+useDateWin  = input.bool(false, "Limit backtest date range", group = "Backtest window")
+startDate   = input.time(timestamp("01 Jan 1990 00:00"), "Start", group = "Backtest window")
+endDate     = input.time(timestamp("01 Jan 2100 00:00"), "End",   group = "Backtest window")
+inDateWin   = not useDateWin or (time >= startDate and time <= endDate)
+
+// ---- Candle geometry --------------------------------------------------------
+body     = math.abs(close - open)
+rng      = high - low
+lowWick  = math.min(open, close) - low
+upWick   = high - math.max(open, close)
+
+bullEngulf = useEngulf and close > open and close[1] < open[1] and open <= close[1] and close >= open[1] and body > body[1]
+hammer     = useHammer and lowWick >= 2 * body and upWick <= body and rng > 0 and close > open
+
+// ---- Context: at support, oversold, in uptrend ------------------------------
+recentLow = ta.lowest(low, supLen)[1]
+atSupport = low <= recentLow * (1 + supTolPct / 100.0)
+rsi       = ta.rsi(close, 14)
+sma       = ta.sma(close, trendLen)
+atr       = ta.atr(14)
+ready     = not na(recentLow) and not na(sma) and bar_index > math.max(supLen, trendLen) + 5
+
+oversold  = not useRsi   or rsi < rsiMax
+trendOK   = not useTrend or close > sma
+
+longSignal = ready and (bullEngulf or hammer) and atSupport and oversold and trendOK and inDateWin
+
+// ---- Sizing: risk 2% across the stop (below the signal candle low) -----------
+stopPrice = low - 0.10 * atr                    // just under the reversal candle
+stopDist  = close - stopPrice
+riskCash  = strategy.equity * (riskPct / 100.0)
+qty       = stopDist > 0 ? riskCash / stopDist : na
+
+// ---- Execution --------------------------------------------------------------
+var int entryBar = na
+if longSignal and strategy.position_size == 0 and not na(qty)
+    strategy.entry("Rev-Long", strategy.long, qty = qty)
+    entryBar := bar_index
+    strategy.exit("Lx", from_entry = "Rev-Long", stop = stopPrice, limit = close + rMult * stopDist)
+
+barsHeld = na(entryBar) ? 0 : bar_index - entryBar
+if strategy.position_size > 0 and barsHeld >= maxHold
+    strategy.close("Rev-Long", comment = "time")
+
+// ---- Plots ------------------------------------------------------------------
+plot(recentLow, "Support (N-lo)", color = color.new(color.green, 20), style = plot.style_stepline)
+plot(useTrend ? sma : na, "SMA-200", color = color.orange)
+plotshape(longSignal, title = "Reversal", style = shape.triangleup, location = location.belowbar, color = color.lime, size = size.tiny)
