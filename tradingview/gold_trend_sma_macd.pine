@@ -14,8 +14,8 @@ strategy(
      initial_capital  = 1000,
      default_qty_type = strategy.fixed,        // we set qty explicitly (ATR-sized)
      commission_type  = strategy.commission.percent,
-     // Spread cost applied per side. Gold on Capital.com ~0.02-0.05%. TUNE this.
-     commission_value = input.float(0.03, "Spread cost % (per side)", group = "Costs"),
+     // Spread cost % per side. Gold on OANDA/Capital.com ~0.02-0.05%. EDIT this number to your broker.
+     commission_value = 0.03,
      slippage         = 2,                     // ticks; live fills aren't perfect
      pyramiding       = 0,
      calc_on_every_tick = false,
@@ -35,6 +35,14 @@ atrStopMult = input.float(2.0,"Stop = ATR x",            group = "Risk", step = 
 tpR         = input.float(3.0,"Take-profit (R multiple)",group = "Risk", step = 0.5)
 riskPct     = input.float(2.0,"Risk % of equity/trade",  group = "Risk", step = 0.5)
 
+// ---- Backtest date window (apples-to-apples comparison across instruments) ----
+// Turn ON, set the SAME start/end for every symbol so no instrument is flattered
+// or punished by how far back its data happens to go.
+useDateWin  = input.bool(false, "Limit backtest date range", group = "Backtest window")
+startDate   = input.time(timestamp("01 Jan 1990 00:00"), "Start", group = "Backtest window")
+endDate     = input.time(timestamp("01 Jan 2100 00:00"), "End",   group = "Backtest window")
+inDateWin   = not useDateWin or (time >= startDate and time <= endDate)
+
 // Cost model — spread is wired into commission_value in the strategy() header.
 // WARNING: SWAP / overnight financing is NOT modeled by Pine at all. A multi-day
 // trend holder pays swap nightly in real life -> these results are slightly
@@ -52,8 +60,8 @@ ready = not na(sma) and not na(atr) and bar_index > smaLen + 10
 longMomOK  = not useMacd or hist > 0
 shortMomOK = not useMacd or hist < 0
 
-longSignal  = ready and allowLong  and close > sma and longMomOK
-shortSignal = ready and allowShort and close < sma and shortMomOK
+longSignal  = ready and allowLong  and close > sma and longMomOK  and inDateWin
+shortSignal = ready and allowShort and close < sma and shortMomOK and inDateWin
 
 // ---- Position sizing: risk 2% of equity across the 2xATR stop distance ------
 stopDist = atr * atrStopMult
@@ -61,25 +69,34 @@ riskCash = strategy.equity * (riskPct / 100.0)
 qty      = stopDist > 0 ? riskCash / stopDist : na          // units (oz for gold)
 
 // ---- Execution --------------------------------------------------------------
+// Alert payloads: readable for a human, JSON-ish for a webhook. {{close}} etc.
+// are filled by TradingView at fire time.
+sym = syminfo.ticker
 // Longs
 if longSignal and strategy.position_size <= 0 and not na(qty)
-    strategy.entry("Long", strategy.long, qty = qty)
+    strategy.entry("Long", strategy.long, qty = qty,
+         alert_message = '{"action":"BUY","symbol":"' + sym + '","qty":' + str.tostring(qty, "#.###") + ',"stop":' + str.tostring(close - stopDist, "#.##") + '}')
     stopL = close - stopDist
     tpL   = close + tpR * stopDist
-    strategy.exit("L-exit", from_entry = "Long", stop = stopL, limit = tpL)
+    strategy.exit("L-exit", from_entry = "Long", stop = stopL, limit = tpL,
+         alert_message = '{"action":"CLOSE_LONG","symbol":"' + sym + '","reason":"stop/target"}')
 
 // Shorts
 if shortSignal and strategy.position_size >= 0 and not na(qty)
-    strategy.entry("Short", strategy.short, qty = qty)
+    strategy.entry("Short", strategy.short, qty = qty,
+         alert_message = '{"action":"SELL","symbol":"' + sym + '","qty":' + str.tostring(qty, "#.###") + ',"stop":' + str.tostring(close + stopDist, "#.##") + '}')
     stopS = close + stopDist
     tpS   = close - tpR * stopDist
-    strategy.exit("S-exit", from_entry = "Short", stop = stopS, limit = tpS)
+    strategy.exit("S-exit", from_entry = "Short", stop = stopS, limit = tpS,
+         alert_message = '{"action":"CLOSE_SHORT","symbol":"' + sym + '","reason":"stop/target"}')
 
 // Trend-flip exits (mirror the live SMA-recross exit)
 if strategy.position_size > 0 and close < sma
-    strategy.close("Long", comment = "SMA flip")
+    strategy.close("Long", comment = "SMA flip",
+         alert_message = '{"action":"CLOSE_LONG","symbol":"' + sym + '","reason":"SMA flip"}')
 if strategy.position_size < 0 and close > sma
-    strategy.close("Short", comment = "SMA flip")
+    strategy.close("Short", comment = "SMA flip",
+         alert_message = '{"action":"CLOSE_SHORT","symbol":"' + sym + '","reason":"SMA flip"}')
 
 // ---- Plots ------------------------------------------------------------------
 plot(sma, "SMA-200", color = color.orange, linewidth = 2)

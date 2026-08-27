@@ -1,0 +1,88 @@
+// =============================================================================
+// Gold Intraday VWAP  (Pine Script v5, strategy)
+//   Intraday day-trade. Long/short pullback-to-VWAP in the intraday trend.
+//   Flat by session end  ->  NO overnight, NO swap.
+//   Entry:  VWAP reclaim (crossover) WITH EMA-9/21 trend agreement, in-session only
+//   Risk:   1x ATR stop, 1.5R target, 0.5% equity/trade, max 3 trades/day, -2% daily stop
+// APPLY TO: XAUUSD on the 15-minute timeframe. Set the session timezone to match yours.
+// NOTE: intraday backtests are LESS reliable than daily (thin free-plan history,
+//       TV underestimates intraday spread/slippage). Treat results as indicative.
+// =============================================================================
+//@version=5
+strategy(
+     title            = "Gold Intraday VWAP",
+     overlay          = true,
+     currency         = currency.USD,
+     initial_capital  = 1000,
+     default_qty_type = strategy.fixed,
+     commission_type  = strategy.commission.percent,
+     commission_value = 0.03,          // spread cost % per side — EDIT to your broker
+     slippage         = 3,             // ticks; intraday fills are worse than daily
+     pyramiding       = 0,
+     process_orders_on_close = true)
+
+// ---- Inputs -----------------------------------------------------------------
+emaFastLen  = input.int(9,    "EMA fast",              group = "Trend")
+emaSlowLen  = input.int(21,   "EMA slow",              group = "Trend")
+allowLong   = input.bool(true,"Allow longs",           group = "Direction")
+allowShort  = input.bool(true,"Allow shorts",          group = "Direction")
+
+atrLen      = input.int(14,   "ATR length",            group = "Risk")
+atrStopMult = input.float(1.0,"Stop = ATR x",          group = "Risk", step = 0.25)
+rMult       = input.float(1.5,"Target (R multiple)",   group = "Risk", step = 0.25)
+riskPct     = input.float(0.5,"Risk % of equity/trade",group = "Risk", step = 0.25)
+
+sess        = input.session("0800-1900", "Trading session (London+NY)", group = "Session")
+tz          = input.string("UTC", "Session timezone",  group = "Session")
+
+maxTrades   = input.int(3,    "Max trades per day",    group = "Guardrails")
+dailyLoss   = input.float(2.0,"Daily loss stop %",     group = "Guardrails", step = 0.5)
+
+// ---- Indicators -------------------------------------------------------------
+vwap = ta.vwap(hlc3)                    // session-anchored, resets each day
+emaF = ta.ema(close, emaFastLen)
+emaS = ta.ema(close, emaSlowLen)
+atr  = ta.atr(atrLen)
+
+// ---- Session + daily guardrails ---------------------------------------------
+inSession = not na(time(timeframe.period, sess, tz))
+
+var int   tradesToday = 0
+var float dayStartEq  = strategy.equity
+newDay = ta.change(time("D")) != 0
+if newDay
+    tradesToday := 0
+    dayStartEq  := strategy.equity
+
+dayLossHit = dayStartEq > 0 and (strategy.equity - dayStartEq) / dayStartEq <= -dailyLoss / 100.0
+canTrade   = inSession and tradesToday < maxTrades and not dayLossHit
+
+// ---- Entry signals: VWAP reclaim in trend direction -------------------------
+longSig  = allowLong  and canTrade and ta.crossover(close, vwap)  and emaF > emaS
+shortSig = allowShort and canTrade and ta.crossunder(close, vwap) and emaF < emaS
+
+// ---- Sizing: risk % across the ATR stop -------------------------------------
+stopDist = atr * atrStopMult
+riskCash = strategy.equity * (riskPct / 100.0)
+qty      = stopDist > 0 ? riskCash / stopDist : na
+
+// ---- Execution --------------------------------------------------------------
+if longSig and strategy.position_size == 0 and not na(qty)
+    strategy.entry("Long", strategy.long, qty = qty)
+    strategy.exit("L-x", from_entry = "Long", stop = close - stopDist, limit = close + rMult * stopDist)
+    tradesToday += 1
+
+if shortSig and strategy.position_size == 0 and not na(qty)
+    strategy.entry("Short", strategy.short, qty = qty)
+    strategy.exit("S-x", from_entry = "Short", stop = close + stopDist, limit = close - rMult * stopDist)
+    tradesToday += 1
+
+// Force flat outside the session -> no overnight, no swap
+if not inSession and strategy.position_size != 0
+    strategy.close_all(comment = "EOD flat")
+
+// ---- Plots ------------------------------------------------------------------
+plot(vwap, "VWAP",     color = color.blue,   linewidth = 2)
+plot(emaF, "EMA fast", color = color.teal)
+plot(emaS, "EMA slow", color = color.orange)
+bgcolor(inSession ? color.new(color.gray, 92) : na, title = "Session")

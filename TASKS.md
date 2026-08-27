@@ -1,7 +1,27 @@
 # Trading System — Task List
 
-> **Last updated: 2026-08-20**
+> **Last updated: 2026-08-27**
 > Read this FIRST every session. This is the single source of truth for what's done, what's open, and what happened last.
+
+---
+
+## Last Session Recap (2026-08-26 / 27)
+
+### ✅ S&P 500 index-trend strategy LIVE as daily dry-run (Milestone 1) — `bc3416c`
+The strategic pivot below moved from idea → running code. New `pipeline/agents/index_pipeline.py` reuses the existing SMA-200 + MACD engine on the S&P 500 (yfinance `^GSPC` / Capital.com epic `US500`), **strategy_id 200**, fully separate from FX (100/101). Config locked to the winning backtest: **long-only, entry = close>SMA-200 AND MACD histogram>0, exit = SMA-200 re-cross ("let it run", no fixed TP), 2% risk over 2×ATR(14) stop, sizing in index points.**
+- **Dry-run only** — logs the daily signal to `signals` (and marks `[DRY-RUN INTENT]` rows in `paper_trades` if it would enter/exit), **submits NO broker orders**. Runs fully offline (public yfinance, no `CAPITAL_*` secrets).
+- Wired into `daily_pipeline.yml` as an offline step right after the FX step, so signals commit to `shared/pipeline.db` automatically each run (3×/weekday).
+- **Verified on GitHub Actions** (run 33025609838, success): fetched 755 bars, computed **SIGNAL=FLAT** (S&P +7.97% above SMA-200 but MACD histogram −14.3 → momentum negative, correctly waits), logged strategy_id=200, no order. FX pipeline untouched (imports clean).
+- **Next → Milestone 2** (after ~1 week of eyeballing signals vs chart): (1) confirm the `US500` demo contract point value (assumed **$1/point**); (2) index-specific execution in `broker_capital.py` (point-based stop, no TP, SMA-recross exit monitor); (3) real `paper_trades` open rows + `broker_order_id`; (4) a `--live` flag guard (currently `run(dry_run=False)` raises `NotImplementedError`); (5) daily Actions step in live mode with secrets.
+
+### 🔬 TradingView full-history research — why gold was a mirage, S&P is the pick
+Ran the SMA-200+MACD Pine strategy (`tradingview/gold_trend_sma_macd.pine`, now with date-window input + alert_message payloads) across instruments, long-only, "let it run" (TP=100). **Central lesson: every spectacular number regressed toward PF ~1.5 / ~30% DD once tested over long/harsh history — the moonshots were period artifacts.**
+- **Fair apples-to-apples on the modern window (~1990+):** **S&P PF 3.29 / +136% / 7.1% DD / 102 trades (29 winners) = WINNER.** Gold PF 2.44 / +89% / 24% DD but only 19 winners (fragile). Nasdaq PF 4.45 but only +20% / 18 trades / **4 winners** (statistically meaningless — barely trades because it trends too smoothly to re-cross the SMA). Gold full-history (43yr) PF **1.03** = no edge; its +880%/PF1.71 was a cherry-picked bull run. Intraday VWAP scalping PF 0.587 = loses. Shorts hurt on every instrument.
+- **Why S&P flipped from "mediocre" to "best":** the 155-yr test (PF 1.49 / 35% DD) was punishing it with 1871–1990 reconstructed/illiquid data from a market that no longer exists. On the relevant modern window it's genuinely strong.
+- **Caveats to respect:** 29 winners = promising not proven; Pine ignores swap/overnight financing (real returns lower) → the demo forward-test is what proves it.
+
+### 📊 "Why can't I see results?" — resolved
+FX bot is running fine (last signal Aug 26; 5 open demo positions, 29 closed, net **−$13** ≈ flat — exactly as FX backtested = the weakest strategy). Two real reasons results felt invisible: (1) local repo was 18 commits behind origin (bot commits daily, laptop wasn't pulling); (2) the bot was trading the **weak FX strategy**, not the strong S&P one. Milestone 1 above fixes #2's root: the good strategy now runs (dry-run) and will produce watchable results.
 
 ---
 
