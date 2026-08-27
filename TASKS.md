@@ -7,6 +7,19 @@
 
 ## Last Session Recap (2026-08-26 / 27)
 
+### 🛑 ALL BOTS FLATTENED TO CASH + PAUSED (2026-08-27) — user decision "secure the capital, redeploy later"
+User chose to flatten everything and stop trading the mixed/weak strategies, then redeploy ONLY the validated index-trend (S&P/Nasdaq/Gold) later. Done across all 3 repos, reversible, verified on Actions:
+- **FX (trading-admin, `f3c6a40`):** Capital.com demo flattened (broker 0 open, 5 DB rows marked `manual_flatten`). New `--flatten` CLI + `flatten_fx.yml`. Entries paused via `FX_PAUSE_ENTRIES=1` in `daily_pipeline.yml` (strategies 100/101 skip entries; exits/reconciliation/export/dashboard STILL RUN). **daily_pipeline.yml NOT disabled** — index dry-run (200/201/202) still logs daily. **Reverse:** remove `FX_PAUSE_ENTRIES` line.
+- **Polymarket (`d68d0cd`):** 45 open paper positions closed (`manual_flatten`, 0 P&L, `won:null` so stats uncorrupted). All 4 trade-opener workflows disabled. **Reverse:** `scripts/unflatten_positions.py` + `gh workflow enable` the 4 bots.
+- **Stock (trading-bot):** new `flatten.yml` + `scripts/flatten.py`; 5 ETF sells (DBC/EFA/SPY/XLF/XLK) QUEUED (market was closed at flatten time) → **fill at 9:30 ET / 13:30 UTC open**. 5 order-placing workflows disabled (market-open, midday, afternoon, asset_class_tf, sector_momentum); monitors kept. **Reverse:** `gh workflow enable` those 5. ⚠️ **VERIFY after next US open** that stock shows 0 open positions (re-run flatten.yml).
+- **Still running everywhere:** monitoring/health/dashboards + the index-trend dry-run. Only *trading* is paused.
+- **Next when user is ready:** redeploy index-trend live (Milestone 2) as the ONLY active strategy set.
+
+### 📉 Dashboard redesigned (uncommitted WIP) — index panel + dark theme + flatline fix
+`dashboard.py` rewritten: dark card layout, new "Index Trend (dry-run)" panel (S&P/Nasdaq/Gold latest signal, SMA/MACD/ADX, open intents), and a fix for the equity-curve flatline (stale stock snapshots where `equity==cash` with positions still open are now filtered). **Left uncommitted** pending user sign-off on the redesign (previewed as an artifact). To ship: commit `dashboard.py` + `docs/index.html`.
+
+
+
 ### ✅ THREE index-trend strategies LIVE as daily dry-run (Milestone 1) — `bc3416c` → `c607542`
 The strategic pivot below moved from idea → running code. New `pipeline/agents/index_pipeline.py` reuses the existing SMA-200 + MACD engine, fully separate from FX (100/101). Loops over an `INSTRUMENTS` list — adding one is a one-row edit. Config locked to the winning backtest: **long-only, entry = close>SMA-200 AND MACD histogram>0, exit = SMA-200 re-cross ("let it run", no fixed TP), 2% risk over 2×ATR(14) stop.**
 

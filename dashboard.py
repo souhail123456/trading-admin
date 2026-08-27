@@ -404,6 +404,26 @@ def _fetch_stock_via_github() -> dict | None:
         return None
 
 
+def _is_stale_stock_snap(s: dict) -> bool:
+    """Detect a degenerate 'positions not priced' stock snapshot.
+
+    Root cause of the equity-curve flatline (late-May..mid-June 2026): on days the
+    stock bot could not price its holdings it still wrote a daily_snapshot, but with
+    equity collapsed to exactly its (frozen) cash while `positions` was non-empty.
+    That single frozen number ($100,659.65) was then carried forward for ~4 weeks
+    and drawn as if it were real daily equity. A genuine snapshot with open
+    positions always has equity != cash (positions carry market value); a truly
+    flat book has 0 positions (equity == cash is then legitimate and kept). So the
+    stale signature is: positions present AND equity == cash to the cent.
+    """
+    eq, cash = s.get("equity"), s.get("cash")
+    positions = s.get("positions") or []
+    return (
+        eq is not None and cash is not None and bool(positions)
+        and abs(float(eq) - float(cash)) < 0.01
+    )
+
+
 def _fetch_stock_local() -> dict | None:
     """Fallback: shared/daily_history.jsonl stock daily_snapshot events (always
     committed by the pipeline), optionally enriched by a local trading-bot clone."""
@@ -411,6 +431,14 @@ def _fetch_stock_local() -> dict | None:
     snaps = dh["stock_snapshots"]
     if not snaps:
         return None
+
+    # Drop stale/degenerate snapshots so carried-forward equity is never drawn as
+    # real data (see _is_stale_stock_snap). Keep the original list if filtering
+    # would leave us with nothing to show.
+    clean = [s for s in snaps if not _is_stale_stock_snap(s)]
+    if clean:
+        snaps = clean
+
     latest = snaps[-1]
     equity_history = _dedupe_daily(snaps, "equity")
 
@@ -527,22 +555,144 @@ def get_poly_data() -> dict | None:
 
 
 # ---------------------------------------------------------------------------
+# Index Trend (dry-run) — reads the same shared/pipeline.db the rest of the
+# dashboard uses. Strategies 200/201/202 are logged by
+# pipeline.agents.index_pipeline (signals table + status='intent' paper_trades).
+# No live orders are ever placed by this path — it is paper/dry-run only.
+# ---------------------------------------------------------------------------
+
+INDEX_STRATEGIES = [
+    {"strategy_id": 200, "name": "S&P 500", "symbol": "US500"},
+    {"strategy_id": 201, "name": "Nasdaq 100", "symbol": "US100"},
+    {"strategy_id": 202, "name": "Gold", "symbol": "GOLD"},
+]
+
+
+def get_index_data() -> dict | None:
+    """Index-trend dry-run state from shared/pipeline.db.
+
+    Returns per-strategy latest signal (+ decoded full_state), any open dry-run
+    intent positions, and a short recent-signal log. None if the DB is missing
+    or has no index signals yet."""
+    conn = _connect_shared_db()
+    if conn is None:
+        return None
+    try:
+        strategies = []
+        for meta in INDEX_STRATEGIES:
+            sid = meta["strategy_id"]
+            try:
+                row = conn.execute(
+                    "SELECT signal_type, symbol, price_at_signal, full_state, generated_at "
+                    "FROM signals WHERE strategy_id = ? ORDER BY generated_at DESC, id DESC LIMIT 1",
+                    (sid,),
+                ).fetchone()
+            except Exception:
+                return None
+            if row is None:
+                continue
+            try:
+                fs = json.loads(row["full_state"]) if row["full_state"] else {}
+            except Exception:
+                fs = {}
+            strategies.append({
+                "strategy_id": sid,
+                "name": meta["name"],
+                "symbol": row["symbol"] or meta["symbol"],
+                "signal_type": row["signal_type"],
+                "action": fs.get("action") or row["signal_type"],
+                "price": row["price_at_signal"],
+                "generated_at": row["generated_at"],
+                "state": fs,
+            })
+
+        if not strategies:
+            return None
+
+        # Open dry-run intent positions (status='intent'). The pipeline may log a
+        # fresh intent each run while flat, so keep only the newest per strategy.
+        intents_by_strat: dict[int, dict] = {}
+        try:
+            for r in conn.execute(
+                "SELECT strategy_id, symbol, side, entry_price, quantity, stop_loss, thesis, created_at "
+                "FROM paper_trades WHERE status = 'intent' AND strategy_id IN (200, 201, 202) "
+                "ORDER BY created_at DESC, id DESC"
+            ).fetchall():
+                sid = r["strategy_id"]
+                if sid not in intents_by_strat:
+                    intents_by_strat[sid] = {
+                        "strategy_id": sid,
+                        "symbol": r["symbol"],
+                        "side": r["side"],
+                        "entry_price": r["entry_price"],
+                        "quantity": r["quantity"],
+                        "stop_loss": r["stop_loss"],
+                        "thesis": r["thesis"],
+                        "created_at": r["created_at"],
+                    }
+        except Exception:
+            pass
+        intents = list(intents_by_strat.values())
+
+        # Recent signal log across the three strategies.
+        recent = []
+        try:
+            name_by_sid = {m["strategy_id"]: m["name"] for m in INDEX_STRATEGIES}
+            for r in conn.execute(
+                "SELECT strategy_id, signal_type, symbol, price_at_signal, full_state, generated_at "
+                "FROM signals WHERE strategy_id IN (200, 201, 202) "
+                "ORDER BY generated_at DESC, id DESC LIMIT 12"
+            ).fetchall():
+                try:
+                    fs = json.loads(r["full_state"]) if r["full_state"] else {}
+                except Exception:
+                    fs = {}
+                recent.append({
+                    "name": name_by_sid.get(r["strategy_id"], r["symbol"]),
+                    "symbol": r["symbol"],
+                    "action": fs.get("action") or r["signal_type"],
+                    "price": r["price_at_signal"],
+                    "generated_at": r["generated_at"],
+                })
+        except Exception:
+            pass
+
+        return {"strategies": strategies, "intents": intents, "recent": recent}
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
 # Inline SVG / CSS chart builders (no external JS libraries)
 # ---------------------------------------------------------------------------
 
 def render_equity_svg(history: list[dict], baseline: float = 100000,
-                       width: int = 1080, height: int = 260) -> str:
-    """Stock portfolio equity curve as a self-contained inline SVG line+area chart."""
+                      width: int = 1120, height: int = 300) -> str:
+    """Stock portfolio equity curve — self-contained inline SVG line+area chart.
+
+    Styled per the dataviz skill (dark surface): single blue series (slot-1
+    #3987e5), recessive hairline grid, muted axis ink, 2px line, dashed baseline,
+    a single direct-labelled last point, and a JS crosshair+tooltip (the default
+    interaction layer for a line chart). No external libraries."""
     if not history or len(history) < 2:
-        return '<div class="empty" style="padding:60px 0">No equity history available yet</div>'
+        return '<div class="empty" style="padding:72px 0">No equity history available yet</div>'
+
+    # Colors (validated dark-mode dataviz palette)
+    C_SERIES = "#3987e5"      # categorical slot 1 (blue)
+    C_GRID = "#232a31"        # hairline gridline (dark)
+    C_AXIS = "#3a4553"        # baseline / axis
+    C_MUTED = "#7a8698"       # axis + tick ink
+    C_INK = "#e6eaf0"         # primary ink (direct label)
+    C_GOOD = "#22c55e"
+    C_BAD = "#ef4444"
 
     values = [h["value"] for h in history]
     n = len(values)
     lo, hi = min(values + [baseline]), max(values + [baseline])
-    pad = (hi - lo) * 0.08 or max(hi * 0.02, 1)
+    pad = (hi - lo) * 0.10 or max(hi * 0.02, 1)
     lo, hi = lo - pad, hi + pad
 
-    pad_l, pad_r, pad_t, pad_b = 58, 16, 16, 26
+    pad_l, pad_r, pad_t, pad_b = 64, 66, 18, 30
     plot_w, plot_h = width - pad_l - pad_r, height - pad_t - pad_b
 
     def x(i):
@@ -560,37 +710,86 @@ def render_equity_svg(history: list[dict], baseline: float = 100000,
     for i in range(5):
         gy = pad_t + plot_h * i / 4
         val = hi - (hi - lo) * i / 4
-        grid.append(f'<line x1="{pad_l}" y1="{gy:.1f}" x2="{width - pad_r}" y2="{gy:.1f}" stroke="#1e2a3a" stroke-width="1"/>')
-        grid.append(f'<text x="{pad_l - 8}" y="{gy + 4:.1f}" text-anchor="end" font-size="10" fill="#666">${val:,.0f}</text>')
+        grid.append(f'<line x1="{pad_l}" y1="{gy:.1f}" x2="{width - pad_r}" y2="{gy:.1f}" stroke="{C_GRID}" stroke-width="1"/>')
+        grid.append(f'<text x="{pad_l - 10}" y="{gy + 3.5:.1f}" text-anchor="end" font-size="11" fill="{C_MUTED}" style="font-variant-numeric:tabular-nums">${val:,.0f}</text>')
 
     x_labels = []
-    for idx in sorted({0, n // 2, n - 1}):
-        x_labels.append(f'<text x="{x(idx):.1f}" y="{height - 6}" text-anchor="middle" font-size="10" fill="#666">{history[idx]["time"]}</text>')
+    for idx in sorted({0, n // 4, n // 2, (3 * n) // 4, n - 1}):
+        anchor = "start" if idx == 0 else "end" if idx == n - 1 else "middle"
+        x_labels.append(f'<text x="{x(idx):.1f}" y="{height - 8}" text-anchor="{anchor}" font-size="11" fill="{C_MUTED}">{history[idx]["time"]}</text>')
 
-    step = max(1, n // 80)
-    circles = []
-    for i in range(0, n, step):
-        px, py = pts[i]
-        circles.append(f'<circle cx="{px:.1f}" cy="{py:.1f}" r="2.5" fill="#00d4aa"><title>{history[i]["time"]}: ${values[i]:,.2f}</title></circle>')
-    if (n - 1) % step != 0:
-        px, py = pts[-1]
-        circles.append(f'<circle cx="{px:.1f}" cy="{py:.1f}" r="3.5" fill="#00d4aa"><title>{history[-1]["time"]}: ${values[-1]:,.2f}</title></circle>')
+    # Direct-labelled last point (selective — never a label on every point)
+    last_v = values[-1]
+    last_col = C_GOOD if last_v >= baseline else C_BAD
+    lx, ly = pts[-1]
+    last_label = (
+        f'<line x1="{lx:.1f}" y1="{ly:.1f}" x2="{width - pad_r + 6:.1f}" y2="{ly:.1f}" stroke="{last_col}" stroke-width="1" stroke-dasharray="2,2" opacity="0.7"/>'
+        f'<circle cx="{lx:.1f}" cy="{ly:.1f}" r="4.5" fill="{last_col}" stroke="#111722" stroke-width="2"/>'
+        f'<text x="{width - pad_r + 10:.1f}" y="{ly - 6:.1f}" text-anchor="end" font-size="12" font-weight="700" fill="{C_INK}" style="font-variant-numeric:tabular-nums">${last_v:,.0f}</text>'
+    )
 
-    return f'''<svg viewBox="0 0 {width} {height}" width="100%" style="height:{height}px;display:block" role="img" aria-label="Stock portfolio equity curve">
+    # Crosshair + tooltip interaction layer (data embedded for the inline script).
+    pt_json = json.dumps([[round(px, 1), round(py, 1)] for px, py in pts])
+    meta_json = json.dumps([[history[i]["time"], values[i]] for i in range(n)])
+    gid = "eq"
+
+    return f'''<svg id="{gid}-svg" viewBox="0 0 {width} {height}" width="100%" style="height:{height}px;display:block" role="img" aria-label="Stock portfolio equity curve"
+      data-pts='{pt_json}' data-meta='{meta_json}' data-baseline="{baseline}">
       <defs>
         <linearGradient id="eqFill" x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stop-color="#00d4aa" stop-opacity="0.30"/>
-          <stop offset="100%" stop-color="#00d4aa" stop-opacity="0.02"/>
+          <stop offset="0%" stop-color="{C_SERIES}" stop-opacity="0.28"/>
+          <stop offset="100%" stop-color="{C_SERIES}" stop-opacity="0.01"/>
         </linearGradient>
       </defs>
       {''.join(grid)}
-      <line x1="{pad_l}" y1="{baseline_y:.1f}" x2="{width - pad_r}" y2="{baseline_y:.1f}" stroke="#666" stroke-width="1" stroke-dasharray="4,4"/>
-      <text x="{width - pad_r}" y="{baseline_y - 4:.1f}" text-anchor="end" font-size="10" fill="#888">${baseline:,.0f} baseline</text>
+      <line x1="{pad_l}" y1="{baseline_y:.1f}" x2="{width - pad_r}" y2="{baseline_y:.1f}" stroke="{C_AXIS}" stroke-width="1" stroke-dasharray="5,4"/>
+      <text x="{pad_l + 4}" y="{baseline_y - 6:.1f}" text-anchor="start" font-size="10" fill="{C_MUTED}">${baseline:,.0f} baseline</text>
       <path d="{area_d}" fill="url(#eqFill)" stroke="none"/>
-      <path d="{path_d}" fill="none" stroke="#00d4aa" stroke-width="2"/>
-      {''.join(circles)}
+      <path d="{path_d}" fill="none" stroke="{C_SERIES}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+      {last_label}
       {''.join(x_labels)}
-    </svg>'''
+      <g id="{gid}-hover" style="display:none">
+        <line id="{gid}-vline" y1="{pad_t}" y2="{pad_t + plot_h:.1f}" stroke="{C_MUTED}" stroke-width="1" stroke-dasharray="3,3"/>
+        <circle id="{gid}-dot" r="4.5" fill="{C_SERIES}" stroke="#0d1420" stroke-width="2"/>
+      </g>
+      <rect id="{gid}-hit" x="{pad_l}" y="{pad_t}" width="{plot_w:.1f}" height="{plot_h:.1f}" fill="transparent" style="cursor:crosshair"/>
+      <g id="{gid}-tip" style="display:none" pointer-events="none">
+        <rect id="{gid}-tip-bg" rx="6" ry="6" fill="#0c1017" stroke="rgba(255,255,255,0.12)"/>
+        <text id="{gid}-tip-d" font-size="11" fill="{C_MUTED}"></text>
+        <text id="{gid}-tip-v" font-size="13" font-weight="700" fill="{C_INK}" style="font-variant-numeric:tabular-nums"></text>
+      </g>
+    </svg>
+    <script>(function(){{
+      var svg=document.getElementById("{gid}-svg"); if(!svg) return;
+      var pts=JSON.parse(svg.getAttribute("data-pts")), meta=JSON.parse(svg.getAttribute("data-meta"));
+      var base=parseFloat(svg.getAttribute("data-baseline"));
+      var hit=document.getElementById("{gid}-hit"), hov=document.getElementById("{gid}-hover");
+      var vline=document.getElementById("{gid}-vline"), dot=document.getElementById("{gid}-dot");
+      var tip=document.getElementById("{gid}-tip"), bg=document.getElementById("{gid}-tip-bg");
+      var td=document.getElementById("{gid}-tip-d"), tv=document.getElementById("{gid}-tip-v");
+      var VB={width}, PADT={pad_t};
+      function locate(ev){{
+        var r=svg.getBoundingClientRect(), sx=(ev.clientX-r.left)*(VB/r.width);
+        var best=0,bd=1e9; for(var i=0;i<pts.length;i++){{var d=Math.abs(pts[i][0]-sx); if(d<bd){{bd=d;best=i;}}}}
+        return best;
+      }}
+      function fmt(v){{return "$"+v.toLocaleString(undefined,{{minimumFractionDigits:2,maximumFractionDigits:2}});}}
+      function show(ev){{
+        var i=locate(ev), p=pts[i], m=meta[i];
+        hov.style.display=""; tip.style.display="";
+        vline.setAttribute("x1",p[0]); vline.setAttribute("x2",p[0]);
+        dot.setAttribute("cx",p[0]); dot.setAttribute("cy",p[1]);
+        var up=m[1]>=base; dot.setAttribute("fill", up?"#22c55e":"#ef4444");
+        td.textContent=m[0]; tv.textContent=fmt(m[1]);
+        var dl=(m[0]+"").length*6.2+16, vl=fmt(m[1]).length*7.4+16, w=Math.max(dl,vl,86), h=40;
+        var tx=p[0]+12; if(tx+w>VB-6) tx=p[0]-w-12; var ty=Math.max(PADT, p[1]-h-10);
+        bg.setAttribute("x",tx); bg.setAttribute("y",ty); bg.setAttribute("width",w); bg.setAttribute("height",h);
+        td.setAttribute("x",tx+9); td.setAttribute("y",ty+16);
+        tv.setAttribute("x",tx+9); tv.setAttribute("y",ty+32);
+      }}
+      hit.addEventListener("mousemove",show);
+      hit.addEventListener("mouseleave",function(){{hov.style.display="none"; tip.style.display="none";}});
+    }})();</script>'''
 
 
 def _bar_row(label: str, value: float, max_abs: float, fmt: str = "${:+,.2f}", title: str | None = None) -> str:
@@ -637,10 +836,10 @@ def _build_api_health_html(api_health: list[dict] | None) -> str:
         <div class="bot-header">
             <div class="bot-title">API STATUS <span class="bot-tag">{ok}/{total} OK</span></div>
         </div>
-        <table>
+        <div class="table-scroll"><table>
             <tr><th>Service</th><th>Bot</th><th>Status</th><th>Latency</th><th>Details</th><th>Fallback</th></tr>
             {rows}
-        </table>
+        </table></div>
     </div>"""
 
 
@@ -729,10 +928,153 @@ def _build_risk_html(fx: dict, stock: dict | None, state: dict) -> str:
     </div>"""
 
 
+_INDEX_ACCENT = {200: "#3987e5", 201: "#eda100", 202: "#e8b923"}  # S&P blue, Nasdaq amber, Gold
+
+
+def _signal_badge(action: str) -> str:
+    a = (action or "flat").lower()
+    label = a.replace("_", " ").upper()
+    cls = {
+        "enter_long": "sig-enter", "entry": "sig-enter",
+        "hold_long": "sig-hold", "hold": "sig-hold",
+        "exit_long": "sig-exit", "exit": "sig-exit",
+        "flat": "sig-flat",
+    }.get(a, "sig-flat")
+    return f'<span class="sig-badge {cls}">{label}</span>'
+
+
+def _short_ts(ts: str) -> str:
+    if not ts:
+        return "—"
+    s = str(ts).replace("T", " ").replace("Z", "")
+    return s[:16]
+
+
+def _build_index_html(index: dict | None) -> str:
+    """Index Trend (dry-run) panel — S&P / Nasdaq / Gold. Paper only, no orders."""
+    if not index or not index.get("strategies"):
+        return ""
+
+    cards = ""
+    for s in index["strategies"]:
+        st = s.get("state") or {}
+        sid = s["strategy_id"]
+        accent = _INDEX_ACCENT.get(sid, "#3987e5")
+        close = st.get("close", s.get("price"))
+        sma = st.get("sma_200")
+        above = st.get("above_sma")
+        dist = st.get("dist_to_sma_pct")
+        if dist is None and close and sma:
+            try:
+                dist = (float(close) - float(sma)) / float(sma) * 100
+            except Exception:
+                dist = None
+        hist = st.get("macd_histogram")
+        macd_bull = st.get("macd_bullish")
+        if macd_bull is None and hist is not None:
+            macd_bull = hist > 0
+
+        dist_css = "pos" if above else "neg"
+        dist_txt = f"{dist:+.2f}%" if isinstance(dist, (int, float)) else "—"
+        sma_txt = f"${sma:,.2f}" if isinstance(sma, (int, float)) else "—"
+        macd_css = "pos" if macd_bull else "neg"
+        macd_txt = "BULLISH &gt;0" if macd_bull else "bearish &le;0"
+        hist_txt = f"{hist:+.3f}" if isinstance(hist, (int, float)) else "—"
+        close_txt = f"${close:,.2f}" if isinstance(close, (int, float)) else "—"
+
+        adx_row = ""
+        if st.get("use_adx"):
+            adx = st.get("adx_14")
+            adx_pass = st.get("adx_pass")
+            adx_min = st.get("adx_min", 25)
+            gate_css = "pos" if adx_pass else "neg"
+            gate_txt = "PASS" if adx_pass else "BLOCK"
+            adx_val = f"{adx:.2f}" if isinstance(adx, (int, float)) else "—"
+            adx_row = (
+                f'<div class="ix-metric"><span class="ix-k">ADX-14 gate</span>'
+                f'<span class="ix-v"><b class="{gate_css}">{adx_val}</b> '
+                f'<span class="ix-gate {gate_css}">{gate_txt}</span> '
+                f'<span class="dim">&gt;{adx_min:g}</span></span></div>'
+            )
+
+        cards += f'''
+        <div class="ix-card" style="--accent:{accent}">
+            <div class="ix-top">
+                <div class="ix-name">{s['name']}<span class="ix-sym">{s['symbol']}</span></div>
+                {_signal_badge(s.get('action'))}
+            </div>
+            <div class="ix-price">{close_txt}<span class="ix-date">{st.get('date') or _short_ts(s.get('generated_at'))}</span></div>
+            <div class="ix-metrics">
+                <div class="ix-metric"><span class="ix-k">vs SMA-200</span><span class="ix-v"><b class="{dist_css}">{dist_txt}</b> <span class="dim">{sma_txt}</span></span></div>
+                <div class="ix-metric"><span class="ix-k">MACD hist</span><span class="ix-v"><b class="{macd_css}">{hist_txt}</b> <span class="{macd_css}">{macd_txt}</span></span></div>
+                {adx_row}
+            </div>
+        </div>'''
+
+    # Open dry-run intents
+    intents = index.get("intents", [])
+    if intents:
+        name_by_sid = {m["strategy_id"]: m["name"] for m in INDEX_STRATEGIES}
+        rows = ""
+        for it in intents:
+            entry = it.get("entry_price")
+            qty = it.get("quantity")
+            stop = it.get("stop_loss")
+            rows += (
+                f'<tr><td><b>{it.get("symbol")}</b> <span class="dim">{name_by_sid.get(it.get("strategy_id"), "")}</span></td>'
+                f'<td>{str(it.get("side","long")).upper()}</td>'
+                f'<td>{f"${entry:,.2f}" if isinstance(entry,(int,float)) else "—"}</td>'
+                f'<td>{f"{qty:,.4f}" if isinstance(qty,(int,float)) else "—"}</td>'
+                f'<td>{f"${stop:,.2f}" if isinstance(stop,(int,float)) else "—"}</td>'
+                f'<td class="dim" style="font-size:11px">{_short_ts(it.get("created_at"))}</td></tr>'
+            )
+        intents_html = (
+            '<h3>Open Dry-Run Intents <span class="ix-paper">status=intent · no order</span></h3>'
+            '<div class="table-scroll"><table>'
+            '<tr><th>Instrument</th><th>Side</th><th>Entry</th><th>Qty (pts)</th><th>Stop</th><th>Logged</th></tr>'
+            f'{rows}</table></div>'
+        )
+    else:
+        intents_html = '<h3>Open Dry-Run Intents</h3><div class="empty">No open intent positions</div>'
+
+    # Recent signal log
+    recent = index.get("recent", [])
+    if recent:
+        rrows = ""
+        for r in recent:
+            price = r.get("price")
+            rrows += (
+                f'<tr><td class="dim" style="font-size:11px">{_short_ts(r.get("generated_at"))}</td>'
+                f'<td><b>{r.get("symbol")}</b></td>'
+                f'<td>{_signal_badge(r.get("action"))}</td>'
+                f'<td style="font-variant-numeric:tabular-nums">{f"${price:,.2f}" if isinstance(price,(int,float)) else "—"}</td></tr>'
+            )
+        recent_html = (
+            '<h3>Recent Signal Log</h3>'
+            '<div class="table-scroll"><table>'
+            '<tr><th>When</th><th>Symbol</th><th>Signal</th><th>Price</th></tr>'
+            f'{rrows}</table></div>'
+        )
+    else:
+        recent_html = ""
+
+    return f'''
+    <section class="panel index-panel">
+        <div class="panel-head">
+            <h2>Index Trend <span class="panel-sub">SMA-200 + MACD trend · long-only</span></h2>
+            <span class="dryrun-badge">DRY-RUN · PAPER · NO ORDERS</span>
+        </div>
+        <div class="ix-cards">{cards}</div>
+        {intents_html}
+        {recent_html}
+    </section>'''
+
+
 def build_dashboard(fx: dict, stock: dict | None, poly: dict | None,
                     api_health: list[dict] | None = None) -> str:
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     state = get_global_state()
+    index = get_index_data()
 
     # Aggregate totals
     bots_online = 1 if (fx.get("account") or fx.get("open_trades")) else 0
@@ -811,10 +1153,10 @@ def build_dashboard(fx: dict, stock: dict | None, poly: dict | None,
             <div class="mini-stat"><span class="label">Est. Swap Cost</span><span class="val neg">${fx['total_swap_est']:+,.2f}</span></div>
         </div>
         <h3>Open Positions</h3>
-        <table>
+        <div class="table-scroll"><table>
             <tr><th>Symbol</th><th>Side</th><th>Size</th><th>Entry</th><th>P&L</th><th>Held</th><th>Swap Est.</th></tr>
             {fx_rows}
-        </table>
+        </table></div>
     </div>"""
 
     # Stock section
@@ -874,11 +1216,11 @@ def build_dashboard(fx: dict, stock: dict | None, poly: dict | None,
                 <div class="mini-stat"><span class="label">Positions</span><span class="val">{len(positions)}</span></div>
                 <div class="mini-stat"><span class="label">Last Run</span><span class="val">{stock.get('last_run') or 'N/A'}</span></div>
             </div>
-            <table>
+            <div class="table-scroll"><table>
                 <tr><th>Symbol</th><th>Side</th><th>Shares</th><th>Entry</th><th>Unrealized</th></tr>
                 {pos_html}
-            </table>
-            {f'<h3>Closed Trades</h3><table><tr><th>Symbol</th><th>Entry</th><th>Exit</th><th>P&L</th></tr>{closed_html}</table>' if closed_html else ''}
+            </table></div>
+            {f'<h3>Closed Trades</h3><div class="table-scroll"><table><tr><th>Symbol</th><th>Entry</th><th>Exit</th><th>P&L</th></tr>{closed_html}</table></div>' if closed_html else ''}
             <h3>Top Winners / Losers</h3>
             {wl_html}
         </div>"""
@@ -928,13 +1270,15 @@ def build_dashboard(fx: dict, stock: dict | None, poly: dict | None,
             <h3>Weather P&L by Side</h3>
             {side_html}
             <h3>Recent Trades</h3>
-            <table>
+            <div class="table-scroll"><table>
                 <tr><th>Market</th><th>Size</th><th>Status</th><th>P&L</th></tr>
                 {recent_html}
-            </table>
+            </table></div>
         </div>"""
 
     risk_html = _build_risk_html(fx, stock, state)
+
+    index_html = _build_index_html(index)
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -943,241 +1287,323 @@ def build_dashboard(fx: dict, stock: dict | None, poly: dict | None,
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Trading Admin Dashboard</title>
 <style>
-* {{ margin: 0; padding: 0; box-sizing: border-box; }}
-body {{
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace;
-    background: #0a0e17;
-    color: #e0e0e0;
-    padding: 20px;
-    max-width: 1400px;
-    margin: 0 auto;
+:root {{
+    --bg: #0a0d13;
+    --panel: #12161f;
+    --tile: #171c27;
+    --tile-2: #0f131b;
+    --border: rgba(255,255,255,0.07);
+    --border-2: rgba(255,255,255,0.12);
+    --ink: #e9ecf2;
+    --ink-2: #9aa3b2;
+    --muted: #626b7a;
+    --accent: #3987e5;
+    --pos: #22c55e;
+    --neg: #ef4444;
+    --warn: #fab219;
+    --violet: #9085e9;
+    --amber: #eda100;
+    --radius: 14px;
+    --shadow: 0 1px 2px rgba(0,0,0,0.4), 0 8px 24px rgba(0,0,0,0.18);
 }}
+* {{ margin: 0; padding: 0; box-sizing: border-box; }}
+html {{ -webkit-text-size-adjust: 100%; }}
+body {{
+    font-family: system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+    background:
+        radial-gradient(1200px 600px at 15% -10%, rgba(57,135,229,0.08), transparent 60%),
+        radial-gradient(1000px 500px at 100% 0%, rgba(144,133,233,0.06), transparent 55%),
+        var(--bg);
+    color: var(--ink);
+    padding: 22px;
+    max-width: 1440px;
+    margin: 0 auto;
+    line-height: 1.45;
+    overflow-x: hidden;
+}}
+.num {{ font-variant-numeric: tabular-nums; }}
 
 /* Header */
 .header {{
     display: flex;
     justify-content: space-between;
-    align-items: center;
-    margin-bottom: 24px;
+    align-items: flex-end;
+    flex-wrap: wrap;
+    gap: 14px;
+    margin-bottom: 22px;
     padding-bottom: 16px;
-    border-bottom: 1px solid #1e2a3a;
+    border-bottom: 1px solid var(--border);
 }}
-.header h1 {{ color: #00d4aa; font-size: 24px; }}
-.header .meta {{ color: #666; font-size: 13px; }}
+.header .brand {{ display: flex; align-items: center; gap: 12px; }}
+.header .dot {{ width: 10px; height: 10px; border-radius: 50%; background: var(--pos); box-shadow: 0 0 0 4px rgba(34,197,94,0.15); }}
+.header h1 {{ font-size: 22px; font-weight: 800; letter-spacing: -0.02em; }}
+.header h1 span {{ color: var(--accent); }}
+.chips {{ display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }}
+.chip {{
+    display: inline-flex; align-items: center; gap: 6px;
+    background: var(--panel); border: 1px solid var(--border);
+    padding: 6px 11px; border-radius: 999px; font-size: 12px; color: var(--ink-2);
+}}
+.chip b {{ color: var(--ink); font-weight: 700; }}
 
-/* Overview cards */
+/* Overview KPI tiles */
 .overview {{
     display: grid;
     grid-template-columns: repeat(4, 1fr);
     gap: 14px;
-    margin-bottom: 24px;
+    margin-bottom: 20px;
 }}
 .overview-card {{
-    background: #111827;
-    border: 1px solid #1e2a3a;
-    border-radius: 10px;
-    padding: 18px;
+    position: relative;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 16px 18px;
+    box-shadow: var(--shadow);
+    overflow: hidden;
 }}
-.overview-card .label {{ color: #666; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }}
-.overview-card .value {{ font-size: 28px; font-weight: bold; margin-top: 6px; }}
-.overview-card .sub {{ font-size: 12px; color: #555; margin-top: 4px; }}
+.overview-card::before {{
+    content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
+    background: var(--accent); opacity: 0.9;
+}}
+.overview-card.k-pnl::before {{ background: var(--pos); }}
+.overview-card.k-neg::before {{ background: var(--neg); }}
+.overview-card.k-pos::before {{ background: var(--pos); }}
+.overview-card.k-open::before {{ background: var(--accent); }}
+.overview-card.k-regime::before {{ background: var(--violet); }}
+.overview-card.k-vix::before {{ background: var(--warn); }}
+.overview-card .label {{ color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.7px; font-weight: 600; }}
+.overview-card .value {{ font-size: 30px; font-weight: 800; margin-top: 6px; letter-spacing: -0.02em; }}
+.overview-card .sub {{ font-size: 12px; color: var(--ink-2); margin-top: 5px; }}
 
 /* Colors */
-.pos {{ color: #00d4aa; }}
-.neg {{ color: #ef4444; }}
-.green {{ color: #00d4aa; }}
-.blue {{ color: #3b82f6; }}
-.yellow {{ color: #f59e0b; }}
-.red {{ color: #ef4444; }}
-.dim {{ color: #555; }}
+.pos {{ color: var(--pos); }}
+.neg {{ color: var(--neg); }}
+.green {{ color: var(--pos); }}
+.blue {{ color: var(--accent); }}
+.yellow {{ color: var(--warn); }}
+.red {{ color: var(--neg); }}
+.dim {{ color: var(--muted); }}
 
 /* Regime */
-.regime-trending {{ color: #00d4aa; }}
-.regime-ranging {{ color: #f59e0b; }}
-.regime-volatile {{ color: #ef4444; }}
-.regime-crisis {{ color: #ef4444; font-weight: bold; }}
-.regime-n\\/a {{ color: #666; }}
+.regime-trending {{ color: var(--pos); }}
+.regime-ranging {{ color: var(--warn); }}
+.regime-volatile {{ color: var(--neg); }}
+.regime-crisis {{ color: var(--neg); font-weight: bold; }}
+.regime-n\\/a {{ color: var(--muted); }}
+
+/* Panels (shared card shell) */
+.panel {{
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    padding: 18px;
+    margin-bottom: 20px;
+}}
+.panel-head {{
+    display: flex; justify-content: space-between; align-items: center;
+    flex-wrap: wrap; gap: 10px; margin-bottom: 16px;
+}}
+.panel-head h2 {{ font-size: 16px; font-weight: 700; letter-spacing: -0.01em; }}
+.panel-sub {{ font-size: 12px; color: var(--muted); font-weight: 500; margin-left: 8px; }}
 
 /* Chart */
 .chart-container {{
-    background: #111827;
-    border: 1px solid #1e2a3a;
-    border-radius: 10px;
-    margin-bottom: 24px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    margin-bottom: 20px;
     overflow: hidden;
 }}
 .chart-header {{
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 10px 16px;
-    border-bottom: 1px solid #1e2a3a;
+    display: flex; justify-content: space-between; align-items: center;
+    flex-wrap: wrap; gap: 8px;
+    padding: 14px 18px; border-bottom: 1px solid var(--border);
 }}
-.chart-title {{ color: #00d4aa; font-size: 16px; font-weight: bold; }}
-#chart {{ padding: 8px 4px 0; }}
+.chart-title {{ font-size: 15px; font-weight: 700; }}
+.chart-legend {{ display: inline-flex; align-items: center; gap: 7px; font-size: 12px; color: var(--ink-2); }}
+.swatch {{ width: 12px; height: 3px; border-radius: 2px; background: var(--accent); display: inline-block; }}
+#chart {{ padding: 12px 10px 6px; overflow-x: auto; }}
 
-/* Bot cards */
-.bots {{ display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; margin-bottom: 24px; }}
+/* Bot cards grid */
+.bots {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-bottom: 20px; }}
 .bot-card {{
-    background: #111827;
-    border: 1px solid #1e2a3a;
-    border-radius: 10px;
-    padding: 16px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    padding: 16px 18px;
     overflow: hidden;
+    min-width: 0;
 }}
 .bot-header {{
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    margin-bottom: 14px;
-    padding-bottom: 10px;
-    border-bottom: 1px solid #1e2a3a;
-    flex-wrap: wrap;
-    gap: 6px;
+    display: flex; justify-content: space-between; align-items: center;
+    margin-bottom: 14px; padding-bottom: 12px;
+    border-bottom: 1px solid var(--border);
+    flex-wrap: wrap; gap: 6px;
 }}
-.bot-title {{ font-size: 14px; font-weight: bold; }}
+.bot-title {{ font-size: 13px; font-weight: 700; letter-spacing: 0.02em; }}
 .bot-tag {{
-    background: #1e2a3a;
-    color: #888;
-    padding: 2px 8px;
-    border-radius: 4px;
-    font-size: 10px;
-    font-weight: normal;
-    margin-left: 6px;
+    background: rgba(255,255,255,0.05); color: var(--ink-2);
+    padding: 2px 8px; border-radius: 5px; font-size: 10px; font-weight: 600;
+    margin-left: 6px; border: 1px solid var(--border);
 }}
-.bot-pnl {{ font-size: 18px; font-weight: bold; }}
+.bot-pnl {{ font-size: 19px; font-weight: 800; }}
 .market-status {{
-    display: inline-block;
-    padding: 2px 8px;
-    border-radius: 4px;
-    font-size: 10px;
-    font-weight: bold;
-    margin-left: 6px;
+    display: inline-block; padding: 2px 8px; border-radius: 5px;
+    font-size: 10px; font-weight: 700; margin-left: 6px;
 }}
-.market-open {{ background: #0d3320; color: #00d4aa; }}
-.market-closed {{ background: #3b1111; color: #ef4444; }}
-.market-247 {{ background: #1a1a33; color: #8b5cf6; }}
-.live-tag {{ background: #0d3320; color: #00d4aa; }}
-.offline-tag {{ background: #33260d; color: #f59e0b; }}
-.bot-stats {{
-    display: grid;
-    grid-template-columns: repeat(3, 1fr);
-    gap: 8px;
-    margin-bottom: 14px;
-}}
-.mini-stat {{
-    background: #0d1520;
-    border-radius: 6px;
-    padding: 8px 10px;
-}}
-.mini-stat .label {{ display: block; font-size: 10px; color: #555; text-transform: uppercase; }}
-.mini-stat .val {{ display: block; font-size: 13px; font-weight: bold; margin-top: 2px; }}
+.market-open {{ background: rgba(34,197,94,0.14); color: var(--pos); }}
+.market-closed {{ background: rgba(239,68,68,0.13); color: var(--neg); }}
+.market-247 {{ background: rgba(144,133,233,0.15); color: var(--violet); }}
+.live-tag {{ background: rgba(34,197,94,0.14); color: var(--pos); }}
+.offline-tag {{ background: rgba(250,178,25,0.14); color: var(--warn); }}
+.bot-stats {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 12px; }}
+.mini-stat {{ background: var(--tile-2); border: 1px solid var(--border); border-radius: 9px; padding: 8px 10px; }}
+.mini-stat .label {{ display: block; font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.4px; }}
+.mini-stat .val {{ display: block; font-size: 13px; font-weight: 700; margin-top: 3px; font-variant-numeric: tabular-nums; }}
 
 h3 {{
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 1px;
-    color: #555;
-    margin: 14px 0 8px;
+    font-size: 11px; text-transform: uppercase; letter-spacing: 1px;
+    color: var(--muted); font-weight: 700; margin: 16px 0 8px;
 }}
 
 /* Tables */
+.table-scroll {{ width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }}
+.table-scroll table {{ min-width: 340px; }}
 table {{ width: 100%; border-collapse: collapse; }}
 th {{
-    text-align: left;
-    padding: 5px 8px;
-    font-size: 10px;
-    text-transform: uppercase;
-    color: #444;
-    border-bottom: 1px solid #1e2a3a;
+    text-align: left; padding: 6px 8px; font-size: 10px; text-transform: uppercase;
+    letter-spacing: 0.4px; color: var(--muted); font-weight: 600;
+    border-bottom: 1px solid var(--border); white-space: nowrap;
 }}
-td {{ padding: 6px 8px; font-size: 12px; border-bottom: 1px solid #0d1520; }}
-tr:hover {{ background: #1a2332; }}
-.empty {{ text-align: center; color: #555; padding: 16px !important; }}
+td {{ padding: 7px 8px; font-size: 12px; border-bottom: 1px solid rgba(255,255,255,0.04); white-space: nowrap; }}
+tbody tr:last-child td, table tr:last-child td {{ border-bottom: none; }}
+tr:hover td {{ background: rgba(255,255,255,0.03); }}
+.empty {{ text-align: center; color: var(--muted); padding: 18px !important; }}
 
-.badge {{
-    display: inline-block;
-    padding: 2px 8px;
-    border-radius: 4px;
-    font-size: 10px;
-    font-weight: bold;
-}}
-.badge-t {{ background: #0d3320; color: #00d4aa; }}
-.badge-pa {{ background: #1e1a33; color: #8b5cf6; }}
+.badge {{ display: inline-block; padding: 2px 8px; border-radius: 5px; font-size: 10px; font-weight: 700; }}
+.badge-t {{ background: rgba(34,197,94,0.14); color: var(--pos); }}
+.badge-pa {{ background: rgba(144,133,233,0.15); color: var(--violet); }}
 .flag-badge {{
-    display: inline-block;
-    background: #3b1111;
-    color: #ef4444;
-    padding: 3px 10px;
-    border-radius: 4px;
-    font-size: 10px;
-    font-weight: bold;
-    margin: 2px 4px 2px 0;
+    display: inline-block; background: rgba(239,68,68,0.13); color: var(--neg);
+    padding: 3px 10px; border-radius: 5px; font-size: 10px; font-weight: 700; margin: 2px 4px 2px 0;
 }}
+.sig-entry {{ color: var(--pos); font-weight: bold; }}
+.sig-exit {{ color: var(--neg); font-weight: bold; }}
 
-.sig-entry {{ color: #00d4aa; font-weight: bold; }}
-.sig-exit {{ color: #ef4444; font-weight: bold; }}
+/* Index Trend panel */
+.dryrun-badge {{
+    font-size: 10px; font-weight: 800; letter-spacing: 0.6px; color: var(--warn);
+    background: rgba(250,178,25,0.10); border: 1px solid rgba(250,178,25,0.32);
+    padding: 5px 11px; border-radius: 999px;
+}}
+.ix-cards {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-bottom: 8px; }}
+.ix-card {{
+    background: var(--tile); border: 1px solid var(--border); border-radius: 12px;
+    padding: 14px 16px; border-top: 3px solid var(--accent); min-width: 0;
+}}
+.ix-top {{ display: flex; justify-content: space-between; align-items: center; gap: 8px; }}
+.ix-name {{ font-weight: 700; font-size: 14px; }}
+.ix-sym {{
+    margin-left: 8px; font-size: 10px; color: var(--ink-2); background: rgba(255,255,255,0.05);
+    padding: 2px 7px; border-radius: 5px; font-weight: 600; letter-spacing: 0.5px;
+}}
+.ix-price {{ font-size: 25px; font-weight: 800; margin: 12px 0 12px; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; }}
+.ix-date {{ font-size: 11px; color: var(--muted); font-weight: 500; margin-left: 8px; }}
+.ix-metrics {{ display: flex; flex-direction: column; gap: 0; }}
+.ix-metric {{ display: flex; justify-content: space-between; align-items: center; gap: 10px; font-size: 12px; padding: 8px 0; border-top: 1px solid var(--border); }}
+.ix-k {{ color: var(--ink-2); }}
+.ix-v {{ text-align: right; font-variant-numeric: tabular-nums; }}
+.ix-v b {{ font-weight: 700; }}
+.ix-gate {{ font-size: 10px; font-weight: 800; padding: 1px 7px; border-radius: 5px; }}
+.ix-gate.pos {{ background: rgba(34,197,94,0.15); }}
+.ix-gate.neg {{ background: rgba(239,68,68,0.14); }}
+.ix-paper {{ font-size: 10px; color: var(--muted); font-weight: 500; text-transform: none; letter-spacing: 0; margin-left: 8px; }}
+.sig-badge {{
+    display: inline-block; padding: 4px 11px; border-radius: 999px;
+    font-size: 11px; font-weight: 800; letter-spacing: 0.4px; white-space: nowrap;
+}}
+.sig-enter {{ background: rgba(34,197,94,0.16); color: var(--pos); border: 1px solid rgba(34,197,94,0.35); }}
+.sig-hold {{ background: rgba(57,135,229,0.16); color: #6aa9f2; border: 1px solid rgba(57,135,229,0.35); }}
+.sig-exit {{ background: rgba(239,68,68,0.16); color: var(--neg); border: 1px solid rgba(239,68,68,0.35); }}
+.sig-flat {{ background: rgba(255,255,255,0.05); color: var(--ink-2); border: 1px solid var(--border); }}
 
-/* Bar rows (winners/losers, currency exposure, weather side P&L) */
-.bar-row {{ display: flex; align-items: center; gap: 8px; margin: 6px 0; font-size: 12px; }}
-.bar-label {{ width: 96px; flex-shrink: 0; color: #888; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
-.bar-track {{ flex: 1; background: #0d1520; border-radius: 4px; height: 14px; overflow: hidden; }}
-.bar-fill {{ height: 100%; border-radius: 4px; }}
-.bar-fill.pos {{ background: #00d4aa; }}
-.bar-fill.neg {{ background: #ef4444; }}
-.bar-value {{ width: 110px; text-align: right; flex-shrink: 0; font-weight: bold; }}
+/* Bar rows */
+.bar-row {{ display: flex; align-items: center; gap: 8px; margin: 7px 0; font-size: 12px; }}
+.bar-label {{ width: 96px; flex-shrink: 0; color: var(--ink-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+.bar-track {{ flex: 1; background: var(--tile-2); border-radius: 5px; height: 14px; overflow: hidden; }}
+.bar-fill {{ height: 100%; border-radius: 5px; }}
+.bar-fill.pos {{ background: var(--pos); }}
+.bar-fill.neg {{ background: var(--neg); }}
+.bar-value {{ width: 108px; text-align: right; flex-shrink: 0; font-weight: 700; font-variant-numeric: tabular-nums; }}
+
+/* Section label */
+.section-label {{ font-size: 12px; letter-spacing: 1.2px; color: var(--ink-2); font-weight: 700; text-transform: uppercase; margin: 4px 0 12px; }}
 
 /* Risk section */
-.risk-grid {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 24px; }}
+.risk-grid {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 20px; }}
 .risk-card {{
-    background: #111827;
-    border: 1px solid #1e2a3a;
-    border-radius: 10px;
-    padding: 16px;
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: var(--radius); box-shadow: var(--shadow); padding: 16px 18px; min-width: 0;
 }}
 .risk-card h3:first-child {{ margin-top: 0; }}
 
 /* Footer */
-.footer {{ text-align: center; color: #333; font-size: 11px; margin-top: 24px; padding-top: 16px; border-top: 1px solid #1e2a3a; }}
+.footer {{ text-align: center; color: var(--muted); font-size: 11px; margin-top: 22px; padding-top: 16px; border-top: 1px solid var(--border); }}
 
-@media (max-width: 1000px) {{
+@media (max-width: 1024px) {{
     .bots {{ grid-template-columns: 1fr; }}
+    .ix-cards {{ grid-template-columns: 1fr; }}
     .overview {{ grid-template-columns: repeat(2, 1fr); }}
     .bot-stats {{ grid-template-columns: repeat(2, 1fr); }}
     .risk-grid {{ grid-template-columns: 1fr 1fr; }}
 }}
 @media (max-width: 600px) {{
+    body {{ padding: 14px; }}
     .risk-grid {{ grid-template-columns: 1fr; }}
     .overview {{ grid-template-columns: 1fr 1fr; }}
+    .overview-card .value {{ font-size: 24px; }}
+    .header h1 {{ font-size: 19px; }}
 }}
 </style>
 </head>
 <body>
 
 <div class="header">
-    <h1>Trading Admin</h1>
-    <div class="meta">{now} | {bots_online}/3 bots online</div>
+    <div class="brand">
+        <span class="dot"></span>
+        <h1>Trading <span>Admin</span></h1>
+    </div>
+    <div class="chips">
+        <span class="chip">{now}</span>
+        <span class="chip"><b>{bots_online}/3</b> bots online</span>
+        <span class="chip">Regime <b class="regime-{regime_label.lower()}">{regime_label}</b></span>
+        <span class="chip">VIX <b class="yellow">{vix_label}</b></span>
+    </div>
 </div>
 
 <div class="overview">
-    <div class="overview-card">
+    <div class="overview-card {'k-pnl' if total_pnl >= 0 else 'k-neg'}">
         <div class="label">Total P&L</div>
-        <div class="value {'green' if total_pnl >= 0 else 'red'}">${total_pnl:+,.2f}</div>
+        <div class="value num {'green' if total_pnl >= 0 else 'red'}">${total_pnl:+,.2f}</div>
         <div class="sub">FX ${fx_total_pnl:+,.0f} &middot; Stock ${stock_pnl:+,.0f} &middot; Poly ${poly_pnl:+,.0f}</div>
     </div>
-    <div class="overview-card">
+    <div class="overview-card k-open">
         <div class="label">Total Open Positions</div>
-        <div class="value blue">{total_open}</div>
+        <div class="value num blue">{total_open}</div>
         <div class="sub">FX {fx['open_count']} &middot; Stock {len(stock.get('open_positions', [])) if stock else 0} &middot; Poly {(poly['ev']['open'] + poly['weather']['open']) if poly else 0}</div>
     </div>
-    <div class="overview-card">
-        <div class="label">Regime</div>
+    <div class="overview-card k-regime">
+        <div class="label">Market Regime</div>
         <div class="value regime-{regime_label.lower()}">{regime_label}</div>
         <div class="sub">{regime_desc[:60]}</div>
     </div>
-    <div class="overview-card">
+    <div class="overview-card k-vix">
         <div class="label">VIX</div>
-        <div class="value yellow">{vix_label}</div>
+        <div class="value num yellow">{vix_label}</div>
         <div class="sub">{vix_desc}</div>
     </div>
 </div>
@@ -1185,23 +1611,26 @@ tr:hover {{ background: #1a2332; }}
 <div class="chart-container">
     <div class="chart-header">
         <span class="chart-title">Portfolio Equity</span>
-        <span style="color:#666;font-size:12px">Stock bot — $100k baseline</span>
+        <span class="chart-legend"><span class="swatch"></span> Stock bot equity &middot; $100k baseline</span>
     </div>
     <div id="chart">{equity_svg}</div>
 </div>
 
+<div class="section-label">Bots</div>
 <div class="bots">
     {stock_html if stock_html else '<div class="bot-card"><div class="bot-header"><div class="bot-title">STOCK/ETF BOT</div></div><div class="empty">No data available</div></div>'}
     {fx_html}
     {poly_html if poly_html else '<div class="bot-card"><div class="bot-header"><div class="bot-title">POLYMARKET BOT</div></div><div class="empty">No data available</div></div>'}
 </div>
 
-<h3 style="font-size:13px;letter-spacing:1px;color:#888;margin-bottom:12px">RISK &amp; EXPOSURE</h3>
+{index_html}
+
+<div class="section-label">Risk &amp; Exposure</div>
 {risk_html}
 
 {_build_api_health_html(api_health)}
 
-<div class="footer">Trading Admin Dashboard | Auto-generated {now} | FX: {fx.get('regime',{}).get('regime','?')} regime source shared/global_state.json | Stock: {stock.get('source','offline') if stock else 'offline'} | Poly: {poly.get('source','offline') if poly else 'offline'}</div>
+<div class="footer">Trading Admin Dashboard &middot; Auto-generated {now} &middot; FX regime source shared/global_state.json &middot; Stock: {stock.get('source','offline') if stock else 'offline'} &middot; Poly: {poly.get('source','offline') if poly else 'offline'} &middot; Index: shared/pipeline.db (dry-run)</div>
 
 </body>
 </html>"""
