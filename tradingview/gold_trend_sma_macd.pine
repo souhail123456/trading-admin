@@ -30,6 +30,13 @@ macdSig     = input.int(9,    "MACD signal",             group = "Momentum")
 allowLong   = input.bool(true,  "Allow longs",           group = "Direction")
 allowShort  = input.bool(true,  "Allow shorts",          group = "Direction")
 
+// Regime filter — only trade when the market is actually TRENDING (ADX high).
+// Off by default (keeps S&P/Nasdaq behaviour unchanged). Turn ON for GOLD: it
+// skips gold's long dead range-bound years (1985-2005) that whipsaw an MA rule.
+useAdx      = input.bool(false, "ADX regime filter (trend-strength gate)", group = "Regime")
+adxLen      = input.int(14,   "ADX/DI length",            group = "Regime")
+adxMin      = input.float(20, "Min ADX to allow entries", group = "Regime", step = 1)
+
 atrLen      = input.int(14,   "ATR length",              group = "Risk")
 atrStopMult = input.float(2.0,"Stop = ATR x",            group = "Risk", step = 0.5)
 tpR         = input.float(3.0,"Take-profit (R multiple)",group = "Risk", step = 0.5)
@@ -52,6 +59,7 @@ inDateWin   = not useDateWin or (time >= startDate and time <= endDate)
 sma  = ta.sma(close, smaLen)
 atr  = ta.atr(atrLen)
 [macdLine, sigLine, hist] = ta.macd(close, macdFast, macdSlow, macdSig)
+[diPlus, diMinus, adxVal] = ta.dmi(adxLen, adxLen)   // ADX trend-strength
 
 // enough history?
 ready = not na(sma) and not na(atr) and bar_index > smaLen + 10
@@ -59,9 +67,10 @@ ready = not na(sma) and not na(atr) and bar_index > smaLen + 10
 // ---- Entry conditions -------------------------------------------------------
 longMomOK  = not useMacd or hist > 0
 shortMomOK = not useMacd or hist < 0
+regimeOK   = not useAdx or adxVal > adxMin           // gate: only trade real trends
 
-longSignal  = ready and allowLong  and close > sma and longMomOK  and inDateWin
-shortSignal = ready and allowShort and close < sma and shortMomOK and inDateWin
+longSignal  = ready and allowLong  and close > sma and longMomOK  and regimeOK and inDateWin
+shortSignal = ready and allowShort and close < sma and shortMomOK and regimeOK and inDateWin
 
 // ---- Position sizing: risk 2% of equity across the 2xATR stop distance ------
 stopDist = atr * atrStopMult
