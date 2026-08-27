@@ -2,8 +2,14 @@ name: Update Dashboard
 
 on:
   workflow_run:
-    workflows: ["Daily Trading Report"]
+    # Rebuild after EITHER the daily report OR the trading pipeline runs
+    # (the pipeline runs 3x/weekday, so the dashboard now refreshes with it).
+    workflows: ["Daily Trading Report", "Daily Trading Pipeline"]
     types: [completed]
+  schedule:
+    # Fallback: rebuild every 4 hours so it never goes stale even when no
+    # upstream workflow ran (e.g. weekends, or after a manual flatten).
+    - cron: "0 */4 * * *"
   workflow_dispatch:
 
 permissions:
