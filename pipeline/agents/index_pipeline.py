@@ -1,26 +1,32 @@
 """
-Index Pipeline (S&P 500 trend) — Milestone 1: DRY-RUN ONLY
-----------------------------------------------------------
-A lightweight, self-contained trend path for a single stock index (S&P 500),
-kept deliberately SEPARATE from the FX universe scan/carry ranking. It reuses
-the existing engine pieces:
+Index Pipeline (stock-index trend) — Milestone 1: DRY-RUN ONLY
+--------------------------------------------------------------
+A lightweight, self-contained trend path for stock indices (S&P 500 + Nasdaq
+100), kept deliberately SEPARATE from the FX universe scan/carry ranking. It
+reuses the existing engine pieces:
   - data:   pipeline.agents.data_fetcher.fetch_ohlcv (yfinance)
   - signal: pipeline.agents.fx_signal_generator.macd_histogram (same MACD rule)
   - DB:     pipeline.db (signals + paper_trades tables)
 
-Strategy (matches the winning TradingView backtest — PF ~3.3, +136%, ~7% maxDD):
+Instruments (each invocation processes ALL of them in sequence):
+  - S&P 500:   yfinance ^GSPC, Capital.com epic US500, strategy_id 200
+  - Nasdaq 100: yfinance ^NDX,  Capital.com epic US100, strategy_id 201
+
+Strategy (identical for every instrument — matches the winning TradingView
+backtest, PF ~3.3, +136%, ~7% maxDD):
   - LONG ONLY (no shorts)
   - Entry:  close > SMA-200  AND  MACD histogram > 0
   - Exit:   "let it run" — close BELOW SMA-200 (SMA re-cross). No fixed TP.
   - Sizing: risk 2% of equity across a 2xATR(14) stop distance, in POINTS
             (index points, NOT FX pips). qty = risk_cash / stop_distance.
 
-MILESTONE 1 = DRY-RUN: this module computes today's signal + implied position
-and LOGS the intended action to the `signals` table (strategy_id 200). If the
-signal would open or close, it also writes a clearly-marked *intent* row into
-paper_trades (status='intent'). It NEVER calls a broker and needs no secrets —
-it runs fully offline on public yfinance data. Milestone 2 will add real demo
-order submission on US500 via Capital.com behind a GitHub Actions step.
+MILESTONE 1 = DRY-RUN: for each instrument this computes today's signal +
+implied position and LOGS the intended action to the `signals` table (with the
+instrument's strategy_id). If the signal would open or close, it also writes a
+clearly-marked *intent* row into paper_trades (status='intent'). It NEVER calls
+a broker and needs no secrets — it runs fully offline on public yfinance data.
+Milestone 2 will add real demo order submission via Capital.com behind a GitHub
+Actions step.
 
 Usage:
     python3 -m pipeline.agents.index_pipeline --dry-run     # compute + log + print
@@ -44,13 +50,25 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# Strategy ID — NEW, isolated from FX (100 trend / 101 price-action)
-INDEX_TREND_STRATEGY_ID = 200
-
-# Instrument config
-YF_TICKER = "^GSPC"       # S&P 500 index daily OHLC on yfinance
-BROKER_EPIC = "US500"     # Capital.com epic (used in Milestone 2, not here)
-SYMBOL = "US500"          # symbol stored in DB (broker-facing name)
+# Instruments — each isolated from FX (100 trend / 101 price-action) by its own
+# strategy_id. All share the IDENTICAL config below. To add an index, append a
+# row here; nothing else needs to change.
+INSTRUMENTS = [
+    {
+        "strategy_id": 200,
+        "name": "Index Trend (S&P 500)",
+        "yf_ticker": "^GSPC",   # S&P 500 index daily OHLC on yfinance
+        "epic": "US500",        # Capital.com epic (used in Milestone 2, not here)
+        "symbol": "US500",      # symbol stored in DB (broker-facing name)
+    },
+    {
+        "strategy_id": 201,
+        "name": "Index Trend (Nasdaq 100)",
+        "yf_ticker": "^NDX",    # Nasdaq 100 index daily OHLC on yfinance
+        "epic": "US100",        # Capital.com epic (used in Milestone 2, not here)
+        "symbol": "US100",      # symbol stored in DB (broker-facing name)
+    },
+]
 
 # Strategy parameters (locked to the winning backtest)
 SMA_PERIOD = 200
@@ -77,12 +95,13 @@ def atr(df: pd.DataFrame, period: int = ATR_PERIOD) -> pd.Series:
     return tr.ewm(alpha=1 / period, adjust=False).mean()
 
 
-def compute_index_signal(df: pd.DataFrame, held_long: bool) -> dict:
-    """Compute today's long-only trend signal + intended action.
+def compute_index_signal(df: pd.DataFrame, held_long: bool, instrument: dict) -> dict:
+    """Compute today's long-only trend signal + intended action for one index.
 
     Args:
-        df:        daily OHLC with columns open/high/low/close(/volume).
-        held_long: True if we currently hold a long (implied position).
+        df:         daily OHLC with columns open/high/low/close(/volume).
+        held_long:  True if we currently hold a long (implied position).
+        instrument: one entry from INSTRUMENTS (strategy_id/symbol/yf_ticker/...).
 
     Returns dict with the full state and an "action" in
     {"enter_long", "exit_long", "hold_long", "flat"}.
@@ -115,8 +134,10 @@ def compute_index_signal(df: pd.DataFrame, held_long: bool) -> dict:
 
     return {
         "date": str(df.index[-1].date()),
-        "symbol": SYMBOL,
-        "yf_ticker": YF_TICKER,
+        "strategy_id": instrument["strategy_id"],
+        "symbol": instrument["symbol"],
+        "epic": instrument["epic"],
+        "yf_ticker": instrument["yf_ticker"],
         "close": round(close, 2),
         "sma_200": round(latest_sma, 2),
         "above_sma": bool(above_sma),
@@ -146,14 +167,13 @@ def _current_position(conn, strategy_id: int) -> bool:
     return row is not None
 
 
-def _ensure_strategy_row(conn) -> None:
-    """Seed the strategy_id=200 row so signals/paper_trades FKs resolve.
+def _ensure_strategy_row(conn, instrument: dict) -> None:
+    """Seed the instrument's strategy row so signals/paper_trades FKs resolve.
 
     Additive and idempotent — does not touch the FX strategies (100/101).
     """
-    exists = conn.execute(
-        "SELECT 1 FROM strategies WHERE id = ?", (INDEX_TREND_STRATEGY_ID,)
-    ).fetchone()
+    sid = instrument["strategy_id"]
+    exists = conn.execute("SELECT 1 FROM strategies WHERE id = ?", (sid,)).fetchone()
     if exists:
         return
     conn.execute(
@@ -162,12 +182,13 @@ def _ensure_strategy_row(conn) -> None:
             position_sizing, holding_period, parameters)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
-            INDEX_TREND_STRATEGY_ID,
-            "Index Trend (S&P 500)",
+            sid,
+            instrument["name"],
             "paper_trading",
             "LONG only: close > SMA-200 AND MACD histogram > 0",
             "Exit on SMA-200 re-cross (let it run, no fixed TP)",
-            "S&P 500 index (yfinance ^GSPC / Capital.com US500)",
+            f"{instrument['symbol']} index (yfinance {instrument['yf_ticker']} / "
+            f"Capital.com {instrument['epic']})",
             "Risk 2% of equity across 2xATR(14) stop, sized in index points",
             "Trend (multi-week/month)",
             json.dumps({
@@ -181,7 +202,7 @@ def _ensure_strategy_row(conn) -> None:
         ),
     )
     conn.commit()
-    log.info(f"Seeded strategy row id={INDEX_TREND_STRATEGY_ID} (Index Trend S&P 500)")
+    log.info(f"Seeded strategy row id={sid} ({instrument['name']})")
 
 
 def _log_signal(conn, state: dict) -> int:
@@ -200,7 +221,7 @@ def _log_signal(conn, state: dict) -> int:
     cur = conn.execute(
         """INSERT INTO signals (strategy_id, signal_type, symbol, side, price_at_signal, full_state)
            VALUES (?, ?, ?, ?, ?, ?)""",
-        (INDEX_TREND_STRATEGY_ID, signal_type, state["symbol"], side,
+        (state["strategy_id"], signal_type, state["symbol"], side,
          state["close"], json.dumps(state)),
     )
     conn.commit()
@@ -229,7 +250,7 @@ def _log_intent_trade(conn, state: dict, signal_id: int) -> int:
             stop_loss, thesis, risk_pct, risk_approved, status)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'intent')""",
         (
-            INDEX_TREND_STRATEGY_ID, signal_id, state["symbol"], "long",
+            state["strategy_id"], signal_id, state["symbol"], "long",
             state["close"], state["qty_units"], state["stop_price"],
             thesis, state["risk_pct"],
         ),
@@ -238,30 +259,26 @@ def _log_intent_trade(conn, state: dict, signal_id: int) -> int:
     return cur.lastrowid
 
 
-def run(dry_run: bool = True, db_path: str | None = None) -> dict:
-    if not dry_run:
-        raise NotImplementedError(
-            "Milestone 1 is DRY-RUN only. Live/demo order submission on US500 "
-            "arrives in Milestone 2 (Capital.com + GitHub Actions)."
-        )
-
-    conn = init_db(db_path)
-    _ensure_strategy_row(conn)
+def run_instrument(conn, instrument: dict) -> dict:
+    """Dry-run one index: fetch, compute, log signal (+ intent), print summary."""
+    yf_ticker = instrument["yf_ticker"]
+    sid = instrument["strategy_id"]
+    _ensure_strategy_row(conn, instrument)
 
     # Need >= SMA_PERIOD + MACD/ATR warmup. Pull ~3 years of daily data.
     start = (datetime.now() - timedelta(days=1100)).strftime("%Y-%m-%d")
-    log.info(f"Fetching {YF_TICKER} daily OHLC from {start} ...")
-    data = fetch_ohlcv([YF_TICKER], start=start, cache=False)
-    df = data.get(YF_TICKER)
+    log.info(f"Fetching {yf_ticker} daily OHLC from {start} ...")
+    data = fetch_ohlcv([yf_ticker], start=start, cache=False)
+    df = data.get(yf_ticker)
     if df is None or len(df) < SMA_PERIOD + ATR_PERIOD + 10:
         raise RuntimeError(
-            f"Insufficient {YF_TICKER} data (got {0 if df is None else len(df)} rows, "
+            f"Insufficient {yf_ticker} data (got {0 if df is None else len(df)} rows, "
             f"need >= {SMA_PERIOD + ATR_PERIOD + 10})"
         )
     log.info(f"Got {len(df)} daily bars ({df.index[0].date()} to {df.index[-1].date()})")
 
-    held_long = _current_position(conn, INDEX_TREND_STRATEGY_ID)
-    state = compute_index_signal(df, held_long=held_long)
+    held_long = _current_position(conn, sid)
+    state = compute_index_signal(df, held_long=held_long, instrument=instrument)
 
     signal_id = _log_signal(conn, state)
     intent_id = None
@@ -270,16 +287,16 @@ def run(dry_run: bool = True, db_path: str | None = None) -> dict:
 
     log_agent_action(
         conn, "index_pipeline", "signal_generated",
-        inputs={"ticker": YF_TICKER, "held_long": held_long},
+        inputs={"ticker": yf_ticker, "held_long": held_long},
         outputs={"action": state["action"], "signal_id": signal_id, "intent_trade_id": intent_id},
-        strategy_id=INDEX_TREND_STRATEGY_ID,
+        strategy_id=sid,
     )
 
     # ---- Human-readable summary ----
     print(f"\n{'=' * 70}")
-    print(f"INDEX PIPELINE (S&P 500) — DRY-RUN — {state['date']}")
+    print(f"INDEX PIPELINE ({instrument['name']}) — DRY-RUN — {state['date']}")
     print(f"{'=' * 70}")
-    print(f"  Instrument      : {SYMBOL}  (yfinance {YF_TICKER}, broker epic {BROKER_EPIC})")
+    print(f"  Instrument      : {state['symbol']}  (yfinance {yf_ticker}, broker epic {state['epic']})")
     print(f"  Close           : {state['close']}")
     print(f"  SMA-200         : {state['sma_200']}  "
           f"({'ABOVE' if state['above_sma'] else 'BELOW'}, {state['dist_to_sma_pct']:+}%)")
@@ -294,7 +311,7 @@ def run(dry_run: bool = True, db_path: str | None = None) -> dict:
               f"(stop {state['stop_price']}, risk ${state['risk_cash']} = {state['risk_pct']}% equity)")
     elif state["action"] == "exit_long":
         print(f"     Intended exit : CLOSE LONG @ {state['close']} (SMA re-cross)")
-    print(f"\n  Logged to signals table: id={signal_id} (strategy_id={INDEX_TREND_STRATEGY_ID})")
+    print(f"\n  Logged to signals table: id={signal_id} (strategy_id={sid})")
     if intent_id is not None:
         print(f"  Logged DRY-RUN intent to paper_trades: id={intent_id} (status='intent', NO broker order)")
     print(f"  [DRY-RUN] No broker order submitted.\n")
@@ -302,8 +319,22 @@ def run(dry_run: bool = True, db_path: str | None = None) -> dict:
     return {"state": state, "signal_id": signal_id, "intent_trade_id": intent_id}
 
 
+def run(dry_run: bool = True, db_path: str | None = None) -> list[dict]:
+    if not dry_run:
+        raise NotImplementedError(
+            "Milestone 1 is DRY-RUN only. Live/demo order submission on the index "
+            "epics arrives in Milestone 2 (Capital.com + GitHub Actions)."
+        )
+
+    conn = init_db(db_path)
+    results = []
+    for instrument in INSTRUMENTS:
+        results.append(run_instrument(conn, instrument))
+    return results
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Index Pipeline (S&P 500 trend) — Milestone 1 dry-run")
+    parser = argparse.ArgumentParser(description="Index Pipeline (S&P 500 + Nasdaq 100 trend) — Milestone 1 dry-run")
     parser.add_argument("--dry-run", action="store_true",
                         help="Compute signal + log intended action (no broker). Required in Milestone 1.")
     parser.add_argument("--db", type=str, default=None)
