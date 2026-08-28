@@ -1,7 +1,29 @@
 # Trading System — Task List
 
-> **Last updated: 2026-08-27**
+> **Last updated: 2026-08-28**
 > Read this FIRST every session. This is the single source of truth for what's done, what's open, and what happened last.
+
+---
+
+## Last Session Recap (2026-08-27 / 28)
+
+### 🎯 EXECUTION PIVOT → MetaTrader 5 EA (escape the custom-broker bug class)
+User's key insight: nearly every time-costing bug (Capital.com 429/login errors, false closes, divergent DBs, reconciliation churn) lived in the **custom broker-execution layer**, NOT the strategies. Decision after research: stop hand-rolling execution; run the validated strategies as a **native MetaTrader 5 Expert Advisor**, where MT owns position state (no reconciliation code = bug class gone). Milestone-2 live execution on the custom Capital.com bot was **paused mid-build and reverted** (index pipeline stays in dry-run).
+- **Broker:** user already has **Fusion Markets** (supports MT4/MT5/cTrader/TradingView + US500/NAS100/XAUUSD) — no new broker needed. Currently testing on the generic **MetaQuotes-Demo** (MT5 via Wine on Mac); switch to Fusion server for the real forward-test (Fusion demo = 30-day limit unless funded). Alternative reuse paths noted: **Alpaca** ($100k already there, clean API, SPY/QQQ/GLD) and **cTrader Open API** (broker_ctrader.py already wired). MT5-native chosen as most bulletproof; **MetaApi** (free tier) or MT5 built-in **VPS** (~$10-15/mo) for 24/7 hosting so the laptop can be off.
+- **The EA — `mt5/TrendEA.mq5`** (+ `mt5/README.md`), commits `5949d42` → `4126427`: long-only SMA-200 + MACD + optional ADX(25) gate, SMA-recross exit (no TP), 2×ATR stop, `UseADX=true` for gold / `false` for indices. **Symbol-agnostic sizing.**
+- **CRITICAL FIX (`4126427`):** first sizing used manual tick-value math → over-sized gold ~4-5x (input 0.5% actually risked ~2.5%; 84% drawdown at "2%"). Rewrote `ComputeLots` to use the terminal's own `OrderCalcProfit()` so **RiskPct is truthful on any instrument**, + a per-entry `SIZING:` journal log printing the real risk %.
+- **✅ GOLD VALIDATED in MT5 Strategy Tester** (XAUUSD D1, 2004-2026, 98% quality, 47 trades, after the fix): **RiskPct 1% → PF 4.43, 7.1% balance / 17% equity DD, +88%.  RiskPct 2% → PF 4.24, 14% balance / 25% equity DD, +209%.** Clean linear risk scaling = sizing confirmed correct. Matches the TradingView gold ADX edge (PF ~4).
+- **✅ Gold EA attached LIVE on the XAUUSD D1 demo chart** (running at RiskPct=2; user may prefer 1% when indices are added — 1% each keeps combined portfolio DD ~15-20%). Note: MT5 EA runs LOCALLY — laptop off = EA pauses (broker-side stop-loss still active); resumes on reopen; needs VPS/MetaApi for true 24/7.
+
+### ⏳ OPEN / NEXT
+- **Validate S&P + Nasdaq in MT5** the same way (`UseADX=false`). BLOCKER: need the exact **Indexes** symbol names from the user's feed (US500/SPX500?, NAS100/USTEC?). Gold symbol confirmed = **XAUUSD** (contract size 100).
+- Switch from MetaQuotes-Demo to the **Fusion Markets** MT5 server for the real forward-test.
+- Set up **MetaApi / MT5 VPS** for 24/7 once the user is ready to run seriously.
+- Decide final **risk %** (1% recommended for the 3-strategy portfolio).
+- The custom index_pipeline dry-run (200/201/202) keeps logging in parallel as a cross-check; retire it once the EA path is trusted.
+
+### 📊 Research bench (all committed, `cb04ff3` + `d0c1795`) — for reference
+Short-term/TA candidates built as Pine (`tradingview/`): RSI2 mean-reversion (untested — the one orthogonal short-term idea worth trying), intraday ORB, S/R Donchian breakout (tested: real but dominated by trend, high DD), candles-at-support (tested: noise/unstable). **Verdict from full sweep: trend-following is the only robust edge; everything else is noise or a worse version of trend.**
 
 ---
 
