@@ -15,6 +15,15 @@ User's key insight: nearly every time-costing bug (Capital.com 429/login errors,
 - **✅ GOLD VALIDATED in MT5 Strategy Tester** (XAUUSD D1, 2004-2026, 98% quality, 47 trades, after the fix): **RiskPct 1% → PF 4.43, 7.1% balance / 17% equity DD, +88%.  RiskPct 2% → PF 4.24, 14% balance / 25% equity DD, +209%.** Clean linear risk scaling = sizing confirmed correct. Matches the TradingView gold ADX edge (PF ~4).
 - **✅ Gold EA attached LIVE on the XAUUSD D1 demo chart** (running at RiskPct=2; user may prefer 1% when indices are added — 1% each keeps combined portfolio DD ~15-20%). Note: MT5 EA runs LOCALLY — laptop off = EA pauses (broker-side stop-loss still active); resumes on reopen; needs VPS/MetaApi for true 24/7.
 
+### ✅ ALPACA BOT REACTIVATED with the validated trend strategy (2026-08-28) — cloud, no VPS
+User's insight: don't retire the accounts, put the PROVEN strategy on them. Rewired the Alpaca stock bot (`work/trading-bot`, paper ~$99.7k) to run ONLY the validated trend rule on ETFs SPY/QQQ/GLD. Old weak-strategy workflows stay disabled.
+- **Validated first (1% risk, full history):** SPY **PF 5.66 / -7.8% DD / 77 trades**, QQQ **PF 4.09 / -9.5% / 78**, GLD (ADX>25 gate) **PF 4.23 / -15.4% / 41**. All deployed.
+- **New:** `scripts/trend_etf.py` + `.github/workflows/trend_etf.yml` (daily `cron 14:00 UTC`, cloud → **no VPS, laptop-independent**). Long-only, SMA200+MACD (GLD +ADX25), SMA-recross exit, 2×ATR stop, 1% risk capped to buying power. **Alpaca = sole source of truth** (no local ledger); entries are atomic **OTO** orders (market buy + attached GTC stop → stop can't orphan = the reconciliation bug class designed out).
+- **Verified live** (run 33133285987): SPY/QQQ held (MACD negative), **GLD ENTERED 68 sh, stop $408.14, 0.99% risk**, queued to fill at next open. Duplicate-guard confirmed.
+- **Kill switch:** `gh workflow disable "Trend ETF (SPY/QQQ/GLD)"`; unwind via the Flatten workflow.
+- **Note:** gold now runs on BOTH MT5 (XAUUSD) and Alpaca (GLD) — fine for parallel paper/demo forward-test; pick ONE home per instrument before real money.
+- **Execution homes for the validated strategy:** (1) MetaTrader/Fusion — native, gold live, needs VPS; (2) **Alpaca — cloud, no VPS, SPY/QQQ/GLD live** = the more convenient home.
+
 ### ⏳ OPEN / NEXT
 - **Validate S&P + Nasdaq in MT5** the same way (`UseADX=false`). BLOCKER: need the exact **Indexes** symbol names from the user's feed (US500/SPX500?, NAS100/USTEC?). Gold symbol confirmed = **XAUUSD** (contract size 100).
 - Switch from MetaQuotes-Demo to the **Fusion Markets** MT5 server for the real forward-test.
