@@ -929,3 +929,5 @@
 {"event": "daily_snapshot", "bot": "fx", "timestamp": "2026-09-04T11:59:34.230996+00:00", "total_realized_pnl": -13.35, "open_positions": [], "open_count": 0}
 {"event": "daily_snapshot", "bot": "stock", "timestamp": "2026-09-04T16:45:06.975520+00:00", "equity": 98807.2, "cash": 98807.2, "positions": [], "total_unrealized_pnl": 0.0}
 {"event": "daily_snapshot", "bot": "fx", "timestamp": "2026-09-04T16:45:06.975920+00:00", "total_realized_pnl": -13.35, "open_positions": [], "open_count": 0}
+{"event": "daily_snapshot", "bot": "stock", "timestamp": "2026-09-04T23:53:48.883446+00:00", "equity": 98807.2, "cash": 98807.2, "positions": [], "total_unrealized_pnl": 0.0}
+{"event": "daily_snapshot", "bot": "fx", "timestamp": "2026-09-04T23:53:48.883842+00:00", "total_realized_pnl": -13.35, "open_positions": [], "open_count": 0}
