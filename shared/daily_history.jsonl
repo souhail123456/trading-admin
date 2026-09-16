@@ -971,3 +971,5 @@
 {"event": "daily_snapshot", "bot": "fx", "timestamp": "2026-09-15T12:28:48.500742+00:00", "total_realized_pnl": -13.35, "open_positions": [], "open_count": 0}
 {"event": "daily_snapshot", "bot": "stock", "timestamp": "2026-09-15T17:29:17.703276+00:00", "equity": 97990.46, "cash": 60642.95, "positions": [{"symbol": "QQQ", "qty": 53.0, "side": "long", "entry": 720.08, "current": 704.67, "unrealized_pnl": -816.73, "market_value": 37347.51}], "total_unrealized_pnl": -816.73}
 {"event": "daily_snapshot", "bot": "fx", "timestamp": "2026-09-15T17:29:17.703566+00:00", "total_realized_pnl": -13.35, "open_positions": [], "open_count": 0}
+{"event": "daily_snapshot", "bot": "stock", "timestamp": "2026-09-16T00:06:33.321043+00:00", "equity": 98015.37, "cash": 60642.95, "positions": [{"symbol": "QQQ", "qty": 53.0, "side": "long", "entry": 720.08, "current": 705.14, "unrealized_pnl": -791.82, "market_value": 37372.42}], "total_unrealized_pnl": -791.82}
+{"event": "daily_snapshot", "bot": "fx", "timestamp": "2026-09-16T00:06:33.321373+00:00", "total_realized_pnl": -13.35, "open_positions": [], "open_count": 0}
