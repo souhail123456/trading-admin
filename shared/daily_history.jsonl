@@ -1105,3 +1105,5 @@
 {"event": "daily_snapshot", "bot": "fx", "timestamp": "2026-10-16T00:13:11.717802+00:00", "total_realized_pnl": -13.35, "open_positions": [], "open_count": 0}
 {"event": "daily_snapshot", "bot": "stock", "timestamp": "2026-10-16T12:07:05.297927+00:00", "equity": 95403.97, "cash": 39735.73, "positions": [{"symbol": "SPY", "qty": 72.0, "side": "long", "entry": 778.23, "current": 773.17, "unrealized_pnl": -364.32, "market_value": 55668.24}], "total_unrealized_pnl": -364.32}
 {"event": "daily_snapshot", "bot": "fx", "timestamp": "2026-10-16T12:07:05.298309+00:00", "total_realized_pnl": -13.35, "open_positions": [], "open_count": 0}
+{"event": "daily_snapshot", "bot": "stock", "timestamp": "2026-10-16T17:11:02.740690+00:00", "equity": 94747.33, "cash": 39735.73, "positions": [{"symbol": "SPY", "qty": 72.0, "side": "long", "entry": 778.23, "current": 764.04, "unrealized_pnl": -1021.68, "market_value": 55010.88}], "total_unrealized_pnl": -1021.68}
+{"event": "daily_snapshot", "bot": "fx", "timestamp": "2026-10-16T17:11:02.741070+00:00", "total_realized_pnl": -13.35, "open_positions": [], "open_count": 0}
