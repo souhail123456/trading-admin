@@ -26,29 +26,29 @@
     }
   },
   "api_usage_today": {},
-  "regime": "TRENDING",
+  "regime": "VOLATILE",
   "alerts": [],
   "service_status": {
-    "timestamp": "2026-11-17T04:24:00Z"
+    "timestamp": "2026-11-17T16:41:23Z"
   },
-  "vix": 22.90999984741211,
+  "vix": 25.670000076293945,
   "recommendations": {
     "100": {
-      "action": "ACTIVE",
-      "reason": "Trending market \u2014 ideal for trend strategy"
+      "action": "REDUCE",
+      "reason": "High vol \u2014 halve position sizes, widen stops"
     },
     "101": {
       "action": "KILLED",
       "reason": "Sharpe -1.08 in backtest \u2014 PA strategy permanently killed 2026-07"
     }
   },
-  "updated": "2026-11-17T04:24:06Z",
+  "updated": "2026-11-17T16:41:30Z",
   "cross_bot_risk": {
     "total_positions": 0,
     "total_exposure": 0,
     "by_bot": {},
     "overlaps": {},
     "flags": [],
-    "computed_at": "2026-11-17T04:24:33Z"
+    "computed_at": "2026-11-17T16:41:55Z"
   }
 }
