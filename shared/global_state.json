@@ -29,9 +29,9 @@
   "regime": "TRENDING",
   "alerts": [],
   "service_status": {
-    "timestamp": "2026-11-27T17:14:39Z"
+    "timestamp": "2026-11-27T21:48:39Z"
   },
-  "vix": 24.56999969482422,
+  "vix": 23.809999465942383,
   "recommendations": {
     "100": {
       "action": "ACTIVE",
@@ -42,13 +42,13 @@
       "reason": "Sharpe -1.08 in backtest \u2014 PA strategy permanently killed 2026-07"
     }
   },
-  "updated": "2026-11-27T17:14:44Z",
+  "updated": "2026-11-27T21:48:46Z",
   "cross_bot_risk": {
     "total_positions": 0,
     "total_exposure": 0,
     "by_bot": {},
     "overlaps": {},
     "flags": [],
-    "computed_at": "2026-11-27T17:15:09Z"
+    "computed_at": "2026-11-27T21:49:14Z"
   }
 }
